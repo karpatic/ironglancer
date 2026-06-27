@@ -1,0 +1,56 @@
+{
+  "name": "ironglancer",
+  "version": "0.1.0",
+  "description": "Analyze a folder's JS/JSX module graph and emit a static IronGlancer site that only needs a file server.",
+  "type": "module",
+  "author": "Carlos Karpati",
+  "license": "MIT",
+  "homepage": "https://karpatic.github.io/ironglancer/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/karpatic/ironglancer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/karpatic/ironglancer/issues"
+  },
+  "keywords": [
+    "visualization",
+    "dependency-graph",
+    "mermaid",
+    "jsx",
+    "javascript",
+    "cli",
+    "static-site"
+  ],
+  "bin": {
+    "ironglancer": "src/cli.mjs"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./analyze-project": "./src/lib/analyze-project.js",
+    "./generate-static-site": "./src/lib/generate-static-site.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "build:demo": "node ./scripts/build-demo.mjs",
+    "prepublishOnly": "npm test",
+    "publish:npm": "npm publish --access public",
+    "publish:github": "./scripts/publish-github-package.sh",
+    "publish:all": "npm run publish:npm && npm run publish:github"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "mermaid": "^11.12.0"
+  }
+}
