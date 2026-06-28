@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 import { analyzeProject } from './analyze-project.js';
 
 const require = createRequire(import.meta.url);
+const packageMeta = require('../../package.json');
 
 function viewerHtml() {
   return `<!doctype html>
@@ -22,6 +23,7 @@ function viewerHtml() {
       .header { display:flex; gap:16px; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; }
       .title { margin:0; font-size:1.7rem; }
       .subtitle { margin:4px 0 0; color:var(--muted); }
+      .meta-line { margin:8px 0 0; color:var(--muted); font-size:.88rem; }
       .grid { display:grid; gap:16px; margin-top:16px; }
       .details-grid { display:grid; gap:16px; }
       @media (min-width: 1100px) { .details-grid { grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.05fr); align-items:start; } }
@@ -85,6 +87,7 @@ function viewerHtml() {
         <div>
           <h1 class="title">IronGlancer</h1>
           <p id="subtitle" class="subtitle">Loading project graph…</p>
+          <p id="build-meta" class="meta-line">Checking build metadata…</p>
         </div>
         <div class="actions">
           <button id="download-svg-btn" type="button">Download SVG</button>
@@ -145,6 +148,7 @@ function viewerAppJs() {
 mermaid.initialize({ startOnLoad: false, securityLevel: 'loose', theme: 'default', flowchart: { htmlLabels: false } });
 
 const subtitleEl = document.getElementById('subtitle');
+const buildMetaEl = document.getElementById('build-meta');
 const treeEl = document.getElementById('tree');
 const scriptsEl = document.getElementById('scripts');
 const mermaidEl = document.getElementById('mermaid');
@@ -375,11 +379,22 @@ function prepareSvgForInteraction(svgMarkup) {
   requestAnimationFrame(() => fitToViewport());
 }
 
+function formatBuildMeta(metadata = {}) {
+  const version = metadata.version || 'unknown';
+  const generatedAtRaw = metadata.generatedAt || '';
+  const generatedAt = generatedAtRaw ? new Date(generatedAtRaw) : null;
+  const generatedLabel = generatedAt && !Number.isNaN(generatedAt.valueOf())
+    ? generatedAt.toLocaleString()
+    : (generatedAtRaw || 'unknown time');
+  return 'Built ' + generatedLabel + '  •  v' + version;
+}
+
 async function main() {
   const response = await fetch('./output.json');
   if (!response.ok) throw new Error('Failed to load output.json');
   const payload = await response.json();
   subtitleEl.textContent = payload.entry + '  •  ' + payload.rootDir;
+  buildMetaEl.textContent = formatBuildMeta(payload.meta);
   treeEl.textContent = payload.treeText;
   mermaidEl.textContent = payload.mermaid;
   renderScripts(payload.jsScripts);
@@ -410,6 +425,7 @@ bindInteraction();
 main().catch((error) => {
   subtitleEl.textContent = error?.message || String(error);
   subtitleEl.style.color = '#b42318';
+  buildMetaEl.textContent = '';
 });
 `;
 }
@@ -435,6 +451,7 @@ async function copyMermaidAsset(outDir) {
 export async function generateStaticSite({ rootDir, entry, outDir } = {}) {
   const resolvedOutDir = path.resolve(outDir || 'ironglancer-site');
   const analysis = await analyzeProject({ rootDir, entry });
+  const generatedAt = new Date().toISOString();
   await fs.rm(resolvedOutDir, { recursive: true, force: true });
   await fs.mkdir(resolvedOutDir, { recursive: true });
   await fs.writeFile(path.join(resolvedOutDir, 'index.html'), viewerHtml(), 'utf8');
@@ -447,6 +464,11 @@ export async function generateStaticSite({ rootDir, entry, outDir } = {}) {
     jsScripts: analysis.jsScripts,
     mermaid: analysis.mermaid,
     summary: analysis.summary,
+    meta: {
+      packageName: packageMeta.name,
+      version: packageMeta.version,
+      generatedAt,
+    },
   }, null, 2) + '\n', 'utf8');
   await copyMermaidAsset(resolvedOutDir);
   return { outDir: resolvedOutDir, ...analysis };
