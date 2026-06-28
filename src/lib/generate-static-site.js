@@ -13,7 +13,7 @@ function viewerHtml() {
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231f6feb'/%3E%3Cpath d='M18 16h28v8H36v24h-8V24H18z' fill='white'/%3E%3C/svg%3E">
-    <title>IronGazer</title>
+    <title>IronGlancer</title>
     <style>
       :root { --bg:#f6f8fc; --panel:#fff; --text:#182132; --muted:#5f6880; --border:#d9dfeb; --accent:#1f6feb; }
       * { box-sizing:border-box; }
@@ -83,7 +83,7 @@ function viewerHtml() {
     <div class="shell">
       <div class="header">
         <div>
-          <h1 class="title">IronGazer</h1>
+          <h1 class="title">IronGlancer</h1>
           <p id="subtitle" class="subtitle">Loading project graph…</p>
         </div>
         <div class="actions">
@@ -399,7 +399,7 @@ downloadBtn.addEventListener('click', () => {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement('a');
   anchor.href = url;
-  anchor.download = 'irongazer.svg';
+  anchor.download = 'ironglancer.svg';
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
