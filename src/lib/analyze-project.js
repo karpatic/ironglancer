@@ -19,6 +19,11 @@ const DEFAULT_ENTRY_CANDIDATES = [
   'src/main.js',
 ];
 
+const DEFAULT_ROUTE_ALIASES = [
+  { from: '/', to: '' },
+  { from: '/', to: 'public' },
+];
+
 async function loadImportAliases(rootDir, entryRel = '') {
   const aliases = new Map();
   const htmlCandidates = [
@@ -47,6 +52,67 @@ async function loadImportAliases(rootDir, entryRel = '') {
   return aliases;
 }
 
+function parseRouteAliasString(value) {
+  const raw = normalizeString(value).trim();
+  const separatorIndex = raw.indexOf('=');
+  if (separatorIndex === -1) {
+    throw new Error(`Invalid route alias "${raw}". Use route=path.`);
+  }
+  return {
+    from: raw.slice(0, separatorIndex),
+    to: raw.slice(separatorIndex + 1),
+  };
+}
+
+function routeAliasEntries(routeAliases) {
+  if (!routeAliases) return [];
+  if (routeAliases instanceof Map) {
+    return Array.from(routeAliases, ([from, to]) => ({ from, to }));
+  }
+  if (Array.isArray(routeAliases)) return routeAliases;
+  if (typeof routeAliases === 'string') return [parseRouteAliasString(routeAliases)];
+  if (typeof routeAliases === 'object') {
+    if ('from' in routeAliases || 'to' in routeAliases) return [routeAliases];
+    return Object.entries(routeAliases).map(([from, to]) => ({ from, to }));
+  }
+  throw new Error('routeAliases must be an array, object, Map, or route=path string.');
+}
+
+function normalizeRouteAliasFrom(value) {
+  const raw = toPosixPath(normalizeString(value).trim());
+  if (!raw) return '';
+  const rooted = raw.startsWith('/') ? raw : `/${raw}`;
+  return rooted.replace(/\/+$/g, '') || '/';
+}
+
+function normalizeRouteAliasTarget(value) {
+  const raw = toPosixPath(normalizeString(value).trim());
+  if (!raw) return '';
+  const normalized = raw.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/+$/g, '');
+  return normalized === '.' ? '' : normalized;
+}
+
+export function normalizeRouteAliases(routeAliases = []) {
+  return routeAliasEntries(routeAliases)
+    .map((entry, index) => {
+      const source = typeof entry === 'string' ? parseRouteAliasString(entry) : entry;
+      const from = normalizeRouteAliasFrom(Array.isArray(source) ? source[0] : source?.from);
+      const targetSource = Array.isArray(source) ? source[1] : source?.to;
+      const to = normalizeRouteAliasTarget(targetSource);
+      if (!from || normalizeString(targetSource).trim() === '') {
+        throw new Error('Route aliases must include a non-empty route and target path.');
+      }
+      return { from, to, index };
+    })
+    .sort((a, b) => b.from.length - a.from.length || a.index - b.index)
+    .map(({ from, to }) => ({ from, to }));
+}
+
+function expandImportAliasTarget(value) {
+  return toPosixPath(normalizeString(value).trim())
+    .replace('__REVIEW_ORIGIN__/', 'public/');
+}
+
 async function resolveFromRoot(rootDir, relativePath) {
   for (const candidate of extensionCandidates(relativePath)) {
     const filePath = path.resolve(rootDir, candidate);
@@ -71,21 +137,46 @@ async function resolveEntry(rootDir, entry) {
   throw new Error(`Unable to resolve entry inside ${rootDir}`);
 }
 
-async function resolveImport({ rootDir, specifier, importerRel, aliases }) {
+function localPathFromRouteAlias(specifier, alias) {
+  const raw = toPosixPath(normalizeString(specifier).trim());
+  if (!raw.startsWith('/')) return null;
+
+  let rest = null;
+  if (alias.from === '/') {
+    rest = raw.replace(/^\/+/, '');
+  } else if (raw === alias.from) {
+    rest = '';
+  } else if (raw.startsWith(`${alias.from}/`)) {
+    rest = raw.slice(alias.from.length + 1);
+  }
+
+  if (rest == null) return null;
+  return path.posix.normalize(path.posix.join(alias.to, rest));
+}
+
+async function resolveRouteAlias({ rootDir, specifier, routeAliases }) {
+  for (const alias of routeAliases) {
+    const localPath = localPathFromRouteAlias(specifier, alias);
+    if (localPath == null) continue;
+    const resolved = await resolveFromRoot(rootDir, localPath);
+    if (resolved) return resolved;
+  }
+  return null;
+}
+
+async function resolveImport({ rootDir, specifier, importerRel, aliases, routeAliases }) {
   const raw = normalizeString(specifier).trim();
   if (!raw || /^https?:\/\//i.test(raw)) return null;
   const aliasTarget = aliases.get(raw);
   if (aliasTarget) {
-    const normalizedAlias = aliasTarget
-      .replace('__REVIEW_ORIGIN__/', 'public/')
-      .replace(/^\.\//, '')
-      .replace(/^\//, '');
+    const expandedAlias = expandImportAliasTarget(aliasTarget);
+    const routedAlias = await resolveRouteAlias({ rootDir, specifier: expandedAlias, routeAliases });
+    if (routedAlias) return routedAlias;
+    const normalizedAlias = normalizeRouteAliasTarget(expandedAlias);
     return resolveFromRoot(rootDir, normalizedAlias);
   }
   if (raw.startsWith('/')) {
-    const direct = await resolveFromRoot(rootDir, raw.replace(/^\//, ''));
-    if (direct) return direct;
-    return resolveFromRoot(rootDir, path.posix.join('public', raw.replace(/^\//, '')));
+    return resolveRouteAlias({ rootDir, specifier: raw, routeAliases });
   }
   if (raw.startsWith('./') || raw.startsWith('../')) {
     const importerDir = path.posix.dirname(toPosixPath(importerRel));
@@ -117,6 +208,10 @@ function externalLabel(specifier) {
   return raw;
 }
 
+function isIgnoredExternalLabel(label) {
+  return normalizeString(label).trim().toLowerCase() === 'react';
+}
+
 function isJsxModule(rel) {
   return /\.(?:jsx)$/i.test(rel);
 }
@@ -143,7 +238,9 @@ function importedScriptVariablesForJsx(record) {
   const variables = new Set();
   for (const ref of Array.isArray(record.importRefs) ? record.importRefs : []) {
     if (ref?.localRel && isJsxModule(ref.localRel)) continue;
+    if (isIgnoredExternalLabel(ref?.specifier)) continue;
     const name = importedScriptVariableName(ref);
+    if (name === 'React') continue;
     if (name) variables.add(name);
   }
   return Array.from(variables).sort(compareLocale);
@@ -207,10 +304,14 @@ function buildTreeText(graph) {
   return lines.join('\n');
 }
 
-export async function analyzeProject({ rootDir, entry, moduleLimit = 500 } = {}) {
+export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeAliases = [] } = {}) {
   const resolvedRoot = path.resolve(normalizeString(rootDir).trim() || '.');
   const resolvedEntry = await resolveEntry(resolvedRoot, entry);
   const aliases = await loadImportAliases(resolvedRoot, resolvedEntry.rel);
+  const resolvedRouteAliases = [
+    ...normalizeRouteAliases(routeAliases),
+    ...DEFAULT_ROUTE_ALIASES,
+  ];
   const modules = new Map();
   const externals = new Set();
   const queue = [resolvedEntry];
@@ -236,6 +337,7 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500 } = {})
         specifier: ref.specifier,
         importerRel: current.rel,
         aliases,
+        routeAliases: resolvedRouteAliases,
       });
       if (local) {
         localDeps.push(local.rel);
@@ -243,7 +345,7 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500 } = {})
         if (!visited.has(local.rel)) queue.push(local);
       } else {
         const label = externalLabel(ref.specifier);
-        if (label) {
+        if (label && !isIgnoredExternalLabel(label)) {
           externals.add(label);
           externalDeps.push(label);
         }

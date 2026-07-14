@@ -16,6 +16,9 @@ Do not call the release done if only one registry moved.
 
 If one registry already has the target version but the repo has changed since that publish, bump the version again before publishing so the two registries do not diverge under the same version number.
 
+## Repo safety rule
+- Never roll back, reset, or revert a repo just to get back to a clean state if the repo already had changes when you began. You may inspect prior commits, diffs, or specific files to understand history, but do not discard pre-existing branch work.
+
 ## Clean release sequence
 1. Keep the repo clean before release work.
 2. Bump the package version in `package.json` and `package-lock.json` together.

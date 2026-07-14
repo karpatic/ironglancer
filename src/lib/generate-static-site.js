@@ -448,9 +448,9 @@ async function copyMermaidAsset(outDir) {
   );
 }
 
-export async function generateStaticSite({ rootDir, entry, outDir } = {}) {
+export async function generateStaticSite({ rootDir, entry, outDir, routeAliases } = {}) {
   const resolvedOutDir = path.resolve(outDir || 'ironglancer-site');
-  const analysis = await analyzeProject({ rootDir, entry });
+  const analysis = await analyzeProject({ rootDir, entry, routeAliases });
   const generatedAt = new Date().toISOString();
   await fs.rm(resolvedOutDir, { recursive: true, force: true });
   await fs.mkdir(resolvedOutDir, { recursive: true });

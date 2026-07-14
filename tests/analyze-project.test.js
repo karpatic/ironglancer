@@ -37,3 +37,41 @@ test('analyzeProject resolves creator-style public assets and review-origin alia
     'public/controller.js',
   ]);
 });
+
+const routeAliasRoot = path.resolve('tests/fixtures/route-alias');
+
+test('analyzeProject maps URL-rooted imports through route aliases', async () => {
+  const result = await analyzeProject({
+    rootDir: routeAliasRoot,
+    entry: 'src/web/ceator/app.jsx',
+    routeAliases: [{ from: '/creator/', to: 'src/web/ceator/' }],
+  });
+
+  assert.equal(result.entryRel, 'src/web/ceator/app.jsx');
+  assert.equal(result.summary.moduleCount, 2);
+  assert.equal(result.summary.externalCount, 0);
+  assert.deepEqual(result.jsScripts.map((item) => item.path), [
+    'src/web/ceator/app.jsx',
+    'src/web/ceator/components/creator-linked-content-editor.jsx',
+  ]);
+  assert.ok(!result.treeText.includes('[external] /creator/components/creator-linked-content-editor.jsx'));
+  assert.ok(!result.mermaid.includes('+LinkedContentEditor'));
+  assert.ok(result.mermaid.includes('CreatorLinkedContentEditor()'));
+});
+
+const reactIgnoreRoot = path.resolve('tests/fixtures/react-ignore');
+
+test('analyzeProject ignores React imports in diagrams while keeping other externals', async () => {
+  const result = await analyzeProject({ rootDir: reactIgnoreRoot, entry: 'src/app.jsx' });
+
+  assert.equal(result.entryRel, 'src/app.jsx');
+  assert.equal(result.summary.moduleCount, 2);
+  assert.equal(result.summary.externalCount, 1);
+  const treeLines = result.treeText.split('\n').map((line) => line.trim());
+  const mermaidLines = result.mermaid.split('\n').map((line) => line.trim());
+  assert.ok(!treeLines.includes('- [external] react'));
+  assert.ok(treeLines.includes('- [external] react-dom'));
+  assert.ok(!mermaidLines.includes('+React'));
+  assert.ok(mermaidLines.includes('+ReactDOM'));
+  assert.ok(result.mermaid.includes('class Widget'));
+});

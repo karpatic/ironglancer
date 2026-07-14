@@ -7,13 +7,14 @@ const { values, positionals } = parseArgs({
   options: {
     entry: { type: 'string' },
     out: { type: 'string' },
+    'route-alias': { type: 'string', multiple: true },
     help: { type: 'boolean', short: 'h' },
   },
   allowPositionals: true,
 });
 
 if (values.help) {
-  console.log('Usage: ironglancer <folder> [--entry src/app.jsx] [--out ./ironglancer-site]');
+  console.log('Usage: ironglancer <folder> [--entry src/app.jsx] [--out ./ironglancer-site] [--route-alias /app/=src/app/]');
   process.exit(0);
 }
 
@@ -22,6 +23,7 @@ const result = await generateStaticSite({
   rootDir,
   entry: values.entry,
   outDir: values.out,
+  routeAliases: values['route-alias'] || [],
 });
 
 console.log(JSON.stringify({
