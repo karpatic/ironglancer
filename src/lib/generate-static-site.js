@@ -124,8 +124,6 @@ function viewerHtml() {
         </div>
         <div class="actions">
           <button id="download-svg-btn" type="button">Download SVG</button>
-          <a class="button" href="./output.json">Open JSON</a>
-          <a class="button" href="./diagram.mmd">Open Mermaid</a>
         </div>
       </div>
       <div class="grid">
@@ -168,10 +166,6 @@ function viewerHtml() {
             <summary><h2>Dependency tree</h2></summary>
             <div class="body"><pre id="tree"></pre></div>
           </details>
-          <details class="panel collapsible-panel" id="jsx-line-counts-panel">
-            <summary><h2>JSX line counts</h2></summary>
-            <div class="body"><ul id="jsx-scripts"></ul></div>
-          </details>
           <details class="panel collapsible-panel" id="mermaid-source-panel">
             <summary><h2>Mermaid source</h2></summary>
             <div class="body text-panel-body">
@@ -200,7 +194,6 @@ const subtitleEl = document.getElementById('subtitle');
 const buildMetaEl = document.getElementById('build-meta');
 const jsxTreeEl = document.getElementById('jsx-tree');
 const treeEl = document.getElementById('tree');
-const jsxScriptsEl = document.getElementById('jsx-scripts');
 const mermaidEl = document.getElementById('mermaid');
 const diagramEl = document.getElementById('diagram');
 const viewportEl = document.getElementById('diagram-viewport');
@@ -238,24 +231,6 @@ function statCard(label, value) {
   span.textContent = label;
   div.append(strong, span);
   return div;
-}
-
-function formatLineCount(lineCount) {
-  return String(lineCount) + ' ' + (lineCount === 1 ? 'line' : 'lines');
-}
-
-function jsxScriptsFromPayload(payload) {
-  if (Array.isArray(payload.jsxScripts)) return payload.jsxScripts;
-  return (payload.jsScripts || []).filter((item) => /\\.jsx$/i.test(item.path || ''));
-}
-
-function renderJsxScripts(items) {
-  jsxScriptsEl.textContent = '';
-  for (const item of items || []) {
-    const li = document.createElement('li');
-    li.textContent = item.path + ' (' + formatLineCount(item.lineCount) + ')';
-    jsxScriptsEl.appendChild(li);
-  }
 }
 
 function setCopyStatus(statusEl, message, state) {
@@ -511,7 +486,6 @@ async function main() {
   const response = await fetch('./output.json');
   if (!response.ok) throw new Error('Failed to load output.json');
   const payload = await response.json();
-  const jsxScripts = jsxScriptsFromPayload(payload);
   rawJsxTreeText = typeof payload.jsxTreeText === 'string' ? payload.jsxTreeText : '';
   rawMermaidSourceText = typeof payload.mermaid === 'string' ? payload.mermaid : '';
   subtitleEl.textContent = payload.entry + '  •  ' + payload.rootDir;
@@ -521,7 +495,6 @@ async function main() {
   mermaidEl.textContent = rawMermaidSourceText;
   copyJsxTreeBtn.disabled = false;
   copyMermaidSourceBtn.disabled = false;
-  renderJsxScripts(jsxScripts);
   statsEl.append(
     statCard('modules', payload.summary.moduleCount),
     statCard('jsx files', payload.summary.jsxFileCount ?? payload.summary.jsxClassCount),

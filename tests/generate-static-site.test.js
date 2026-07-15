@@ -204,11 +204,15 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.match(html, /\.\/app\.js/);
   assert.match(html, /<details class="panel collapsible-panel" id="jsx-tree-panel">/);
   assert.match(html, /<details class="panel collapsible-panel" id="mermaid-source-panel">/);
+  assert.doesNotMatch(html, /id="jsx-line-counts-panel"/);
+  assert.doesNotMatch(html, />JSX line counts</);
+  assert.doesNotMatch(html, />Open JSON</);
+  assert.doesNotMatch(html, />Open Mermaid</);
   assert.doesNotMatch(html, /<details[^>]*\sopen(?:\s|>|=)/);
 
   const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
   assert.match(appJs, /payload\.jsxTreeText/);
-  assert.match(appJs, /renderJsxScripts\(jsxScripts\)/);
+  assert.doesNotMatch(appJs, /jsxScriptsEl|renderJsxScripts|jsxScriptsFromPayload/);
 
   const output = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
   assert.equal(output.entry, 'src/app.jsx');
