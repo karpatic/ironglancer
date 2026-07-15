@@ -77,6 +77,12 @@ function viewerHtml() {
       }
       button:hover, a.button:hover { background:#eef5ff; }
       .diagram-panel-body { display:grid; gap:12px; }
+      .text-panel-body { display:grid; gap:10px; }
+      .text-toolbar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; justify-content:space-between; }
+      .copy-status { min-height:1.2em; font-size:.85rem; color:var(--muted); }
+      .copy-status.is-success { color:#16703d; }
+      .copy-status.is-error { color:#b42318; }
+      button:disabled { cursor:not-allowed; opacity:.6; }
       .diagram-toolbar { justify-content:space-between; }
       .diagram-toolbar-group { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
       .diagram-status { font-size:.85rem; color:var(--muted); }
@@ -150,7 +156,13 @@ function viewerHtml() {
           </div>
           <details class="panel collapsible-panel" id="jsx-tree-panel">
             <summary><h2>JSX hierarchy</h2></summary>
-            <div class="body"><pre id="jsx-tree"></pre></div>
+            <div class="body text-panel-body">
+              <div class="text-toolbar">
+                <button id="copy-jsx-tree-btn" type="button" aria-describedby="copy-jsx-tree-status" disabled>Copy JSX tree</button>
+                <span id="copy-jsx-tree-status" class="copy-status" role="status" aria-live="polite"></span>
+              </div>
+              <pre id="jsx-tree"></pre>
+            </div>
           </details>
           <details class="panel collapsible-panel" id="dependency-tree-panel">
             <summary><h2>Dependency tree</h2></summary>
@@ -162,7 +174,13 @@ function viewerHtml() {
           </details>
           <details class="panel collapsible-panel" id="mermaid-source-panel">
             <summary><h2>Mermaid source</h2></summary>
-            <div class="body"><pre id="mermaid"></pre></div>
+            <div class="body text-panel-body">
+              <div class="text-toolbar">
+                <button id="copy-mermaid-source-btn" type="button" aria-describedby="copy-mermaid-source-status" disabled>Copy Mermaid source</button>
+                <span id="copy-mermaid-source-status" class="copy-status" role="status" aria-live="polite"></span>
+              </div>
+              <pre id="mermaid"></pre>
+            </div>
           </details>
         </div>
       </div>
@@ -193,7 +211,13 @@ const zoomOutBtn = document.getElementById('zoom-out-btn');
 const fitBtn = document.getElementById('fit-btn');
 const resetViewBtn = document.getElementById('reset-view-btn');
 const zoomStatusEl = document.getElementById('zoom-status');
+const copyJsxTreeBtn = document.getElementById('copy-jsx-tree-btn');
+const copyMermaidSourceBtn = document.getElementById('copy-mermaid-source-btn');
+const copyJsxTreeStatusEl = document.getElementById('copy-jsx-tree-status');
+const copyMermaidSourceStatusEl = document.getElementById('copy-mermaid-source-status');
 let latestSvg = '';
+let rawJsxTreeText = '';
+let rawMermaidSourceText = '';
 let activeSvg = null;
 let baseWidth = 0;
 let baseHeight = 0;
@@ -231,6 +255,59 @@ function renderJsxScripts(items) {
     const li = document.createElement('li');
     li.textContent = item.path + ' (' + formatLineCount(item.lineCount) + ')';
     jsxScriptsEl.appendChild(li);
+  }
+}
+
+function setCopyStatus(statusEl, message, state) {
+  statusEl.textContent = message;
+  statusEl.classList.remove('is-success', 'is-error');
+  if (state) statusEl.classList.add('is-' + state);
+}
+
+function copyTextWithTextarea(text) {
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', '');
+  textarea.setAttribute('aria-hidden', 'true');
+  textarea.style.position = 'fixed';
+  textarea.style.top = '-1000px';
+  textarea.style.left = '-1000px';
+  textarea.style.width = '1px';
+  textarea.style.height = '1px';
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+
+  let didCopy = false;
+  try {
+    if (typeof document.execCommand === 'function') didCopy = document.execCommand('copy');
+  } finally {
+    textarea.remove();
+  }
+
+  if (!didCopy) throw new Error('Copy command was unavailable');
+}
+
+async function writeClipboardText(text) {
+  const clipboard = typeof navigator === 'object' ? navigator.clipboard : null;
+  if (clipboard && typeof clipboard.writeText === 'function') {
+    try {
+      await clipboard.writeText(text);
+      return;
+    } catch (error) {
+      // Fall back for browsers that expose Clipboard API but reject this call.
+    }
+  }
+
+  copyTextWithTextarea(text);
+}
+
+async function copyRawText(text, label, statusEl) {
+  try {
+    await writeClipboardText(text);
+    setCopyStatus(statusEl, 'Copied ' + label + '.', 'success');
+  } catch (error) {
+    setCopyStatus(statusEl, 'Could not copy ' + label + '.', 'error');
   }
 }
 
@@ -435,11 +512,15 @@ async function main() {
   if (!response.ok) throw new Error('Failed to load output.json');
   const payload = await response.json();
   const jsxScripts = jsxScriptsFromPayload(payload);
+  rawJsxTreeText = typeof payload.jsxTreeText === 'string' ? payload.jsxTreeText : '';
+  rawMermaidSourceText = typeof payload.mermaid === 'string' ? payload.mermaid : '';
   subtitleEl.textContent = payload.entry + '  •  ' + payload.rootDir;
   buildMetaEl.textContent = formatBuildMeta(payload.meta);
-  jsxTreeEl.textContent = payload.jsxTreeText || 'No JSX files found.';
+  jsxTreeEl.textContent = rawJsxTreeText || 'No JSX files found.';
   treeEl.textContent = payload.treeText;
-  mermaidEl.textContent = payload.mermaid;
+  mermaidEl.textContent = rawMermaidSourceText;
+  copyJsxTreeBtn.disabled = false;
+  copyMermaidSourceBtn.disabled = false;
   renderJsxScripts(jsxScripts);
   statsEl.append(
     statCard('modules', payload.summary.moduleCount),
@@ -462,6 +543,14 @@ downloadBtn.addEventListener('click', () => {
   anchor.click();
   anchor.remove();
   setTimeout(() => URL.revokeObjectURL(url), 0);
+});
+
+copyJsxTreeBtn.addEventListener('click', () => {
+  copyRawText(rawJsxTreeText, 'JSX tree', copyJsxTreeStatusEl);
+});
+
+copyMermaidSourceBtn.addEventListener('click', () => {
+  copyRawText(rawMermaidSourceText, 'Mermaid source', copyMermaidSourceStatusEl);
 });
 
 bindInteraction();
