@@ -186,8 +186,20 @@ async function resolveImport({ rootDir, specifier, importerRel, aliases, routeAl
   return null;
 }
 
+function sourceLines(source) {
+  const normalized = normalizeString(source);
+  if (!normalized) return [];
+  const lines = normalized.split(/\r\n|\r|\n/);
+  if (/[\r\n]$/.test(normalized)) lines.pop();
+  return lines;
+}
+
+function formatLineCount(lineCount) {
+  return `${lineCount} ${lineCount === 1 ? 'line' : 'lines'}`;
+}
+
 function scriptStats(rel, source) {
-  const lines = normalizeString(source).split(/\r?\n/);
+  const lines = sourceLines(source);
   return {
     path: rel,
     lineCount: lines.length,
@@ -304,6 +316,56 @@ function buildTreeText(graph) {
   return lines.join('\n');
 }
 
+function createTreeNode() {
+  return {
+    dirs: new Map(),
+    files: [],
+  };
+}
+
+function buildJsxTreeText(jsxScripts) {
+  if (!Array.isArray(jsxScripts) || jsxScripts.length === 0) return 'No JSX files found.';
+  const root = createTreeNode();
+
+  for (const script of jsxScripts) {
+    const parts = toPosixPath(script.path).split('/').filter(Boolean);
+    const fileName = parts.pop();
+    if (!fileName) continue;
+
+    let node = root;
+    for (const dirName of parts) {
+      if (!node.dirs.has(dirName)) node.dirs.set(dirName, createTreeNode());
+      node = node.dirs.get(dirName);
+    }
+    node.files.push({
+      name: fileName,
+      lineCount: script.lineCount,
+    });
+  }
+
+  const lines = ['.'];
+  const render = (node, prefix) => {
+    const entries = [
+      ...Array.from(node.dirs, ([name, child]) => ({ type: 'dir', name, child })),
+      ...node.files.map((file) => ({ type: 'file', ...file })),
+    ].sort((a, b) => compareLocale(a.name, b.name) || compareLocale(a.type, b.type));
+
+    entries.forEach((entry, index) => {
+      const isLast = index === entries.length - 1;
+      const connector = isLast ? '`-- ' : '|-- ';
+      if (entry.type === 'file') {
+        lines.push(`${prefix}${connector}${entry.name} (${formatLineCount(entry.lineCount)})`);
+        return;
+      }
+      lines.push(`${prefix}${connector}${entry.name}`);
+      render(entry.child, `${prefix}${isLast ? '    ' : '|   '}`);
+    });
+  };
+
+  render(root, '');
+  return lines.join('\n');
+}
+
 export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeAliases = [] } = {}) {
   const resolvedRoot = path.resolve(normalizeString(rootDir).trim() || '.');
   const resolvedEntry = await resolveEntry(resolvedRoot, entry);
@@ -373,20 +435,27 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
   const jsScripts = Array.from(modules.values())
     .map((record) => record.stats)
     .sort((a, b) => compareLocale(a.path, b.path));
-  const jsxClassCount = Array.from(modules.keys()).filter((rel) => isJsxModule(rel)).length;
+  const jsxScripts = jsScripts
+    .filter((script) => isJsxModule(script.path))
+    .sort((a, b) => compareLocale(a.path, b.path));
+  const jsxClassCount = jsxScripts.length;
   const mermaid = buildMermaid(graph);
   const treeText = buildTreeText(graph);
+  const jsxTreeText = buildJsxTreeText(jsxScripts);
 
   return {
     rootDir: resolvedRoot,
     entryRel: resolvedEntry.rel,
     graph,
     treeText,
+    jsxTreeText,
     jsScripts,
+    jsxScripts,
     mermaid,
     summary: {
       moduleCount: modules.size,
       jsxClassCount,
+      jsxFileCount: jsxScripts.length,
       jsScriptCount: jsScripts.length,
       externalCount: externals.size,
     },

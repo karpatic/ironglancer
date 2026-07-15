@@ -14,6 +14,7 @@ test('analyzeProject resolves local modules, import-map aliases, and externals',
   assert.equal(result.summary.externalCount, 1);
   assert.ok(result.treeText.includes('src/components/App.jsx'));
   assert.ok(result.treeText.includes('src/panes/Inspector.jsx'));
+  assert.equal(result.summary.jsxFileCount, 3);
   assert.ok(result.mermaid.includes('classDiagram'));
   assert.deepEqual(result.jsScripts.map((item) => item.path), [
     'shared/theme.js',
@@ -22,6 +23,22 @@ test('analyzeProject resolves local modules, import-map aliases, and externals',
     'src/lib/util.js',
     'src/panes/Inspector.jsx',
   ]);
+  assert.deepEqual(result.jsxScripts.map(({ path: scriptPath, lineCount }) => ({ path: scriptPath, lineCount })), [
+    { path: 'src/app.jsx', lineCount: 9 },
+    { path: 'src/components/App.jsx', lineCount: 3 },
+    { path: 'src/panes/Inspector.jsx', lineCount: 3 },
+  ]);
+  assert.equal(result.jsxTreeText, [
+    '.',
+    '`-- src',
+    '    |-- app.jsx (9 lines)',
+    '    |-- components',
+    '    |   `-- App.jsx (3 lines)',
+    '    `-- panes',
+    '        `-- Inspector.jsx (3 lines)',
+  ].join('\n'));
+  assert.ok(!result.jsxTreeText.includes('shared/theme.js'));
+  assert.ok(!result.jsxTreeText.includes('[external]'));
 });
 
 const creatorLikeRoot = path.resolve('tests/fixtures/creator-like');

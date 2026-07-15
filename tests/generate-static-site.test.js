@@ -21,10 +21,27 @@ test('generateStaticSite writes a static viewer bundle', async () => {
 
   const html = await fs.readFile(path.join(outDir, 'index.html'), 'utf8');
   assert.match(html, /\.\/app\.js/);
+  assert.match(html, /<details class="panel collapsible-panel" id="jsx-tree-panel">/);
+  assert.match(html, /<details class="panel collapsible-panel" id="mermaid-source-panel">/);
+  assert.doesNotMatch(html, /<details[^>]*\sopen(?:\s|>|=)/);
+
+  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
+  assert.match(appJs, /payload\.jsxTreeText/);
+  assert.match(appJs, /renderJsxScripts\(jsxScripts\)/);
 
   const output = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
   assert.equal(output.entry, 'src/app.jsx');
   assert.equal(output.summary.moduleCount, 5);
+  assert.equal(output.summary.jsxFileCount, 3);
+  assert.deepEqual(output.jsxScripts.map(({ path: scriptPath, lineCount }) => ({ path: scriptPath, lineCount })), [
+    { path: 'src/app.jsx', lineCount: 9 },
+    { path: 'src/components/App.jsx', lineCount: 3 },
+    { path: 'src/panes/Inspector.jsx', lineCount: 3 },
+  ]);
+  assert.ok(output.jsxTreeText.includes('`-- src'));
+  assert.ok(output.jsxTreeText.includes('app.jsx (9 lines)'));
+  assert.ok(!output.jsxTreeText.includes('src/lib/util.js'));
+  assert.ok(!output.jsxTreeText.includes('[external]'));
 
   const vendorFiles = await fs.readdir(path.join(outDir, 'vendor'));
   assert.ok(vendorFiles.some((name) => name.includes('mermaid')));

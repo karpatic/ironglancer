@@ -31,6 +31,33 @@ function viewerHtml() {
       .panel { background:var(--panel); border:1px solid var(--border); border-radius:14px; overflow:hidden; box-shadow:0 8px 30px rgba(35,55,110,.06); }
       .panel h2 { margin:0; padding:12px 14px; border-bottom:1px solid var(--border); font-size:0.98rem; }
       .panel .body { padding:14px; }
+      .collapsible-panel summary {
+        display:flex;
+        justify-content:space-between;
+        align-items:center;
+        gap:12px;
+        padding:12px 14px;
+        border-bottom:1px solid var(--border);
+        cursor:pointer;
+        list-style:none;
+      }
+      .collapsible-panel:not([open]) summary { border-bottom:0; }
+      .collapsible-panel summary::-webkit-details-marker { display:none; }
+      .collapsible-panel summary h2 { padding:0; border-bottom:0; }
+      .collapsible-panel summary::after {
+        content:'+';
+        display:inline-grid;
+        place-items:center;
+        width:22px;
+        height:22px;
+        border:1px solid #bfd1f2;
+        border-radius:6px;
+        color:#22407d;
+        background:#f7faff;
+        font-weight:700;
+        flex:0 0 auto;
+      }
+      .collapsible-panel[open] summary::after { content:'-'; }
       pre { margin:0; white-space:pre-wrap; overflow:auto; font-size:.85rem; }
       ul { margin:0; padding-left:20px; }
       .stats { display:grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap:12px; }
@@ -121,18 +148,22 @@ function viewerHtml() {
             <h2>Summary</h2>
             <div id="stats" class="body stats"></div>
           </div>
-          <div class="panel">
-            <h2>Dependency tree</h2>
+          <details class="panel collapsible-panel" id="jsx-tree-panel">
+            <summary><h2>JSX hierarchy</h2></summary>
+            <div class="body"><pre id="jsx-tree"></pre></div>
+          </details>
+          <details class="panel collapsible-panel" id="dependency-tree-panel">
+            <summary><h2>Dependency tree</h2></summary>
             <div class="body"><pre id="tree"></pre></div>
-          </div>
-          <div class="panel">
-            <h2>Scripts</h2>
-            <div class="body"><ul id="scripts"></ul></div>
-          </div>
-          <div class="panel">
-            <h2>Mermaid source</h2>
+          </details>
+          <details class="panel collapsible-panel" id="jsx-line-counts-panel">
+            <summary><h2>JSX line counts</h2></summary>
+            <div class="body"><ul id="jsx-scripts"></ul></div>
+          </details>
+          <details class="panel collapsible-panel" id="mermaid-source-panel">
+            <summary><h2>Mermaid source</h2></summary>
             <div class="body"><pre id="mermaid"></pre></div>
-          </div>
+          </details>
         </div>
       </div>
     </div>
@@ -149,8 +180,9 @@ mermaid.initialize({ startOnLoad: false, securityLevel: 'loose', theme: 'default
 
 const subtitleEl = document.getElementById('subtitle');
 const buildMetaEl = document.getElementById('build-meta');
+const jsxTreeEl = document.getElementById('jsx-tree');
 const treeEl = document.getElementById('tree');
-const scriptsEl = document.getElementById('scripts');
+const jsxScriptsEl = document.getElementById('jsx-scripts');
 const mermaidEl = document.getElementById('mermaid');
 const diagramEl = document.getElementById('diagram');
 const viewportEl = document.getElementById('diagram-viewport');
@@ -184,12 +216,21 @@ function statCard(label, value) {
   return div;
 }
 
-function renderScripts(items) {
-  scriptsEl.textContent = '';
+function formatLineCount(lineCount) {
+  return String(lineCount) + ' ' + (lineCount === 1 ? 'line' : 'lines');
+}
+
+function jsxScriptsFromPayload(payload) {
+  if (Array.isArray(payload.jsxScripts)) return payload.jsxScripts;
+  return (payload.jsScripts || []).filter((item) => /\\.jsx$/i.test(item.path || ''));
+}
+
+function renderJsxScripts(items) {
+  jsxScriptsEl.textContent = '';
   for (const item of items || []) {
     const li = document.createElement('li');
-    li.textContent = item.path + '  lines=' + item.lineCount + '  maxLineLength=' + item.maxLineLength;
-    scriptsEl.appendChild(li);
+    li.textContent = item.path + ' (' + formatLineCount(item.lineCount) + ')';
+    jsxScriptsEl.appendChild(li);
   }
 }
 
@@ -393,14 +434,16 @@ async function main() {
   const response = await fetch('./output.json');
   if (!response.ok) throw new Error('Failed to load output.json');
   const payload = await response.json();
+  const jsxScripts = jsxScriptsFromPayload(payload);
   subtitleEl.textContent = payload.entry + '  •  ' + payload.rootDir;
   buildMetaEl.textContent = formatBuildMeta(payload.meta);
+  jsxTreeEl.textContent = payload.jsxTreeText || 'No JSX files found.';
   treeEl.textContent = payload.treeText;
   mermaidEl.textContent = payload.mermaid;
-  renderScripts(payload.jsScripts);
+  renderJsxScripts(jsxScripts);
   statsEl.append(
     statCard('modules', payload.summary.moduleCount),
-    statCard('jsx classes', payload.summary.jsxClassCount),
+    statCard('jsx files', payload.summary.jsxFileCount ?? payload.summary.jsxClassCount),
     statCard('scripts', payload.summary.jsScriptCount),
     statCard('externals', payload.summary.externalCount),
   );
@@ -461,7 +504,9 @@ export async function generateStaticSite({ rootDir, entry, outDir, routeAliases 
     rootDir: analysis.rootDir,
     entry: analysis.entryRel,
     treeText: analysis.treeText,
+    jsxTreeText: analysis.jsxTreeText,
     jsScripts: analysis.jsScripts,
+    jsxScripts: analysis.jsxScripts,
     mermaid: analysis.mermaid,
     summary: analysis.summary,
     meta: {
