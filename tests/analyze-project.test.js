@@ -116,3 +116,95 @@ test('analyzeProject resolves lazy-loaded module specifier constants', async () 
   assert.ok(result.mermaid.includes('app --> creator_lazy_widget : imports'));
   assert.ok(result.mermaid.includes('app --> creator_panel : imports'));
 });
+
+const importEdgeMetadataRoot = path.resolve('tests/fixtures/import-edge-metadata');
+
+test('analyzeProject exposes JSX import edge metadata', async () => {
+  const result = await analyzeProject({
+    rootDir: importEdgeMetadataRoot,
+    entry: 'src/app.jsx',
+  });
+
+  assert.deepEqual(result.jsScripts.map((item) => item.path), [
+    'src/app.jsx',
+    'src/dynamic-child.jsx',
+    'src/faculty-body-child.jsx',
+    'src/faculty-editor-child.jsx',
+    'src/static-child.jsx',
+  ]);
+
+  assert.deepEqual(result.importEdges, [
+    {
+      source: 'app',
+      target: 'dynamic_child',
+      sourcePath: 'src/app.jsx',
+      targetPath: 'src/dynamic-child.jsx',
+      loadKinds: ['dynamic'],
+      imports: [
+        {
+          imported: 'DynamicExport',
+          local: 'DynamicLocal',
+          kind: 'named',
+          inferred: false,
+        },
+      ],
+    },
+    {
+      source: 'app',
+      target: 'faculty_body_child',
+      sourcePath: 'src/app.jsx',
+      targetPath: 'src/faculty-body-child.jsx',
+      loadKinds: ['lazy'],
+      imports: [
+        {
+          imported: 'CreatorViewBody',
+          local: 'CreatorViewBody',
+          kind: 'named',
+          inferred: true,
+        },
+      ],
+    },
+    {
+      source: 'app',
+      target: 'faculty_editor_child',
+      sourcePath: 'src/app.jsx',
+      targetPath: 'src/faculty-editor-child.jsx',
+      loadKinds: ['lazy'],
+      imports: [
+        {
+          imported: 'CreatorQuizEntryEditor',
+          local: 'CreatorQuizEntryEditor',
+          kind: 'named',
+          inferred: true,
+        },
+      ],
+    },
+    {
+      source: 'app',
+      target: 'static_child',
+      sourcePath: 'src/app.jsx',
+      targetPath: 'src/static-child.jsx',
+      loadKinds: ['static'],
+      imports: [
+        {
+          imported: 'default',
+          local: 'StaticDefault',
+          kind: 'default',
+          inferred: false,
+        },
+        {
+          imported: 'StaticNamed',
+          local: 'StaticAlias',
+          kind: 'named',
+          inferred: false,
+        },
+        {
+          imported: 'StaticSame',
+          local: 'StaticSame',
+          kind: 'named',
+          inferred: false,
+        },
+      ],
+    },
+  ]);
+});

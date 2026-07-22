@@ -111,7 +111,19 @@ function viewerHtml() {
         display:block;
         max-width:none;
         height:auto;
+        overflow:visible;
       }
+      .diagram-canvas path.relation, .diagram-canvas path[data-edge="true"], .diagram-canvas g.edgeLabel { cursor:pointer; }
+      .diagram-canvas .edge-hit-target {
+        fill:none !important;
+        stroke:transparent !important;
+        stroke-width:16px !important;
+        pointer-events:stroke;
+      }
+      .diagram-canvas path.relation.is-selected, .diagram-canvas path[data-edge="true"].is-selected { stroke:var(--accent) !important; stroke-width:3px !important; }
+      .diagram-canvas .edge-import-label { pointer-events:none; }
+      .diagram-canvas g.edgeLabel.is-expanded .edge-import-label rect { fill:#eef5ff; stroke:#8eb5f4; stroke-width:1.5; }
+      .diagram-canvas g.edgeLabel.is-expanded .edge-import-label text { fill:#17366f; font-weight:700; font-size:13px; }
     </style>
   </head>
   <body>
@@ -343,6 +355,166 @@ function resetView() {
   centerViewport();
 }
 
+function edgeTargetBasename(edge = {}) {
+  const targetPath = typeof edge.targetPath === 'string' ? edge.targetPath : '';
+  const target = targetPath || (typeof edge.target === 'string' ? edge.target : '');
+  return target.split(/[\\/]/).filter(Boolean).at(-1) || target;
+}
+
+function formatNamedImportBinding(binding = {}) {
+  const imported = typeof binding.imported === 'string' ? binding.imported : '';
+  const local = typeof binding.local === 'string' ? binding.local : '';
+  if (!imported && !local) return '';
+  const callable = (local || imported) + '()';
+  if (!imported || imported === local) return callable;
+  return imported + ' as ' + callable;
+}
+
+function edgeImportLabels(edge = {}) {
+  const labels = [];
+  const targetLabel = edgeTargetBasename(edge);
+  for (const binding of Array.isArray(edge.imports) ? edge.imports : []) {
+    const kind = typeof binding?.kind === 'string' ? binding.kind : 'named';
+    if (kind === 'named') {
+      labels.push(formatNamedImportBinding(binding));
+    } else if (targetLabel) {
+      labels.push(targetLabel);
+    }
+  }
+  if (labels.length === 0 && targetLabel) labels.push(targetLabel);
+  return Array.from(new Set(labels)).filter(Boolean);
+}
+
+function edgeDataIdPrefix(source, target) {
+  return 'id_' + source + '_' + target + '_';
+}
+
+function hasClass(element, className) {
+  if (!element) return false;
+  if (element.classList && typeof element.classList.contains === 'function') {
+    return element.classList.contains(className);
+  }
+  return (' ' + (element.getAttribute('class') || '') + ' ').includes(' ' + className + ' ');
+}
+
+function findEdgeLabelGroup(label, dataId) {
+  const groups = Array.from(label.querySelectorAll('g.label[data-id]'));
+  return groups.find((group) => group.getAttribute('data-id') === dataId) || groups[0] || null;
+}
+
+function findRenderedEdgeLabel(labels, dataId) {
+  for (const label of labels) {
+    const labelGroup = findEdgeLabelGroup(label, dataId);
+    if (labelGroup && labelGroup.getAttribute('data-id') === dataId) return { label, labelGroup };
+  }
+  return { label: null, labelGroup: null };
+}
+
+function originalEdgeLabelContent(labelGroup) {
+  return Array.from(labelGroup.children)
+    .find((child) => !hasClass(child, 'edge-import-label')) || null;
+}
+
+let expandedEdge = null;
+
+function collapseExpandedEdge() {
+  if (!expandedEdge) return;
+  const { customLabel, label, originalContent, originalDisplay, path } = expandedEdge;
+  if (customLabel && typeof customLabel.remove === 'function') customLabel.remove();
+  if (originalContent) originalContent.style.display = originalDisplay;
+  if (label) label.classList.remove('is-expanded');
+  if (path) path.classList.remove('is-selected');
+  expandedEdge = null;
+}
+
+function expandEdgeLabel(edge, path, label, labelGroup) {
+  collapseExpandedEdge();
+  const originalContent = labelGroup && originalEdgeLabelContent(labelGroup);
+  if (!labelGroup || !originalContent) return;
+  const labels = edgeImportLabels(edge);
+  const lines = labels.length > 0 ? labels : [edge.targetPath || edge.target || 'module import'];
+  const width = Math.min(460, Math.max(120, Math.ceil(Math.max(...lines.map((line) => line.length)) * 7.2) + 24));
+  const height = 12 + (lines.length * 20);
+  const svgNamespace = 'http://www.w3.org/2000/svg';
+  const customLabel = document.createElementNS(svgNamespace, 'g');
+  const rect = document.createElementNS(svgNamespace, 'rect');
+  const text = document.createElementNS(svgNamespace, 'text');
+
+  customLabel.setAttribute('class', 'edge-import-label');
+  rect.setAttribute('x', String(-width / 2));
+  rect.setAttribute('y', String(-height / 2));
+  rect.setAttribute('width', String(width));
+  rect.setAttribute('height', String(height));
+  rect.setAttribute('rx', '7');
+  text.setAttribute('x', '0');
+  text.setAttribute('y', String((-height / 2) + 18));
+  text.setAttribute('text-anchor', 'middle');
+  lines.forEach((line, index) => {
+    const tspan = document.createElementNS(svgNamespace, 'tspan');
+    tspan.setAttribute('x', '0');
+    if (index > 0) tspan.setAttribute('dy', '20');
+    tspan.textContent = line;
+    text.appendChild(tspan);
+  });
+  customLabel.append(rect, text);
+  const originalDisplay = originalContent.style.display;
+  originalContent.style.display = 'none';
+  labelGroup.appendChild(customLabel);
+  label.classList.add('is-expanded');
+  path.classList.add('is-selected');
+  expandedEdge = { customLabel, label, originalContent, originalDisplay, path };
+}
+
+function addEdgeActivation(element, callback) {
+  element.setAttribute('tabindex', '0');
+  element.setAttribute('role', 'button');
+  element.addEventListener('click', callback);
+  element.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    callback(event);
+  });
+}
+
+function wireImportEdges(importEdges) {
+  if (!activeSvg || typeof activeSvg.querySelectorAll !== 'function') return;
+  const paths = Array.from(activeSvg.querySelectorAll('path[data-id]'))
+    .filter((path) => hasClass(path, 'relation') || path.getAttribute('data-edge') === 'true');
+  const labels = Array.from(activeSvg.querySelectorAll('g.edgeLabel'));
+  const claimedPaths = new Set();
+
+  for (const edge of Array.isArray(importEdges) ? importEdges : []) {
+    const prefix = edgeDataIdPrefix(edge.source, edge.target);
+    const path = paths.find((candidate) => {
+      const dataId = candidate.getAttribute('data-id') || '';
+      return !claimedPaths.has(candidate) && dataId.startsWith(prefix);
+    });
+    if (!path) continue;
+    const dataId = path.getAttribute('data-id');
+    const { label, labelGroup } = findRenderedEdgeLabel(labels, dataId);
+    if (!label || !labelGroup) continue;
+    claimedPaths.add(path);
+
+    const activate = () => expandEdgeLabel(edge, path, label, labelGroup);
+    const targetLabel = edge.targetPath || edge.target;
+    path.setAttribute('aria-label', 'Show imports for ' + targetLabel);
+    label.setAttribute('aria-label', 'Show imports for ' + targetLabel);
+    addEdgeActivation(path, activate);
+    addEdgeActivation(label, activate);
+
+    const hitPath = path.cloneNode(false);
+    hitPath.classList.add('edge-hit-target');
+    hitPath.removeAttribute('id');
+    hitPath.removeAttribute('data-id');
+    hitPath.removeAttribute('marker-start');
+    hitPath.removeAttribute('marker-mid');
+    hitPath.removeAttribute('marker-end');
+    hitPath.setAttribute('aria-hidden', 'true');
+    hitPath.addEventListener('click', activate);
+    path.parentNode.insertBefore(hitPath, path);
+  }
+}
+
 function distanceBetween(pointerA, pointerB) {
   return Math.hypot(pointerA.clientX - pointerB.clientX, pointerA.clientY - pointerB.clientY);
 }
@@ -448,7 +620,7 @@ function bindInteraction() {
   resetViewBtn.addEventListener('click', resetView);
 }
 
-function prepareSvgForInteraction(svgMarkup) {
+function prepareSvgForInteraction(svgMarkup, importEdges) {
   latestSvg = svgMarkup;
   diagramEl.innerHTML = svgMarkup;
   activeSvg = diagramEl.querySelector('svg');
@@ -469,6 +641,7 @@ function prepareSvgForInteraction(svgMarkup) {
   activeSvg.style.height = baseHeight + 'px';
   zoom = 1;
   updateZoomStatus();
+  wireImportEdges(importEdges);
   requestAnimationFrame(() => fitToViewport());
 }
 
@@ -502,7 +675,7 @@ async function main() {
     statCard('externals', payload.summary.externalCount),
   );
   const { svg } = await mermaid.render('ironglancer-diagram-' + Date.now(), payload.mermaid);
-  prepareSvgForInteraction(svg);
+  prepareSvgForInteraction(svg, payload.importEdges);
 }
 
 downloadBtn.addEventListener('click', () => {
@@ -570,6 +743,7 @@ export async function generateStaticSite({ rootDir, entry, outDir, routeAliases 
     jsScripts: analysis.jsScripts,
     jsxScripts: analysis.jsxScripts,
     mermaid: analysis.mermaid,
+    importEdges: analysis.importEdges,
     summary: analysis.summary,
     meta: {
       packageName: packageMeta.name,

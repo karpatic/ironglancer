@@ -34,6 +34,7 @@ class FakeElement {
         const classes = new Set(this.className.split(/\s+/).filter(Boolean));
         for (const name of names) classes.add(name);
         this.className = Array.from(classes).join(' ');
+        this.attributes.set('class', this.className);
       },
       remove: (...names) => {
         const removeNames = new Set(names);
@@ -41,7 +42,9 @@ class FakeElement {
           .split(/\s+/)
           .filter((name) => name && !removeNames.has(name))
           .join(' ');
+        this.attributes.set('class', this.className);
       },
+      contains: (name) => this.className.split(/\s+/).includes(name),
     };
   }
 
@@ -51,11 +54,22 @@ class FakeElement {
   }
 
   get textContent() {
+    if (this.children.length > 0) {
+      return this.children.map((child) => child.textContent).join('');
+    }
     return this._textContent;
   }
 
   set innerHTML(value) {
     this._innerHTML = String(value);
+    this.children = [];
+    if (this.id === 'diagram' && this._innerHTML.includes('<svg')) {
+      const svg = this.ownerDocument.renderedSvgFactory
+        ? this.ownerDocument.renderedSvgFactory(this.ownerDocument)
+        : this.ownerDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.viewBox = svg.viewBox || { baseVal: { width: 640, height: 320 } };
+      this.appendChild(svg);
+    }
   }
 
   get innerHTML() {
@@ -72,6 +86,17 @@ class FakeElement {
     return node;
   }
 
+  insertBefore(node, referenceNode) {
+    node.parentNode = this;
+    const index = this.children.indexOf(referenceNode);
+    if (index === -1) {
+      this.children.push(node);
+      return node;
+    }
+    this.children.splice(index, 0, node);
+    return node;
+  }
+
   remove() {
     if (!this.parentNode) return;
     this.parentNode.children = this.parentNode.children.filter((child) => child !== this);
@@ -80,11 +105,20 @@ class FakeElement {
 
   setAttribute(name, value) {
     this.attributes.set(name, String(value));
+    if (name === 'class') this.className = String(value);
+    if (name === 'id') this.id = String(value);
     if (name === 'disabled') this.disabled = true;
   }
 
   getAttribute(name) {
     return this.attributes.get(name) ?? null;
+  }
+
+  removeAttribute(name) {
+    this.attributes.delete(name);
+    if (name === 'class') this.className = '';
+    if (name === 'id') this.id = '';
+    if (name === 'disabled') this.disabled = false;
   }
 
   addEventListener(type, listener) {
@@ -110,17 +144,70 @@ class FakeElement {
     return { left: 0, top: 0, width: this.clientWidth, height: this.clientHeight };
   }
 
+  get firstElementChild() {
+    return this.children[0] || null;
+  }
+
+  cloneNode(deep = false) {
+    const clone = new FakeElement(this.tagName.toLowerCase(), this.id);
+    clone.ownerDocument = this.ownerDocument;
+    clone.className = this.className;
+    clone.disabled = this.disabled;
+    clone.value = this.value;
+    clone.scrollLeft = this.scrollLeft;
+    clone.scrollTop = this.scrollTop;
+    clone.scrollWidth = this.scrollWidth;
+    clone.scrollHeight = this.scrollHeight;
+    clone.clientWidth = this.clientWidth;
+    clone.clientHeight = this.clientHeight;
+    clone._textContent = this._textContent;
+    clone._innerHTML = this._innerHTML;
+    clone.style = { ...this.style };
+    clone.viewBox = this.viewBox;
+    for (const [name, value] of this.attributes) clone.attributes.set(name, value);
+    if (deep) {
+      for (const child of this.children) clone.appendChild(child.cloneNode(true));
+    }
+    return clone;
+  }
+
+  matchesSelector(selector) {
+    const attrMatches = Array.from(selector.matchAll(/\[([^\]=]+)(?:=(['"]?)(.*?)\2)?\]/g));
+    const selectorWithoutAttrs = selector.replace(/\[[^\]]+\]/g, '');
+    const [tagName, ...classNames] = selectorWithoutAttrs.split('.');
+    if (tagName && this.tagName.toLowerCase() !== tagName.toLowerCase()) return false;
+    for (const className of classNames) {
+      if (!this.classList.contains(className)) return false;
+    }
+    for (const [, name, , expectedValue] of attrMatches) {
+      const actualValue = this.getAttribute(name);
+      if (actualValue == null) return false;
+      if (expectedValue !== undefined && actualValue !== expectedValue) return false;
+    }
+    return true;
+  }
+
+  querySelectorAll(selector) {
+    const matches = [];
+    const visit = (element) => {
+      for (const child of element.children) {
+        if (child.matchesSelector(selector)) matches.push(child);
+        visit(child);
+      }
+    };
+    visit(this);
+    return matches;
+  }
+
   querySelector(selector) {
-    if (selector !== 'svg' || !this._innerHTML.includes('<svg')) return null;
-    const svg = new FakeElement('svg');
-    svg.viewBox = { baseVal: { width: 640, height: 320 } };
-    return svg;
+    return this.querySelectorAll(selector)[0] || null;
   }
 }
 
 class FakeDocument {
-  constructor(execCommand) {
+  constructor(execCommand, renderedSvgFactory) {
     this.elements = new Map();
+    this.renderedSvgFactory = renderedSvgFactory;
     this.selectedText = '';
     this.body = this.createElement('body');
     this.execCommand = (command) => (execCommand ? execCommand(command, this) : false);
@@ -130,6 +217,10 @@ class FakeDocument {
     const element = new FakeElement(tagName);
     element.ownerDocument = this;
     return element;
+  }
+
+  createElementNS(namespace, tagName) {
+    return this.createElement(tagName);
   }
 
   getElementById(id) {
@@ -148,8 +239,15 @@ async function flushAsyncWork() {
   await Promise.resolve();
 }
 
-async function runGeneratedViewerApp({ appJs, payload, clipboardWriteText, execCommand }) {
-  const document = new FakeDocument(execCommand);
+async function runGeneratedViewerApp({
+  appJs,
+  payload,
+  clipboardWriteText,
+  execCommand,
+  renderedSvgFactory,
+  renderedSvgMarkup = '<svg viewBox="0 0 640 320"></svg>',
+}) {
+  const document = new FakeDocument(execCommand, renderedSvgFactory);
   const context = {
     Blob,
     URL: {
@@ -170,7 +268,7 @@ async function runGeneratedViewerApp({ appJs, payload, clipboardWriteText, execC
     clearTimeout() {},
     __mermaid: {
       initialize() {},
-      render: async () => ({ svg: '<svg viewBox="0 0 640 320"></svg>' }),
+      render: async () => ({ svg: renderedSvgMarkup }),
     },
   };
   context.globalThis = context;
@@ -184,9 +282,31 @@ async function runGeneratedViewerApp({ appJs, payload, clipboardWriteText, execC
 
   for (let attempt = 0; attempt < 10; attempt += 1) {
     await flushAsyncWork();
-    if (document.getElementById('mermaid').textContent === payload.mermaid) return { document };
+    if (document.getElementById('mermaid').textContent === payload.mermaid) return { context, document };
   }
   throw new Error('generated viewer app did not finish rendering test payload');
+}
+
+function createFakeMermaidEdge(document, { source, target }) {
+  const dataId = `id_${source}_${target}_fake`;
+  const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+  const pathElement = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  const edgeLabel = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+  const labelGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+  const originalLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+
+  pathElement.setAttribute('class', 'relation');
+  pathElement.setAttribute('data-id', dataId);
+  edgeLabel.setAttribute('class', 'edgeLabel');
+  labelGroup.setAttribute('class', 'label');
+  labelGroup.setAttribute('data-id', dataId);
+  originalLabel.textContent = 'imports';
+
+  labelGroup.appendChild(originalLabel);
+  edgeLabel.appendChild(labelGroup);
+  group.append(pathElement, edgeLabel);
+
+  return { edgeLabel, group, labelGroup, originalLabel, pathElement };
 }
 
 test('generateStaticSite writes a static viewer bundle', async () => {
@@ -227,6 +347,7 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.ok(output.jsxTreeText.includes('app.jsx (9 lines)'));
   assert.ok(!output.jsxTreeText.includes('src/lib/util.js'));
   assert.ok(!output.jsxTreeText.includes('[external]'));
+  assert.deepEqual(output.importEdges, result.importEdges);
 
   const vendorFiles = await fs.readdir(path.join(outDir, 'vendor'));
   assert.ok(vendorFiles.some((name) => name.includes('mermaid')));
@@ -302,4 +423,47 @@ test('generated viewer copy controls fall back and report copy failure', async (
   const statusEl = failureHarness.document.getElementById('copy-jsx-tree-status');
   assert.equal(statusEl.textContent, 'Could not copy JSX tree.');
   assert.match(statusEl.className, /is-error/);
+});
+
+test('generated viewer formats edge imports for clickable inline labels', async () => {
+  const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-edge-imports-'));
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
+
+  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
+  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
+  const rendered = {};
+  const { document } = await runGeneratedViewerApp({
+    appJs,
+    payload,
+    renderedSvgFactory: (fakeDocument) => {
+      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.viewBox = { baseVal: { width: 640, height: 320 } };
+      Object.assign(rendered, createFakeMermaidEdge(fakeDocument, {
+        source: 'app',
+        target: 'static_child',
+      }));
+      svg.appendChild(rendered.group);
+      return svg;
+    },
+  });
+
+  rendered.pathElement.click();
+
+  const customLabel = rendered.labelGroup.querySelector('g.edge-import-label');
+  assert.ok(customLabel, 'expected clicking the rendered edge to add a custom SVG label');
+  assert.equal(rendered.originalLabel.style.display, 'none');
+  assert.match(rendered.pathElement.className, /is-selected/);
+  assert.match(rendered.edgeLabel.className, /is-expanded/);
+
+  assert.deepEqual(
+    customLabel.querySelectorAll('tspan').map((line) => line.textContent),
+    ['static-child.jsx', 'StaticNamed as StaticAlias()', 'StaticSame()'],
+  );
+  assert.equal(rendered.pathElement.getAttribute('role'), 'button');
+  assert.equal(rendered.pathElement.getAttribute('aria-label'), 'Show imports for src/static-child.jsx');
+  assert.equal(
+    document.getElementById('diagram').querySelectorAll('path.edge-hit-target').length,
+    1,
+  );
 });

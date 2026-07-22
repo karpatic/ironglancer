@@ -258,6 +258,82 @@ function importedScriptVariablesForJsx(record) {
   return Array.from(variables).sort(compareLocale);
 }
 
+function normalizeImportEdgeBinding(binding) {
+  const imported = normalizeString(binding?.imported).trim();
+  const local = normalizeString(binding?.local).trim();
+  const kind = normalizeString(binding?.kind || 'named').trim() || 'named';
+  if (!imported || !local) return null;
+  return {
+    imported,
+    local,
+    kind,
+    inferred: Boolean(binding?.inferred),
+  };
+}
+
+function importKindRank(kind) {
+  if (kind === 'default') return 0;
+  if (kind === 'namespace') return 1;
+  return 2;
+}
+
+function compareImportEdgeBinding(a, b) {
+  return importKindRank(a.kind) - importKindRank(b.kind)
+    || compareLocale(a.imported, b.imported)
+    || compareLocale(a.local, b.local)
+    || Number(a.inferred) - Number(b.inferred);
+}
+
+function buildImportEdges(graph) {
+  const jsxModules = Array.from(graph.modules.values())
+    .filter((record) => isJsxModule(record.rel))
+    .sort((a, b) => compareLocale(a.rel, b.rel));
+  const classIds = buildClassIds(jsxModules);
+  const edgeMap = new Map();
+
+  for (const record of jsxModules) {
+    const source = classIds.get(record.rel);
+    for (const ref of Array.isArray(record.importRefs) ? record.importRefs : []) {
+      if (!ref?.localRel || !classIds.has(ref.localRel)) continue;
+      const key = `${record.rel}\u0000${ref.localRel}`;
+      if (!edgeMap.has(key)) {
+        edgeMap.set(key, {
+          source,
+          target: classIds.get(ref.localRel),
+          sourcePath: record.rel,
+          targetPath: ref.localRel,
+          loadKinds: new Set(),
+          imports: new Map(),
+        });
+      }
+
+      const edge = edgeMap.get(key);
+      const loadKind = normalizeString(ref.kind).trim();
+      if (loadKind) edge.loadKinds.add(loadKind);
+      for (const binding of Array.isArray(ref.bindings) ? ref.bindings : []) {
+        const normalized = normalizeImportEdgeBinding(binding);
+        if (!normalized) continue;
+        const bindingKey = `${normalized.kind}\u0000${normalized.imported}\u0000${normalized.local}\u0000${normalized.inferred}`;
+        edge.imports.set(bindingKey, normalized);
+      }
+    }
+  }
+
+  return Array.from(edgeMap.values())
+    .map((edge) => ({
+      source: edge.source,
+      target: edge.target,
+      sourcePath: edge.sourcePath,
+      targetPath: edge.targetPath,
+      loadKinds: Array.from(edge.loadKinds).sort(compareLocale),
+      imports: Array.from(edge.imports.values()).sort(compareImportEdgeBinding),
+    }))
+    .sort((a, b) => compareLocale(a.sourcePath, b.sourcePath)
+      || compareLocale(a.targetPath, b.targetPath)
+      || compareLocale(a.source, b.source)
+      || compareLocale(a.target, b.target));
+}
+
 function buildMermaid(graph) {
   const jsxModules = Array.from(graph.modules.values())
     .filter((record) => isJsxModule(record.rel))
@@ -440,6 +516,7 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
     .sort((a, b) => compareLocale(a.path, b.path));
   const jsxClassCount = jsxScripts.length;
   const mermaid = buildMermaid(graph);
+  const importEdges = buildImportEdges(graph);
   const treeText = buildTreeText(graph);
   const jsxTreeText = buildJsxTreeText(jsxScripts);
 
@@ -452,6 +529,7 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
     jsScripts,
     jsxScripts,
     mermaid,
+    importEdges,
     summary: {
       moduleCount: modules.size,
       jsxClassCount,
