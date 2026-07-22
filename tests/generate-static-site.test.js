@@ -425,13 +425,38 @@ test('generated viewer copy controls fall back and report copy failure', async (
   assert.match(statusEl.className, /is-error/);
 });
 
-test('generated viewer formats edge imports for clickable inline labels', async () => {
+test('generated viewer activates edge hit targets and formats Creator/file labels', async () => {
   const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
   const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-edge-imports-'));
   await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
 
   const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
-  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
+  const payload = {
+    ...JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8')),
+    importEdges: [
+      {
+        source: 'creator_course_view',
+        target: 'creator_view_body',
+        sourcePath: 'src/creator/creator-course-view.jsx',
+        targetPath: 'src/creator/creator-view-body.jsx',
+        loadKinds: ['static'],
+        imports: [
+          {
+            imported: 'default',
+            local: 'CreatorViewBody',
+            kind: 'default',
+            inferred: false,
+          },
+          {
+            imported: 'CreatorViewBody',
+            local: 'CreatorViewBody',
+            kind: 'named',
+            inferred: true,
+          },
+        ],
+      },
+    ],
+  };
   const rendered = {};
   const { document } = await runGeneratedViewerApp({
     appJs,
@@ -440,28 +465,35 @@ test('generated viewer formats edge imports for clickable inline labels', async 
       const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
       svg.viewBox = { baseVal: { width: 640, height: 320 } };
       Object.assign(rendered, createFakeMermaidEdge(fakeDocument, {
-        source: 'app',
-        target: 'static_child',
+        source: 'creator_course_view',
+        target: 'creator_view_body',
       }));
       svg.appendChild(rendered.group);
       return svg;
     },
   });
 
-  rendered.pathElement.click();
+  const hitPath = document.getElementById('diagram').querySelector('path.edge-hit-target');
+  assert.ok(hitPath, 'expected generated viewer to add a cloned edge hit target');
+  hitPath.click();
 
   const customLabel = rendered.labelGroup.querySelector('g.edge-import-label');
-  assert.ok(customLabel, 'expected clicking the rendered edge to add a custom SVG label');
+  assert.ok(customLabel, 'expected clicking the edge hit target to add a custom SVG label');
   assert.equal(rendered.originalLabel.style.display, 'none');
   assert.match(rendered.pathElement.className, /is-selected/);
   assert.match(rendered.edgeLabel.className, /is-expanded/);
 
   assert.deepEqual(
     customLabel.querySelectorAll('tspan').map((line) => line.textContent),
-    ['static-child.jsx', 'StaticNamed as StaticAlias()', 'StaticSame()'],
+    ['creator-view-body.jsx', 'CreatorViewBody()'],
   );
   assert.equal(rendered.pathElement.getAttribute('role'), 'button');
-  assert.equal(rendered.pathElement.getAttribute('aria-label'), 'Show imports for src/static-child.jsx');
+  assert.equal(rendered.pathElement.getAttribute('aria-label'), 'Show imports for src/creator/creator-view-body.jsx');
+  assert.equal(hitPath.getAttribute('aria-hidden'), 'true');
+  assert.equal(hitPath.getAttribute('focusable'), 'false');
+  assert.equal(hitPath.getAttribute('aria-label'), null);
+  assert.equal(hitPath.getAttribute('role'), null);
+  assert.equal(hitPath.getAttribute('tabindex'), null);
   assert.equal(
     document.getElementById('diagram').querySelectorAll('path.edge-hit-target').length,
     1,

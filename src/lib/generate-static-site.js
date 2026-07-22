@@ -465,10 +465,14 @@ function expandEdgeLabel(edge, path, label, labelGroup) {
   expandedEdge = { customLabel, label, originalContent, originalDisplay, path };
 }
 
+function addEdgeClickActivation(element, callback) {
+  element.addEventListener('click', callback);
+}
+
 function addEdgeActivation(element, callback) {
   element.setAttribute('tabindex', '0');
   element.setAttribute('role', 'button');
-  element.addEventListener('click', callback);
+  addEdgeClickActivation(element, callback);
   element.addEventListener('keydown', (event) => {
     if (event.key !== 'Enter' && event.key !== ' ') return;
     event.preventDefault();
@@ -506,11 +510,15 @@ function wireImportEdges(importEdges) {
     hitPath.classList.add('edge-hit-target');
     hitPath.removeAttribute('id');
     hitPath.removeAttribute('data-id');
+    hitPath.removeAttribute('aria-label');
+    hitPath.removeAttribute('role');
+    hitPath.removeAttribute('tabindex');
     hitPath.removeAttribute('marker-start');
     hitPath.removeAttribute('marker-mid');
     hitPath.removeAttribute('marker-end');
     hitPath.setAttribute('aria-hidden', 'true');
-    hitPath.addEventListener('click', activate);
+    hitPath.setAttribute('focusable', 'false');
+    addEdgeClickActivation(hitPath, activate);
     path.parentNode.insertBefore(hitPath, path);
   }
 }

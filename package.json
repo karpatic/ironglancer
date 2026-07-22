@@ -1,6 +1,6 @@
 {
   "name": "ironglancer",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Analyze a folder's JS/JSX module graph and emit a static IronGlancer site that only needs a file server.",
   "type": "module",
   "author": "Carlos Karpati",
