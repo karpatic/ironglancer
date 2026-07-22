@@ -59,6 +59,33 @@ function parseDynamicImportSymbols(binding) {
   return name ? [name] : [];
 }
 
+function unescapeStringLiteralValue(value) {
+  return normalizeString(value).replace(/\\(['"\\])/g, '$1');
+}
+
+function collectStringConstants(source) {
+  const text = normalizeString(source);
+  const constants = new Map();
+  const stringConstantPattern = /\b(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(['"])((?:\\.|(?!\2)[\s\S])*?)\2/g;
+  let match;
+  while ((match = stringConstantPattern.exec(text))) {
+    constants.set(match[1], unescapeStringLiteralValue(match[3]));
+  }
+  return constants;
+}
+
+function resolveSpecifierExpression(expression, constants) {
+  let text = normalizeString(expression).trim();
+  if (!text) return '';
+  const paneUrlMatch = text.match(/^paneUrl\s*\(\s*([\s\S]*?)\s*\)$/);
+  if (paneUrlMatch) text = paneUrlMatch[1].trim();
+  const literalMatch = text.match(/^(['"])((?:\\.|(?!\1)[\s\S])*?)\1$/);
+  if (literalMatch) return unescapeStringLiteralValue(literalMatch[2]);
+  const identifierMatch = text.match(/^[A-Za-z_$][A-Za-z0-9_$]*$/);
+  if (identifierMatch) return constants.get(text) || '';
+  return '';
+}
+
 function pushImportRef(refs, ref) {
   const specifier = normalizeString(ref?.specifier).trim();
   if (!specifier) return;
@@ -74,12 +101,16 @@ function pushImportRef(refs, ref) {
 export function extractImportRefs(source) {
   const imports = new Set();
   const text = normalizeString(source);
+  const constants = collectStringConstants(text);
   const refs = [];
+  const specifierExpression = `(?:paneUrl\\s*\\(\\s*)?(?:['"](?:\\\\.|[^'"])*['"]|[A-Za-z_$][A-Za-z0-9_$]*)\\s*\\)?`;
   const staticImportPattern = /\bimport\s+([\s\S]*?)\s+from\s+['"]([^'"]+)['"]/g;
   const sideEffectImportPattern = /\bimport\s+['"]([^'"]+)['"]/g;
   const exportFromPattern = /\bexport\s+[\s\S]*?\s+from\s+['"]([^'"]+)['"]/g;
-  const assignedWindowImportPattern = /\b(?:const|let|var)\s+(\{[\s\S]*?\}|[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*await\s+window\.import\s*\(\s*(?:paneUrl\s*\(\s*)?['"]([^'"]+)['"]\s*\)?\s*\)/g;
-  const dynamicImportPattern = /\b(?:import|window\.import)\s*\(\s*(?:paneUrl\s*\(\s*)?['"]([^'"]+)['"]\s*\)?\s*\)/g;
+  const assignedDynamicImportPattern = new RegExp(`\\b(?:const|let|var)\\s+(\\{[\\s\\S]*?\\}|[A-Za-z_$][A-Za-z0-9_$]*)\\s*=\\s*await\\s+(?:import|window\\.import)\\s*\\(\\s*(${specifierExpression})\\s*\\)`, 'g');
+  const dynamicImportPattern = new RegExp(`\\b(?:import|window\\.import)\\s*\\(\\s*(${specifierExpression})\\s*\\)`, 'g');
+  const lazyModuleCallPattern = /\b(?:use|load)[A-Za-z0-9_$]*Module(?:Once)?\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*|['"](?:\\.|[^'"])*['"])/g;
+  const jsxSpecifierPropPattern = /\bspecifier\s*=\s*\{\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\}/g;
 
   const mark = (specifier) => {
     const value = normalizeString(specifier).trim();
@@ -100,13 +131,21 @@ export function extractImportRefs(source) {
     const specifier = mark(match[1]);
     pushImportRef(refs, { specifier, symbols: [], kind: 'export' });
   }
-  while ((match = assignedWindowImportPattern.exec(text))) {
-    const specifier = mark(match[2]);
+  while ((match = assignedDynamicImportPattern.exec(text))) {
+    const specifier = mark(resolveSpecifierExpression(match[2], constants));
     pushImportRef(refs, { specifier, symbols: parseDynamicImportSymbols(match[1]), kind: 'dynamic' });
   }
   while ((match = dynamicImportPattern.exec(text))) {
-    const specifier = mark(match[1]);
+    const specifier = mark(resolveSpecifierExpression(match[1], constants));
     pushImportRef(refs, { specifier, symbols: [], kind: 'dynamic' });
+  }
+  while ((match = lazyModuleCallPattern.exec(text))) {
+    const specifier = mark(resolveSpecifierExpression(match[1], constants));
+    pushImportRef(refs, { specifier, symbols: [], kind: 'lazy' });
+  }
+  while ((match = jsxSpecifierPropPattern.exec(text))) {
+    const specifier = mark(resolveSpecifierExpression(match[1], constants));
+    pushImportRef(refs, { specifier, symbols: [], kind: 'lazy' });
   }
 
   const seen = new Set();

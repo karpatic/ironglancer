@@ -92,3 +92,27 @@ test('analyzeProject ignores React imports in diagrams while keeping other exter
   assert.ok(mermaidLines.includes('+ReactDOM'));
   assert.ok(result.mermaid.includes('class Widget'));
 });
+
+const lazyLoadedRoot = path.resolve('tests/fixtures/lazy-loaded-imports');
+
+test('analyzeProject resolves lazy-loaded module specifier constants', async () => {
+  const result = await analyzeProject({
+    rootDir: lazyLoadedRoot,
+    entry: 'src/app.jsx',
+    routeAliases: [{ from: '/creator/', to: 'src/creator/' }],
+  });
+
+  assert.equal(result.entryRel, 'src/app.jsx');
+  assert.equal(result.summary.moduleCount, 4);
+  assert.deepEqual(result.jsScripts.map((item) => item.path), [
+    'src/app.jsx',
+    'src/creator/components/creator-lazy-widget.jsx',
+    'src/creator/components/creator-panel.jsx',
+    'src/creator/components/creator-startup-cache.js',
+  ]);
+  assert.ok(result.treeText.includes('src/creator/components/creator-panel.jsx'));
+  assert.ok(result.treeText.includes('src/creator/components/creator-lazy-widget.jsx'));
+  assert.ok(!result.treeText.includes('src/creator/components/unused-editor.jsx'));
+  assert.ok(result.mermaid.includes('app --> creator_lazy_widget : imports'));
+  assert.ok(result.mermaid.includes('app --> creator_panel : imports'));
+});
