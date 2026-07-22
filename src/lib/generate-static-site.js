@@ -118,6 +118,7 @@ function viewerHtml() {
         fill:none !important;
         stroke:transparent !important;
         stroke-width:16px !important;
+        vector-effect:non-scaling-stroke;
         pointer-events:stroke;
       }
       .diagram-canvas path.relation.is-selected, .diagram-canvas path[data-edge="true"].is-selected { stroke:var(--accent) !important; stroke-width:3px !important; }
@@ -361,13 +362,17 @@ function edgeTargetBasename(edge = {}) {
   return target.split(/[\\/]/).filter(Boolean).at(-1) || target;
 }
 
+function prefixLineCount(label, lineCount) {
+  return Number.isInteger(lineCount) && lineCount > 0 ? lineCount + ' ' + label : label;
+}
+
 function formatNamedImportBinding(binding = {}) {
   const imported = typeof binding.imported === 'string' ? binding.imported : '';
   const local = typeof binding.local === 'string' ? binding.local : '';
   if (!imported && !local) return '';
   const callable = (local || imported) + '()';
-  if (!imported || imported === local) return callable;
-  return imported + ' as ' + callable;
+  const label = !imported || imported === local ? callable : imported + ' as ' + callable;
+  return prefixLineCount(label, binding.lineCount);
 }
 
 function edgeImportLabels(edge = {}) {
@@ -378,10 +383,10 @@ function edgeImportLabels(edge = {}) {
     if (kind === 'named') {
       labels.push(formatNamedImportBinding(binding));
     } else if (targetLabel) {
-      labels.push(targetLabel);
+      labels.push(prefixLineCount(targetLabel, edge.targetLineCount));
     }
   }
-  if (labels.length === 0 && targetLabel) labels.push(targetLabel);
+  if (labels.length === 0 && targetLabel) labels.push(prefixLineCount(targetLabel, edge.targetLineCount));
   return Array.from(new Set(labels)).filter(Boolean);
 }
 
@@ -480,6 +485,19 @@ function addEdgeActivation(element, callback) {
   });
 }
 
+function isEdgePointerTarget(target) {
+  let element = target;
+  while (element && element !== viewportEl) {
+    const tagName = typeof element.tagName === 'string' ? element.tagName.toLowerCase() : '';
+    if (hasClass(element, 'edge-hit-target') || hasClass(element, 'edgeLabel')) return true;
+    if (tagName === 'path' && (hasClass(element, 'relation') || element.getAttribute('data-edge') === 'true')) {
+      return true;
+    }
+    element = element.parentNode;
+  }
+  return false;
+}
+
 function wireImportEdges(importEdges) {
   if (!activeSvg || typeof activeSvg.querySelectorAll !== 'function') return;
   const paths = Array.from(activeSvg.querySelectorAll('path[data-id]'))
@@ -518,6 +536,7 @@ function wireImportEdges(importEdges) {
     hitPath.removeAttribute('marker-end');
     hitPath.setAttribute('aria-hidden', 'true');
     hitPath.setAttribute('focusable', 'false');
+    hitPath.setAttribute('vector-effect', 'non-scaling-stroke');
     addEdgeClickActivation(hitPath, activate);
     path.parentNode.insertBefore(hitPath, path);
   }
@@ -556,6 +575,8 @@ function bindInteraction() {
   }, { passive: false });
 
   viewportEl.addEventListener('pointerdown', (event) => {
+    if (isEdgePointerTarget(event.target)) return;
+
     activePointers.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY });
 
     if (activePointers.size === 1) {

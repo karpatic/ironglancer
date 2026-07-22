@@ -27,6 +27,7 @@ class FakeElement {
     this.scrollHeight = 800;
     this.clientWidth = 800;
     this.clientHeight = 600;
+    this.pointerCaptureCalls = [];
     this._textContent = '';
     this._innerHTML = '';
     this.classList = {
@@ -126,6 +127,21 @@ class FakeElement {
     this.listeners.get(type).push(listener);
   }
 
+  dispatchEvent(event) {
+    const eventObject = event || {};
+    eventObject.target = eventObject.target || this;
+    eventObject.currentTarget = this;
+    if (typeof eventObject.preventDefault !== 'function') {
+      eventObject.preventDefault = () => {
+        eventObject.defaultPrevented = true;
+      };
+    }
+    for (const listener of this.listeners.get(eventObject.type) || []) {
+      listener(eventObject);
+    }
+    return !eventObject.defaultPrevented;
+  }
+
   click() {
     for (const listener of this.listeners.get('click') || []) {
       listener({ type: 'click', preventDefault() {} });
@@ -138,7 +154,9 @@ class FakeElement {
     this.ownerDocument.selectedText = this.value;
   }
 
-  setPointerCapture() {}
+  setPointerCapture(pointerId) {
+    this.pointerCaptureCalls.push(pointerId);
+  }
 
   getBoundingClientRect() {
     return { left: 0, top: 0, width: this.clientWidth, height: this.clientHeight };
@@ -287,7 +305,7 @@ async function runGeneratedViewerApp({
   throw new Error('generated viewer app did not finish rendering test payload');
 }
 
-function createFakeMermaidEdge(document, { source, target }) {
+function createFakeMermaidEdge(document, { source, target, labelText = 'import' }) {
   const dataId = `id_${source}_${target}_fake`;
   const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
   const pathElement = document.createElementNS('http://www.w3.org/2000/svg', 'path');
@@ -300,7 +318,7 @@ function createFakeMermaidEdge(document, { source, target }) {
   edgeLabel.setAttribute('class', 'edgeLabel');
   labelGroup.setAttribute('class', 'label');
   labelGroup.setAttribute('data-id', dataId);
-  originalLabel.textContent = 'imports';
+  originalLabel.textContent = labelText;
 
   labelGroup.appendChild(originalLabel);
   edgeLabel.appendChild(labelGroup);
@@ -425,7 +443,7 @@ test('generated viewer copy controls fall back and report copy failure', async (
   assert.match(statusEl.className, /is-error/);
 });
 
-test('generated viewer activates edge hit targets and formats Creator/file labels', async () => {
+test('generated viewer activates edge hit targets and formats counted inline labels', async () => {
   const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
   const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-edge-imports-'));
   await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
@@ -435,23 +453,49 @@ test('generated viewer activates edge hit targets and formats Creator/file label
     ...JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8')),
     importEdges: [
       {
-        source: 'creator_course_view',
-        target: 'creator_view_body',
-        sourcePath: 'src/creator/creator-course-view.jsx',
-        targetPath: 'src/creator/creator-view-body.jsx',
+        source: 'app',
+        target: 'static_child',
+        sourcePath: 'src/app.jsx',
+        targetPath: 'src/static-child.jsx',
+        targetLineCount: 11,
         loadKinds: ['static'],
         imports: [
           {
             imported: 'default',
-            local: 'CreatorViewBody',
+            local: 'StaticDefault',
             kind: 'default',
             inferred: false,
           },
           {
-            imported: 'CreatorViewBody',
-            local: 'CreatorViewBody',
+            imported: 'StaticNamed',
+            local: 'StaticAlias',
             kind: 'named',
-            inferred: true,
+            inferred: false,
+            lineCount: 3,
+          },
+          {
+            imported: 'StaticSame',
+            local: 'StaticSame',
+            kind: 'named',
+            inferred: false,
+            lineCount: 3,
+          },
+        ],
+      },
+      {
+        source: 'app',
+        target: 'dynamic_child',
+        sourcePath: 'src/app.jsx',
+        targetPath: 'src/dynamic-child.jsx',
+        targetLineCount: 3,
+        loadKinds: ['dynamic'],
+        imports: [
+          {
+            imported: 'DynamicExport',
+            local: 'DynamicLocal',
+            kind: 'named',
+            inferred: false,
+            lineCount: 3,
           },
         ],
       },
@@ -464,31 +508,43 @@ test('generated viewer activates edge hit targets and formats Creator/file label
     renderedSvgFactory: (fakeDocument) => {
       const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
       svg.viewBox = { baseVal: { width: 640, height: 320 } };
-      Object.assign(rendered, createFakeMermaidEdge(fakeDocument, {
-        source: 'creator_course_view',
-        target: 'creator_view_body',
-      }));
-      svg.appendChild(rendered.group);
+      rendered.static = createFakeMermaidEdge(fakeDocument, {
+        source: 'app',
+        target: 'static_child',
+        labelText: 'import',
+      });
+      rendered.lazy = createFakeMermaidEdge(fakeDocument, {
+        source: 'app',
+        target: 'dynamic_child',
+        labelText: 'lazy',
+      });
+      svg.append(rendered.static.group, rendered.lazy.group);
       return svg;
     },
   });
 
-  const hitPath = document.getElementById('diagram').querySelector('path.edge-hit-target');
+  assert.equal(rendered.static.originalLabel.textContent, 'import');
+  assert.equal(rendered.lazy.originalLabel.textContent, 'lazy');
+  assert.equal(rendered.static.originalLabel.style.display || '', '');
+  assert.equal(rendered.lazy.originalLabel.style.display || '', '');
+
+  const hitPath = rendered.static.group.querySelector('path.edge-hit-target');
   assert.ok(hitPath, 'expected generated viewer to add a cloned edge hit target');
   hitPath.click();
 
-  const customLabel = rendered.labelGroup.querySelector('g.edge-import-label');
+  const customLabel = rendered.static.labelGroup.querySelector('g.edge-import-label');
   assert.ok(customLabel, 'expected clicking the edge hit target to add a custom SVG label');
-  assert.equal(rendered.originalLabel.style.display, 'none');
-  assert.match(rendered.pathElement.className, /is-selected/);
-  assert.match(rendered.edgeLabel.className, /is-expanded/);
+  assert.equal(rendered.static.originalLabel.style.display, 'none');
+  assert.match(rendered.static.pathElement.className, /is-selected/);
+  assert.match(rendered.static.edgeLabel.className, /is-expanded/);
 
   assert.deepEqual(
     customLabel.querySelectorAll('tspan').map((line) => line.textContent),
-    ['creator-view-body.jsx', 'CreatorViewBody()'],
+    ['11 static-child.jsx', '3 StaticNamed as StaticAlias()', '3 StaticSame()'],
   );
-  assert.equal(rendered.pathElement.getAttribute('role'), 'button');
-  assert.equal(rendered.pathElement.getAttribute('aria-label'), 'Show imports for src/creator/creator-view-body.jsx');
+  assert.equal(rendered.static.pathElement.getAttribute('role'), 'button');
+  assert.equal(rendered.static.pathElement.getAttribute('aria-label'), 'Show imports for src/static-child.jsx');
+  assert.equal(hitPath.getAttribute('vector-effect'), 'non-scaling-stroke');
   assert.equal(hitPath.getAttribute('aria-hidden'), 'true');
   assert.equal(hitPath.getAttribute('focusable'), 'false');
   assert.equal(hitPath.getAttribute('aria-label'), null);
@@ -496,6 +552,65 @@ test('generated viewer activates edge hit targets and formats Creator/file label
   assert.equal(hitPath.getAttribute('tabindex'), null);
   assert.equal(
     document.getElementById('diagram').querySelectorAll('path.edge-hit-target').length,
-    1,
+    2,
   );
+});
+
+test('generated viewer keeps edge pointerdown from starting viewport drag', async () => {
+  const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-edge-pointer-'));
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
+
+  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
+  const payload = {
+    ...JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8')),
+    importEdges: [
+      {
+        source: 'app',
+        target: 'static_child',
+        sourcePath: 'src/app.jsx',
+        targetPath: 'src/static-child.jsx',
+        targetLineCount: 11,
+        loadKinds: ['static'],
+        imports: [],
+      },
+    ],
+  };
+  const rendered = {};
+  const { document } = await runGeneratedViewerApp({
+    appJs,
+    payload,
+    renderedSvgFactory: (fakeDocument) => {
+      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.viewBox = { baseVal: { width: 640, height: 320 } };
+      Object.assign(rendered, createFakeMermaidEdge(fakeDocument, {
+        source: 'app',
+        target: 'static_child',
+        labelText: 'import',
+      }));
+      svg.appendChild(rendered.group);
+      return svg;
+    },
+  });
+
+  const viewport = document.getElementById('diagram-viewport');
+  const hitPath = rendered.group.querySelector('path.edge-hit-target');
+  const pointerDown = (target, pointerId) => ({
+    type: 'pointerdown',
+    pointerId,
+    pointerType: 'mouse',
+    clientX: 20 + pointerId,
+    clientY: 30 + pointerId,
+    target,
+  });
+
+  for (const [index, target] of [rendered.pathElement, hitPath, rendered.edgeLabel].entries()) {
+    viewport.dispatchEvent(pointerDown(target, index + 1));
+    assert.deepEqual(viewport.pointerCaptureCalls, []);
+    assert.equal(viewport.classList.contains('is-dragging'), false);
+  }
+
+  viewport.dispatchEvent(pointerDown(viewport, 99));
+  assert.deepEqual(viewport.pointerCaptureCalls, [99]);
+  assert.equal(viewport.classList.contains('is-dragging'), true);
 });

@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import { extractComponents, extractImportRefs } from './import-parser.js';
+import { extractComponents, extractDeclarationSpans, extractImportRefs } from './import-parser.js';
 import { compareLocale, extensionCandidates, fileExists, isWithinPath, normalizeString, toPosixPath } from './utils.js';
 
 const DEFAULT_ENTRY_CANDIDATES = [
@@ -207,6 +207,36 @@ function scriptStats(rel, source) {
   };
 }
 
+function declarationSpansByName(record) {
+  const spans = new Map();
+  for (const span of Array.isArray(record?.declarationSpans) ? record.declarationSpans : []) {
+    if (!spans.has(span.name)) spans.set(span.name, span);
+  }
+  return spans;
+}
+
+function declarationLineCount(record, name) {
+  const span = declarationSpansByName(record).get(normalizeString(name).trim());
+  return Number.isInteger(span?.lineCount) && span.lineCount > 0 ? span.lineCount : null;
+}
+
+function prefixLineCount(label, lineCount) {
+  if (!Number.isInteger(lineCount) || lineCount <= 0) return label;
+  return `${lineCount} ${label}`;
+}
+
+function mermaidClassLabel(record) {
+  return `${record.stats.lineCount} ${path.posix.basename(record.rel)}`;
+}
+
+function escapeMermaidLabel(label) {
+  return normalizeString(label).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+function mermaidClassHeader(record, classId) {
+  return `class ${classId}["${escapeMermaidLabel(mermaidClassLabel(record))}"]`;
+}
+
 function externalLabel(specifier) {
   const raw = normalizeString(specifier).trim();
   if (!raw) return '';
@@ -246,16 +276,26 @@ function importedScriptVariableName(ref) {
   return ref.symbols[0] || '';
 }
 
-function importedScriptVariablesForJsx(record) {
-  const variables = new Set();
+function importedScriptMembersForJsx(record, graph) {
+  const members = new Map();
   for (const ref of Array.isArray(record.importRefs) ? record.importRefs : []) {
     if (ref?.localRel && isJsxModule(ref.localRel)) continue;
     if (isIgnoredExternalLabel(ref?.specifier)) continue;
     const name = importedScriptVariableName(ref);
     if (name === 'React') continue;
-    if (name) variables.add(name);
+    if (!name) continue;
+    const targetRecord = ref.localRel ? graph.modules.get(ref.localRel) : null;
+    const binding = (Array.isArray(ref.bindings) ? ref.bindings : [])
+      .find((candidate) => candidate.local === name);
+    const lineCount = binding?.kind === 'named'
+      ? declarationLineCount(targetRecord, binding.imported)
+      : declarationLineCount(targetRecord, name);
+    const existing = members.get(name);
+    if (!existing || (!existing.lineCount && lineCount)) {
+      members.set(name, { name, lineCount });
+    }
   }
-  return Array.from(variables).sort(compareLocale);
+  return Array.from(members.values()).sort((a, b) => compareLocale(a.name, b.name));
 }
 
 function normalizeImportEdgeBinding(binding) {
@@ -284,6 +324,18 @@ function compareImportEdgeBinding(a, b) {
     || Number(a.inferred) - Number(b.inferred);
 }
 
+function importBindingLineCount(graph, targetRel, binding) {
+  if (binding.kind !== 'named') return null;
+  return declarationLineCount(graph.modules.get(targetRel), binding.imported);
+}
+
+function edgeRestingLabel(loadKinds) {
+  const kinds = Array.isArray(loadKinds) ? loadKinds : Array.from(loadKinds || []);
+  const isLazyOnly = kinds.length > 0
+    && kinds.every((kind) => kind === 'lazy' || kind === 'dynamic');
+  return isLazyOnly ? 'lazy' : 'import';
+}
+
 function buildImportEdges(graph) {
   const jsxModules = Array.from(graph.modules.values())
     .filter((record) => isJsxModule(record.rel))
@@ -297,11 +349,13 @@ function buildImportEdges(graph) {
       if (!ref?.localRel || !classIds.has(ref.localRel)) continue;
       const key = `${record.rel}\u0000${ref.localRel}`;
       if (!edgeMap.has(key)) {
+        const targetRecord = graph.modules.get(ref.localRel);
         edgeMap.set(key, {
           source,
           target: classIds.get(ref.localRel),
           sourcePath: record.rel,
           targetPath: ref.localRel,
+          targetLineCount: targetRecord?.stats?.lineCount || null,
           loadKinds: new Set(),
           imports: new Map(),
         });
@@ -313,8 +367,10 @@ function buildImportEdges(graph) {
       for (const binding of Array.isArray(ref.bindings) ? ref.bindings : []) {
         const normalized = normalizeImportEdgeBinding(binding);
         if (!normalized) continue;
+        const lineCount = importBindingLineCount(graph, ref.localRel, normalized);
+        const enriched = lineCount ? { ...normalized, lineCount } : normalized;
         const bindingKey = `${normalized.kind}\u0000${normalized.imported}\u0000${normalized.local}\u0000${normalized.inferred}`;
-        edge.imports.set(bindingKey, normalized);
+        edge.imports.set(bindingKey, enriched);
       }
     }
   }
@@ -325,6 +381,7 @@ function buildImportEdges(graph) {
       target: edge.target,
       sourcePath: edge.sourcePath,
       targetPath: edge.targetPath,
+      targetLineCount: edge.targetLineCount,
       loadKinds: Array.from(edge.loadKinds).sort(compareLocale),
       imports: Array.from(edge.imports.values()).sort(compareImportEdgeBinding),
     }))
@@ -334,7 +391,7 @@ function buildImportEdges(graph) {
       || compareLocale(a.target, b.target));
 }
 
-function buildMermaid(graph) {
+function buildMermaid(graph, importEdges) {
   const jsxModules = Array.from(graph.modules.values())
     .filter((record) => isJsxModule(record.rel))
     .sort((a, b) => compareLocale(a.rel, b.rel));
@@ -346,25 +403,25 @@ function buildMermaid(graph) {
   }
   for (const record of jsxModules) {
     const classId = classIds.get(record.rel);
-    const variables = importedScriptVariablesForJsx(record);
+    const variables = importedScriptMembersForJsx(record, graph);
     const components = extractComponents(record.source);
     if (variables.length === 0 && components.length === 0) {
-      lines.push(`  class ${classId}`);
+      lines.push(`  ${mermaidClassHeader(record, classId)}`);
       continue;
     }
-    lines.push(`  class ${classId} {`);
-    for (const variable of variables) lines.push(`    +${variable}`);
-    for (const component of components) lines.push(`    +${component}()`);
+    lines.push(`  ${mermaidClassHeader(record, classId)} {`);
+    for (const variable of variables) {
+      lines.push(`    +${prefixLineCount(variable.name, variable.lineCount)}`);
+    }
+    for (const component of components) {
+      const lineCount = declarationLineCount(record, component);
+      lines.push(`    +${prefixLineCount(`${component}()`, lineCount)}`);
+    }
     lines.push('  }');
   }
-  for (const record of jsxModules) {
-    const sourceId = classIds.get(record.rel);
-    const jsxDeps = Array.from(new Set(record.localDeps))
-      .filter((rel) => isJsxModule(rel) && classIds.has(rel))
-      .sort(compareLocale);
-    for (const dep of jsxDeps) {
-      lines.push(`  ${sourceId} --> ${classIds.get(dep)} : imports`);
-    }
+  for (const edge of importEdges) {
+    if (!classIds.has(edge.sourcePath) || !classIds.has(edge.targetPath)) continue;
+    lines.push(`  ${edge.source} --> ${edge.target} : ${edgeRestingLabel(edge.loadKinds)}`);
   }
   return lines.join('\n');
 }
@@ -495,6 +552,7 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
       rel: current.rel,
       source,
       stats: scriptStats(current.rel, source),
+      declarationSpans: extractDeclarationSpans(source),
       importRefs: normalizedImportRefs,
       localDeps: Array.from(new Set(localDeps)).sort(compareLocale),
       externalDeps: Array.from(new Set(externalDeps)).sort(compareLocale),
@@ -515,8 +573,8 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
     .filter((script) => isJsxModule(script.path))
     .sort((a, b) => compareLocale(a.path, b.path));
   const jsxClassCount = jsxScripts.length;
-  const mermaid = buildMermaid(graph);
   const importEdges = buildImportEdges(graph);
+  const mermaid = buildMermaid(graph, importEdges);
   const treeText = buildTreeText(graph);
   const jsxTreeText = buildJsxTreeText(jsxScripts);
 

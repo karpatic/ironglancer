@@ -113,8 +113,9 @@ test('analyzeProject resolves lazy-loaded module specifier constants', async () 
   assert.ok(result.treeText.includes('src/creator/components/creator-panel.jsx'));
   assert.ok(result.treeText.includes('src/creator/components/creator-lazy-widget.jsx'));
   assert.ok(!result.treeText.includes('src/creator/components/unused-editor.jsx'));
-  assert.ok(result.mermaid.includes('app --> creator_lazy_widget : imports'));
-  assert.ok(result.mermaid.includes('app --> creator_panel : imports'));
+  assert.ok(result.mermaid.includes('app --> creator_lazy_widget : lazy'));
+  assert.ok(result.mermaid.includes('app --> creator_panel : lazy'));
+  assert.ok(!result.mermaid.includes(': imports'));
 });
 
 const importEdgeMetadataRoot = path.resolve('tests/fixtures/import-edge-metadata');
@@ -132,6 +133,13 @@ test('analyzeProject exposes JSX import edge metadata', async () => {
     'src/faculty-editor-child.jsx',
     'src/static-child.jsx',
   ]);
+  assert.match(result.mermaid, /class app\["28 app\.jsx"\] \{/);
+  assert.match(result.mermaid, /\+16 App\(\)/);
+  assert.match(result.mermaid, /class static_child\["11 static-child\.jsx"\] \{/);
+  assert.match(result.mermaid, /\+3 StaticNamed\(\)/);
+  assert.ok(result.mermaid.includes('app --> static_child : import'));
+  assert.ok(result.mermaid.includes('app --> dynamic_child : lazy'));
+  assert.ok(!result.mermaid.includes(': imports'));
 
   assert.deepEqual(result.importEdges, [
     {
@@ -139,6 +147,7 @@ test('analyzeProject exposes JSX import edge metadata', async () => {
       target: 'dynamic_child',
       sourcePath: 'src/app.jsx',
       targetPath: 'src/dynamic-child.jsx',
+      targetLineCount: 3,
       loadKinds: ['dynamic'],
       imports: [
         {
@@ -146,6 +155,7 @@ test('analyzeProject exposes JSX import edge metadata', async () => {
           local: 'DynamicLocal',
           kind: 'named',
           inferred: false,
+          lineCount: 3,
         },
       ],
     },
@@ -154,6 +164,7 @@ test('analyzeProject exposes JSX import edge metadata', async () => {
       target: 'faculty_body_child',
       sourcePath: 'src/app.jsx',
       targetPath: 'src/faculty-body-child.jsx',
+      targetLineCount: 3,
       loadKinds: ['lazy'],
       imports: [
         {
@@ -161,6 +172,7 @@ test('analyzeProject exposes JSX import edge metadata', async () => {
           local: 'CreatorViewBody',
           kind: 'named',
           inferred: true,
+          lineCount: 3,
         },
       ],
     },
@@ -169,6 +181,7 @@ test('analyzeProject exposes JSX import edge metadata', async () => {
       target: 'faculty_editor_child',
       sourcePath: 'src/app.jsx',
       targetPath: 'src/faculty-editor-child.jsx',
+      targetLineCount: 3,
       loadKinds: ['lazy'],
       imports: [
         {
@@ -176,6 +189,7 @@ test('analyzeProject exposes JSX import edge metadata', async () => {
           local: 'CreatorQuizEntryEditor',
           kind: 'named',
           inferred: true,
+          lineCount: 3,
         },
       ],
     },
@@ -184,6 +198,7 @@ test('analyzeProject exposes JSX import edge metadata', async () => {
       target: 'static_child',
       sourcePath: 'src/app.jsx',
       targetPath: 'src/static-child.jsx',
+      targetLineCount: 11,
       loadKinds: ['static'],
       imports: [
         {
@@ -197,12 +212,14 @@ test('analyzeProject exposes JSX import edge metadata', async () => {
           local: 'StaticAlias',
           kind: 'named',
           inferred: false,
+          lineCount: 3,
         },
         {
           imported: 'StaticSame',
           local: 'StaticSame',
           kind: 'named',
           inferred: false,
+          lineCount: 3,
         },
       ],
     },

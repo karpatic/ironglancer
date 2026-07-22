@@ -318,13 +318,353 @@ export function extractImportRefs(source) {
   });
 }
 
-export function extractComponents(source) {
+function preserveNewlinesAsSpaces(chars, start, end) {
+  for (let index = start; index < end; index += 1) {
+    if (chars[index] !== '\n' && chars[index] !== '\r') chars[index] = ' ';
+  }
+}
+
+function maskQuotedText(chars, text, start, quote) {
+  let index = start + 1;
+  let end = -1;
+  while (index < text.length) {
+    if (text[index] === '\\') {
+      index += 2;
+      continue;
+    }
+    if (text[index] === quote) {
+      end = index;
+      index += 1;
+      break;
+    }
+    index += 1;
+  }
+  preserveNewlinesAsSpaces(chars, start + 1, end === -1 ? text.length : end);
+  return index;
+}
+
+function maskLineComment(chars, text, start) {
+  let index = start + 2;
+  while (index < text.length && text[index] !== '\n' && text[index] !== '\r') index += 1;
+  preserveNewlinesAsSpaces(chars, start, index);
+  return index;
+}
+
+function maskBlockComment(chars, text, start) {
+  let index = start + 2;
+  while (index < text.length - 1) {
+    if (text[index] === '*' && text[index + 1] === '/') {
+      index += 2;
+      break;
+    }
+    index += 1;
+  }
+  preserveNewlinesAsSpaces(chars, start, Math.min(index, text.length));
+  return index;
+}
+
+function isIdentifierPart(char) {
+  return /[A-Za-z0-9_$]/.test(char);
+}
+
+const REGEX_ALLOWED_AFTER_KEYWORDS = new Set([
+  'await',
+  'case',
+  'delete',
+  'do',
+  'else',
+  'in',
+  'instanceof',
+  'new',
+  'of',
+  'return',
+  'throw',
+  'typeof',
+  'void',
+  'yield',
+]);
+
+function previousSignificantIndex(chars, start) {
+  for (let index = start - 1; index >= 0; index -= 1) {
+    if (!/\s/.test(chars[index])) return index;
+  }
+  return -1;
+}
+
+function isJsxClosingTagNamePart(char) {
+  return typeof char === 'string' && /[A-Za-z0-9_$.:-]/.test(char);
+}
+
+function isAdjacentJsxClosingTagSlash(chars, start) {
+  if (chars[start - 1] !== '<') return false;
+  if (chars[start + 1] === '>') return true;
+  if (!/[A-Za-z]/.test(chars[start + 1] || '')) return false;
+
+  let index = start + 2;
+  while (isJsxClosingTagNamePart(chars[index])) index += 1;
+  while (/\s/.test(chars[index] || '')) index += 1;
+  return chars[index] === '>';
+}
+
+function isRegexLiteralStart(chars, start) {
+  if (isAdjacentJsxClosingTagSlash(chars, start)) return false;
+
+  const previousIndex = previousSignificantIndex(chars, start);
+  if (previousIndex === -1) return true;
+
+  const previous = chars[previousIndex];
+  if ('([{=,:;!~?&|+-*%^<>/'.includes(previous)) return true;
+  if (!isIdentifierPart(previous)) return false;
+
+  let wordStart = previousIndex;
+  while (wordStart >= 0 && isIdentifierPart(chars[wordStart])) wordStart -= 1;
+  const word = chars.slice(wordStart + 1, previousIndex + 1).join('');
+  return REGEX_ALLOWED_AFTER_KEYWORDS.has(word);
+}
+
+function maskRegexLiteral(chars, text, start) {
+  let index = start + 1;
+  let end = -1;
+  let inCharacterClass = false;
+  while (index < text.length) {
+    const char = text[index];
+    if (char === '\n' || char === '\r') break;
+    if (char === '\\') {
+      index += 2;
+      continue;
+    }
+    if (char === '[') {
+      inCharacterClass = true;
+      index += 1;
+      continue;
+    }
+    if (char === ']' && inCharacterClass) {
+      inCharacterClass = false;
+      index += 1;
+      continue;
+    }
+    if (char === '/' && !inCharacterClass) {
+      end = index;
+      index += 1;
+      while (index < text.length && isIdentifierPart(text[index])) index += 1;
+      break;
+    }
+    index += 1;
+  }
+
+  if (end === -1) return start + 1;
+  preserveNewlinesAsSpaces(chars, start + 1, end);
+  preserveNewlinesAsSpaces(chars, end + 1, index);
+  return index;
+}
+
+function maskIgnorableSyntax(text) {
+  const chars = text.split('');
+  let index = 0;
+  while (index < text.length) {
+    const char = text[index];
+    const next = text[index + 1];
+    if (char === '/' && next === '/') {
+      index = maskLineComment(chars, text, index);
+    } else if (char === '/' && next === '*') {
+      index = maskBlockComment(chars, text, index);
+    } else if (char === '/' && isRegexLiteralStart(chars, index)) {
+      index = maskRegexLiteral(chars, text, index);
+    } else if (char === '"' || char === "'" || char === '`') {
+      index = maskQuotedText(chars, text, index, char);
+    } else {
+      index += 1;
+    }
+  }
+  return chars.join('');
+}
+
+function lineStartIndexes(text) {
+  const starts = [0];
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === '\n') starts.push(index + 1);
+  }
+  return starts;
+}
+
+function lineNumberAt(index, starts) {
+  let low = 0;
+  let high = starts.length - 1;
+  let found = 0;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    if (starts[mid] <= index) {
+      found = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return found + 1;
+}
+
+function findNextNonWhitespace(text, start) {
+  let index = start;
+  while (index < text.length && /\s/.test(text[index])) index += 1;
+  return index;
+}
+
+function findMatchingDelimiter(text, start, openChar, closeChar) {
+  let depth = 0;
+  for (let index = start; index < text.length; index += 1) {
+    if (text[index] === openChar) {
+      depth += 1;
+    } else if (text[index] === closeChar) {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+function findTopLevelArrow(text, start) {
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  for (let index = start; index < text.length - 1; index += 1) {
+    const char = text[index];
+    if (char === '(') parenDepth += 1;
+    else if (char === ')') parenDepth = Math.max(0, parenDepth - 1);
+    else if (char === '[') bracketDepth += 1;
+    else if (char === ']') bracketDepth = Math.max(0, bracketDepth - 1);
+    else if (char === '{') braceDepth += 1;
+    else if (char === '}') braceDepth = Math.max(0, braceDepth - 1);
+    else if (char === ';' && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) return -1;
+
+    if (
+      char === '='
+      && text[index + 1] === '>'
+      && parenDepth === 0
+      && bracketDepth === 0
+      && braceDepth === 0
+    ) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function findExpressionEnd(text, start) {
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  let lastNonWhitespace = start;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (!/\s/.test(char)) lastNonWhitespace = index;
+    if (char === '(') parenDepth += 1;
+    else if (char === ')') parenDepth = Math.max(0, parenDepth - 1);
+    else if (char === '[') bracketDepth += 1;
+    else if (char === ']') bracketDepth = Math.max(0, bracketDepth - 1);
+    else if (char === '{') braceDepth += 1;
+    else if (char === '}') braceDepth = Math.max(0, braceDepth - 1);
+    else if (char === ';' && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) return index;
+  }
+  return lastNonWhitespace;
+}
+
+function findQuotedLiteralEnd(text, start) {
+  const quote = text[start];
+  for (let index = start + 1; index < text.length; index += 1) {
+    if (text[index] === quote) return index;
+  }
+  return -1;
+}
+
+function findRegexLiteralEnd(text, start) {
+  for (let index = start + 1; index < text.length; index += 1) {
+    if (text[index] === '/') return index;
+  }
+  return -1;
+}
+
+function declarationSpan({ name, kind, startIndex, endIndex, lineStarts }) {
+  const startLine = lineNumberAt(startIndex, lineStarts);
+  const endLine = lineNumberAt(endIndex, lineStarts);
+  return {
+    name,
+    kind,
+    startLine,
+    endLine,
+    lineCount: endLine - startLine + 1,
+  };
+}
+
+function compareDeclarationSpan(a, b) {
+  return a.name.localeCompare(b.name)
+    || a.startLine - b.startLine
+    || a.endLine - b.endLine
+    || a.kind.localeCompare(b.kind);
+}
+
+export function extractDeclarationSpans(source) {
   const text = normalizeString(source);
-  const names = new Set();
-  const functionPattern = /\bfunction\s+([A-Z][A-Za-z0-9_$]*)\s*\(/g;
-  const constPattern = /\bconst\s+([A-Z][A-Za-z0-9_$]*)\s*=\s*(?:\([^)]*\)|[A-Za-z_$][A-Za-z0-9_$]*)\s*=>/g;
+  if (!text) return [];
+  const masked = maskIgnorableSyntax(text);
+  const lineStarts = lineStartIndexes(text);
+  const spans = [];
+
+  const functionPattern = /\b(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g;
   let match;
-  while ((match = functionPattern.exec(text))) names.add(match[1]);
-  while ((match = constPattern.exec(text))) names.add(match[1]);
+  while ((match = functionPattern.exec(masked))) {
+    const parametersStart = match.index + match[0].lastIndexOf('(');
+    const parametersEnd = findMatchingDelimiter(masked, parametersStart, '(', ')');
+    if (parametersEnd === -1) continue;
+    const bodyStart = findNextNonWhitespace(masked, parametersEnd + 1);
+    if (masked[bodyStart] !== '{') continue;
+    const bodyEnd = findMatchingDelimiter(masked, bodyStart, '{', '}');
+    if (bodyEnd === -1) continue;
+    spans.push(declarationSpan({
+      name: match[1],
+      kind: 'function',
+      startIndex: match.index,
+      endIndex: bodyEnd,
+      lineStarts,
+    }));
+  }
+
+  const arrowPattern = /\b(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=/g;
+  while ((match = arrowPattern.exec(masked))) {
+    const arrowIndex = findTopLevelArrow(masked, arrowPattern.lastIndex);
+    if (arrowIndex === -1) continue;
+    const bodyStart = findNextNonWhitespace(masked, arrowIndex + 2);
+    if (bodyStart >= masked.length) continue;
+    let bodyEnd = -1;
+    if (masked[bodyStart] === '{') {
+      bodyEnd = findMatchingDelimiter(masked, bodyStart, '{', '}');
+    } else if (masked[bodyStart] === '(') {
+      bodyEnd = findMatchingDelimiter(masked, bodyStart, '(', ')');
+    } else if (masked[bodyStart] === '[') {
+      bodyEnd = findMatchingDelimiter(masked, bodyStart, '[', ']');
+    } else if (masked[bodyStart] === '"' || masked[bodyStart] === "'" || masked[bodyStart] === '`') {
+      bodyEnd = findQuotedLiteralEnd(masked, bodyStart);
+    } else if (masked[bodyStart] === '/') {
+      bodyEnd = findRegexLiteralEnd(masked, bodyStart);
+    } else {
+      bodyEnd = findExpressionEnd(masked, bodyStart);
+    }
+    if (bodyEnd === -1) continue;
+    spans.push(declarationSpan({
+      name: match[1],
+      kind: 'arrow',
+      startIndex: match.index,
+      endIndex: bodyEnd,
+      lineStarts,
+    }));
+  }
+
+  return spans.sort(compareDeclarationSpan);
+}
+
+export function extractComponents(source) {
+  const names = new Set();
+  for (const span of extractDeclarationSpans(source)) {
+    if (/^[A-Z]/.test(span.name)) names.add(span.name);
+  }
   return Array.from(names).sort((a, b) => a.localeCompare(b));
 }
