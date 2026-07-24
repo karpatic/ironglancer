@@ -125,6 +125,16 @@ function viewerHtml() {
       .diagram-canvas .edge-import-label { pointer-events:none; }
       .diagram-canvas g.edgeLabel.is-expanded .edge-import-label rect { fill:#eef5ff; stroke:#8eb5f4; stroke-width:1.5; }
       .diagram-canvas g.edgeLabel.is-expanded .edge-import-label text { fill:#17366f; font-weight:700; font-size:13px; }
+      .selected-import-details { display:grid; gap:12px; }
+      .selected-import-details h3, .selected-import-details h4, .selected-import-details p { margin:0; }
+      .selected-import-details h3 { overflow-wrap:anywhere; font-size:1rem; }
+      .selected-import-details h4 { color:var(--muted); font-size:.75rem; text-transform:uppercase; }
+      .selected-import-rows { display:grid; gap:8px; }
+      .selected-import-row { display:grid; gap:3px; }
+      .selected-import-row span { color:var(--muted); font-size:.72rem; font-weight:700; text-transform:uppercase; }
+      .selected-import-row code { overflow-wrap:anywhere; }
+      .selected-import-list { display:grid; gap:6px; margin:0; padding:0; list-style:none; }
+      .selected-import-list li { border:1px solid var(--border); border-radius:8px; background:#fbfcff; padding:8px 10px; overflow-wrap:anywhere; }
     </style>
   </head>
   <body>
@@ -161,6 +171,12 @@ function viewerHtml() {
           </div>
         </div>
         <div class="details-grid">
+          <div class="panel">
+            <h2>Selected import</h2>
+            <div id="selected-import" class="body selected-import-details" aria-live="polite">
+              <p class="muted">No edge selected.</p>
+            </div>
+          </div>
           <div class="panel">
             <h2>Summary</h2>
             <div id="stats" class="body stats"></div>
@@ -211,6 +227,7 @@ const mermaidEl = document.getElementById('mermaid');
 const diagramEl = document.getElementById('diagram');
 const viewportEl = document.getElementById('diagram-viewport');
 const statsEl = document.getElementById('stats');
+const selectedImportEl = document.getElementById('selected-import');
 const downloadBtn = document.getElementById('download-svg-btn');
 const zoomInBtn = document.getElementById('zoom-in-btn');
 const zoomOutBtn = document.getElementById('zoom-out-btn');
@@ -420,6 +437,46 @@ function originalEdgeLabelContent(labelGroup) {
     .find((child) => !hasClass(child, 'edge-import-label')) || null;
 }
 
+function renderEmptySelectedImport() {
+  selectedImportEl.textContent = '';
+  const message = document.createElement('p');
+  message.className = 'muted';
+  message.textContent = 'No edge selected.';
+  selectedImportEl.appendChild(message);
+}
+
+function appendSelectedImportRow(parent, label, value) {
+  const row = document.createElement('div');
+  row.className = 'selected-import-row';
+  const labelEl = document.createElement('span');
+  labelEl.textContent = label;
+  const valueEl = document.createElement('code');
+  valueEl.textContent = value || 'none';
+  row.append(labelEl, valueEl);
+  parent.appendChild(row);
+}
+
+function renderSelectedImport(edge, labels) {
+  selectedImportEl.textContent = '';
+  const title = document.createElement('h3');
+  title.textContent = (edge.source || 'unknown') + ' -> ' + (edge.target || 'unknown');
+  const rows = document.createElement('div');
+  rows.className = 'selected-import-rows';
+  appendSelectedImportRow(rows, 'Source', edge.sourcePath || edge.source);
+  appendSelectedImportRow(rows, 'Target', edge.targetPath || edge.target);
+  appendSelectedImportRow(rows, 'Load', Array.isArray(edge.loadKinds) ? edge.loadKinds.join(', ') : 'unknown');
+  const listTitle = document.createElement('h4');
+  listTitle.textContent = 'Direct Imports';
+  const list = document.createElement('ul');
+  list.className = 'selected-import-list';
+  for (const label of labels) {
+    const item = document.createElement('li');
+    item.textContent = label;
+    list.appendChild(item);
+  }
+  selectedImportEl.append(title, rows, listTitle, list);
+}
+
 let expandedEdge = null;
 
 function collapseExpandedEdge() {
@@ -430,6 +487,7 @@ function collapseExpandedEdge() {
   if (label) label.classList.remove('is-expanded');
   if (path) path.classList.remove('is-selected');
   expandedEdge = null;
+  renderEmptySelectedImport();
 }
 
 function expandEdgeLabel(edge, path, label, labelGroup) {
@@ -468,6 +526,7 @@ function expandEdgeLabel(edge, path, label, labelGroup) {
   label.classList.add('is-expanded');
   path.classList.add('is-selected');
   expandedEdge = { customLabel, label, originalContent, originalDisplay, path };
+  renderSelectedImport(edge, lines);
 }
 
 function addEdgeClickActivation(element, callback) {
@@ -685,6 +744,7 @@ function formatBuildMeta(metadata = {}) {
 }
 
 async function main() {
+  renderEmptySelectedImport();
   const response = await fetch('./output.json');
   if (!response.ok) throw new Error('Failed to load output.json');
   const payload = await response.json();

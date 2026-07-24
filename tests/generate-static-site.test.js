@@ -342,6 +342,8 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.match(html, /\.\/app\.js/);
   assert.match(html, /<details class="panel collapsible-panel" id="jsx-tree-panel">/);
   assert.match(html, /<details class="panel collapsible-panel" id="mermaid-source-panel">/);
+  assert.match(html, /<div id="selected-import" class="body selected-import-details"/);
+  assert.match(html, />Selected import</);
   assert.doesNotMatch(html, /id="jsx-line-counts-panel"/);
   assert.doesNotMatch(html, />JSX line counts</);
   assert.doesNotMatch(html, />Open JSON</);
@@ -554,6 +556,13 @@ test('generated viewer activates edge hit targets and formats counted inline lab
     document.getElementById('diagram').querySelectorAll('path.edge-hit-target').length,
     2,
   );
+
+  const selectedImport = document.getElementById('selected-import');
+  assert.match(selectedImport.textContent, /app -> static_child/);
+  assert.match(selectedImport.textContent, /Sourcesrc\/app\.jsx/);
+  assert.match(selectedImport.textContent, /Targetsrc\/static-child\.jsx/);
+  assert.match(selectedImport.textContent, /Loadstatic/);
+  assert.match(selectedImport.textContent, /Direct Imports11 static-child\.jsx3 StaticNamed as StaticAlias\(\)3 StaticSame\(\)/);
 });
 
 test('generated viewer keeps edge pointerdown from starting viewport drag', async () => {
