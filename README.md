@@ -44,5 +44,6 @@ Publishing
 - npm run publish:all
 
 GitHub Pages
-- the Pages workflow builds a demo site into docs/ from tests/fixtures/sample-app
+- the Pages workflow publishes a simple React app whose JSX runs directly in the browser with Bundless
+- the build runs IronGlancer against that exact app and embeds the generated viewer at `./analysis/`
 - intended public URL: https://karpatic.github.io/ironglancer/

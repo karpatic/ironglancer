@@ -1,20 +1,55 @@
+import fs from 'node:fs/promises';
 import path from 'node:path';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
 
 import { generateStaticSite } from '../src/lib/generate-static-site.js';
 
-const rootDir = path.resolve('tests/fixtures/sample-app');
-const outDir = path.resolve('docs');
+const require = createRequire(import.meta.url);
+const defaultDemoRoot = path.resolve('examples/bundless-react');
+const defaultOutDir = path.resolve('docs');
 
-const result = await generateStaticSite({
-  rootDir,
-  entry: 'src/app.jsx',
-  outDir,
-});
+export async function buildDemoSite({
+  demoRoot = defaultDemoRoot,
+  outDir = defaultOutDir,
+} = {}) {
+  const resolvedDemoRoot = path.resolve(demoRoot);
+  const resolvedOutDir = path.resolve(outDir);
+  const analysisOutDir = path.join(resolvedOutDir, 'analysis');
+  const bundlessSource = require.resolve('bundlessdev/sucrase');
 
-console.log(JSON.stringify({
-  ok: true,
-  rootDir: result.rootDir,
-  entry: result.entryRel,
-  outDir: result.outDir,
-  summary: result.summary,
-}, null, 2));
+  await fs.rm(resolvedOutDir, { recursive: true, force: true });
+  await fs.cp(resolvedDemoRoot, resolvedOutDir, { recursive: true });
+  await fs.mkdir(path.join(resolvedOutDir, 'vendor'), { recursive: true });
+  await fs.copyFile(
+    bundlessSource,
+    path.join(resolvedOutDir, 'vendor/bundless.sucrase.min.js'),
+  );
+
+  const analysis = await generateStaticSite({
+    rootDir: resolvedDemoRoot,
+    entry: 'main.jsx',
+    outDir: analysisOutDir,
+  });
+
+  return {
+    demoRoot: resolvedDemoRoot,
+    outDir: resolvedOutDir,
+    analysis,
+  };
+}
+
+const isMain = process.argv[1]
+  && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
+
+if (isMain) {
+  const result = await buildDemoSite();
+  console.log(JSON.stringify({
+    ok: true,
+    demoRoot: result.demoRoot,
+    outDir: result.outDir,
+    entry: result.analysis.entryRel,
+    analysisOutDir: result.analysis.outDir,
+    summary: result.analysis.summary,
+  }, null, 2));
+}

@@ -6,7 +6,8 @@ on:
     paths:
       - src/**
       - scripts/build-demo.mjs
-      - tests/fixtures/sample-app/**
+      - examples/bundless-react/**
+      - tests/build-demo.test.js
       - package.json
       - package-lock.json
       - .github/workflows/pages.yml
