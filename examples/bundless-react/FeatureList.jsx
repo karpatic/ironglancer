@@ -1,4 +1,4 @@
-import React from 'react';
+const React = window.React;
 
 const features = [
   'JSX transpiled in the browser by Bundless',

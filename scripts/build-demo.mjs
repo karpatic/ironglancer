@@ -17,14 +17,32 @@ export async function buildDemoSite({
   const resolvedOutDir = path.resolve(outDir);
   const analysisOutDir = path.join(resolvedOutDir, 'analysis');
   const bundlessSource = require.resolve('bundlessdev/sucrase');
+  const reactSource = path.join(
+    path.dirname(require.resolve('react')),
+    'umd/react.production.min.js',
+  );
+  const reactDomSource = path.join(
+    path.dirname(require.resolve('react-dom')),
+    'umd/react-dom.production.min.js',
+  );
 
   await fs.rm(resolvedOutDir, { recursive: true, force: true });
   await fs.cp(resolvedDemoRoot, resolvedOutDir, { recursive: true });
   await fs.mkdir(path.join(resolvedOutDir, 'vendor'), { recursive: true });
-  await fs.copyFile(
-    bundlessSource,
-    path.join(resolvedOutDir, 'vendor/bundless.sucrase.min.js'),
-  );
+  await Promise.all([
+    fs.copyFile(
+      bundlessSource,
+      path.join(resolvedOutDir, 'vendor/bundless.sucrase.min.js'),
+    ),
+    fs.copyFile(
+      reactSource,
+      path.join(resolvedOutDir, 'vendor/react.production.min.js'),
+    ),
+    fs.copyFile(
+      reactDomSource,
+      path.join(resolvedOutDir, 'vendor/react-dom.production.min.js'),
+    ),
+  ]);
 
   const analysis = await generateStaticSite({
     rootDir: resolvedDemoRoot,

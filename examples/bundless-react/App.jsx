@@ -1,4 +1,4 @@
-import React from 'react';
+const React = window.React;
 
 const Counter = await window.import('./Counter.jsx').then((module) => module.default);
 const FeatureList = await window.import('./FeatureList.jsx').then((module) => module.default);
