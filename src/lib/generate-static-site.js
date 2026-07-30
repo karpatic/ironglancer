@@ -212,6 +212,24 @@ function viewerHtml() {
       }
       .diagram-canvas path.relation, .diagram-canvas path[data-edge="true"], .diagram-canvas g.edgeLabel { cursor:pointer; }
       .diagram-canvas .source-member-trigger { cursor:pointer; color:var(--accent); fill:var(--accent); font-weight:700; pointer-events:auto; }
+      .diagram-canvas .source-member-metrics {
+        display:inline-flex;
+        gap:3px;
+        margin-left:5px;
+        vertical-align:middle;
+        pointer-events:none;
+      }
+      .diagram-canvas .source-member-metric {
+        display:inline-block;
+        padding:1px 4px;
+        border:1px solid #bfd1f2;
+        border-radius:999px;
+        background:#eef5ff;
+        color:#17366f;
+        font-size:.75em;
+        font-weight:700;
+        line-height:1.15;
+      }
       .diagram-canvas .source-member-hit-target {
         fill:none !important;
         stroke:transparent !important;
@@ -409,6 +427,8 @@ let sourceDeclarationLookup = { byDisplay: new Map(), byName: new Map(), groups:
 let sourceDialogState = { declaration: null, group: [], index: -1 };
 let sourceDialogRestoreFocusEl = null;
 const svgNamespace = 'http://www.w3.org/2000/svg';
+let sourceMemberTargetCounter = 0;
+let sourceMemberTargets = new Map();
 
 function statCard(label, value) {
   const div = document.createElement('div');
@@ -594,6 +614,10 @@ function sourceDisplayName(labelText) {
     .trim();
 }
 
+function sourceMetricsSuffixPattern() {
+  return /\\s+\\[lines:\\s*\\d+\\s*\\|\\s*refs:\\s*\\d+\\s*\\|\\s*importers:\\s*\\d+\\]\\s*$/i;
+}
+
 function validSourceNavigation(declaration) {
   return typeof declaration?.sourceGroup === 'string'
     && declaration.sourceGroup.trim()
@@ -652,6 +676,7 @@ async function loadSourceDeclarationMap(payload) {
 function sourceMemberName(label) {
   let text = (typeof label === 'string' ? label : '').replace(/\\s+/g, ' ').trim();
   text = text.replace(/^\\\\?[+#~-]\\s*/, '');
+  text = text.replace(sourceMetricsSuffixPattern(), '');
   text = text.replace(/^\\d+\\s+/, '');
   const parametersIndex = text.indexOf('(');
   if (parametersIndex !== -1) text = text.slice(0, parametersIndex);
@@ -705,6 +730,60 @@ function sourceDeclarationForLabel(label) {
   return fallbackDeclaration;
 }
 
+function sourceDeclarationLineCount(declaration) {
+  const startLine = Number(declaration?.startLine);
+  const endLine = Number(declaration?.endLine);
+  return Number.isInteger(startLine) && Number.isInteger(endLine) && endLine >= startLine
+    ? endLine - startLine + 1
+    : 0;
+}
+
+function sourceMetricCount(value) {
+  const count = Number(value);
+  return Number.isInteger(count) && count >= 0 ? count : 0;
+}
+
+function sourceMemberBaseText(labelText, declaration) {
+  const raw = typeof labelText === 'string' ? labelText : '';
+  const prefixMatch = raw.match(/^\\s*(\\\\?[+#~-])\\s*/);
+  const prefix = prefixMatch ? prefixMatch[1] : '';
+  const displayName = String(declaration?.sourceDisplayName || '').replace(sourceMetricsSuffixPattern(), '').trim()
+    || sourceDisplayName(raw).replace(sourceMetricsSuffixPattern(), '').replace(/\\s+:\\s*$/, '').trim()
+    || String(declaration?.name || '').trim();
+  return prefix + displayName;
+}
+
+function appendSourceMemberMetrics(element, declaration) {
+  const tagName = typeof element?.tagName === 'string' ? element.tagName.toLowerCase() : '';
+  const isSvgText = tagName === 'text';
+  const createInlineElement = (className) => {
+    const node = isSvgText
+      ? document.createElementNS(svgNamespace, 'tspan')
+      : document.createElement('span');
+    node.setAttribute('class', className);
+    return node;
+  };
+  const baseText = sourceMemberBaseText(element.textContent, declaration);
+  const metrics = [
+    ['lines', 'Lines ' + sourceDeclarationLineCount(declaration)],
+    ['refs', 'Refs ' + sourceMetricCount(declaration?.referenceCount)],
+    ['importers', 'Files ' + sourceMetricCount(declaration?.importerFileCount)],
+  ];
+  const labelText = createInlineElement('source-member-label-text');
+  labelText.textContent = baseText;
+  const metricsGroup = createInlineElement('source-member-metrics');
+  metricsGroup.setAttribute('aria-hidden', 'true');
+  for (const [metric, text] of metrics) {
+    const badge = createInlineElement('source-member-metric');
+    badge.setAttribute('data-metric', metric);
+    badge.textContent = text;
+    metricsGroup.appendChild(badge);
+  }
+
+  element.textContent = '';
+  element.append(labelText, metricsGroup);
+}
+
 function svgNumber(value) {
   if (!Number.isFinite(value)) return '0';
   return String(Number(value.toFixed(3)));
@@ -731,6 +810,121 @@ function sourceHitBoxFromAttributes(element) {
   return validSourceHitBox(box) ? box : null;
 }
 
+function sourceMemberRecordForElement(element) {
+  let current = element;
+  while (current && current !== viewportEl) {
+    if (typeof current.getAttribute === 'function') {
+      const targetId = current.getAttribute('data-source-member-target-id');
+      if (targetId && sourceMemberTargets.has(targetId)) return sourceMemberTargets.get(targetId);
+    }
+    current = current.parentNode;
+  }
+  return null;
+}
+
+function sourceClientRectForRecord(record) {
+  if (!record?.element || typeof record.element.getBoundingClientRect !== 'function') return null;
+  const rawRect = record.element.getBoundingClientRect();
+  if (!rawRect) return null;
+  const left = Number(rawRect.left);
+  const top = Number(rawRect.top);
+  const width = Number.isFinite(rawRect.width) ? Number(rawRect.width) : Number(rawRect.right) - left;
+  const height = Number.isFinite(rawRect.height) ? Number(rawRect.height) : Number(rawRect.bottom) - top;
+  if (!Number.isFinite(left) || !Number.isFinite(top) || !Number.isFinite(width) || !Number.isFinite(height)) {
+    return null;
+  }
+  if (width <= 0 || height <= 0) return null;
+  return {
+    left,
+    top,
+    right: Number.isFinite(rawRect.right) ? Number(rawRect.right) : left + width,
+    bottom: Number.isFinite(rawRect.bottom) ? Number(rawRect.bottom) : top + height,
+    width,
+    height,
+  };
+}
+
+function sourcePointInsideRecord(record, clientX, clientY) {
+  const rect = sourceClientRectForRecord(record);
+  if (!rect) return null;
+  return clientX >= rect.left
+    && clientX <= rect.right
+    && clientY >= rect.top
+    && clientY <= rect.bottom;
+}
+
+function sourceElementsFromPoint(clientX, clientY) {
+  if (typeof document.elementsFromPoint !== 'function') return [];
+  try {
+    return Array.from(document.elementsFromPoint(clientX, clientY) || []);
+  } catch (error) {
+    return [];
+  }
+}
+
+function sourceVisibleRecordFromPointStack(elements, clientX, clientY) {
+  for (const element of elements) {
+    if (hasClass(element, 'source-member-hit-target')) continue;
+    const record = sourceMemberRecordForElement(element);
+    if (!record) continue;
+    const containsPoint = sourcePointInsideRecord(record, clientX, clientY);
+    if (containsPoint !== false) return record;
+  }
+  return null;
+}
+
+function sourceCandidateRecordsFromPointStack(elements, fallbackRecord) {
+  const records = [];
+  const seen = new Set();
+  const addRecord = (record) => {
+    if (!record || seen.has(record.id)) return;
+    seen.add(record.id);
+    records.push(record);
+  };
+  for (const element of elements) addRecord(sourceMemberRecordForElement(element));
+  addRecord(fallbackRecord);
+  return records;
+}
+
+function sourceRecordDistanceFromPoint(record, clientX, clientY) {
+  const rect = sourceClientRectForRecord(record);
+  if (!rect) return { vertical: Number.POSITIVE_INFINITY, horizontal: Number.POSITIVE_INFINITY };
+  const centerY = rect.top + (rect.height / 2);
+  const vertical = Math.abs(clientY - centerY);
+  const horizontal = clientX < rect.left
+    ? rect.left - clientX
+    : (clientX > rect.right ? clientX - rect.right : 0);
+  return { vertical, horizontal };
+}
+
+function nearestSourceRecordForPoint(records, clientX, clientY) {
+  return records
+    .map((record) => ({
+      record,
+      distance: sourceRecordDistanceFromPoint(record, clientX, clientY),
+    }))
+    .sort((a, b) => a.distance.vertical - b.distance.vertical
+      || a.distance.horizontal - b.distance.horizontal
+      || a.record.order - b.record.order
+      || String(a.record.declaration?.name || '').localeCompare(String(b.record.declaration?.name || '')))[0]?.record || null;
+}
+
+function sourceActivationRecordForEvent(event, fallbackRecord) {
+  const targetRecord = sourceMemberRecordForElement(event?.currentTarget)
+    || sourceMemberRecordForElement(event?.target)
+    || fallbackRecord;
+  const clientX = Number(event?.clientX);
+  const clientY = Number(event?.clientY);
+  if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return targetRecord;
+
+  const pointElements = sourceElementsFromPoint(clientX, clientY);
+  const visibleRecord = sourceVisibleRecordFromPointStack(pointElements, clientX, clientY);
+  if (visibleRecord) return visibleRecord;
+
+  const candidates = sourceCandidateRecordsFromPointStack(pointElements, targetRecord);
+  return nearestSourceRecordForPoint(candidates, clientX, clientY) || targetRecord;
+}
+
 function sourceHitTargetReference(element) {
   let current = element;
   while (current && current !== activeSvg) {
@@ -750,7 +944,8 @@ function sourceHitTargetReference(element) {
   return null;
 }
 
-function addSourceHitTarget(element, activate) {
+function addSourceHitTarget(record, activate) {
+  const element = record.element;
   const reference = sourceHitTargetReference(element);
   const parent = reference?.element?.parentNode;
   if (!parent) return;
@@ -758,11 +953,13 @@ function addSourceHitTarget(element, activate) {
   const { x, y, width, height } = reference.box;
   const hitTarget = document.createElementNS(svgNamespace, 'path');
   hitTarget.classList.add('source-member-hit-target');
+  hitTarget.setAttribute('data-source-member-target-id', record.id);
   hitTarget.setAttribute('d', 'M' + svgNumber(x) + ' ' + svgNumber(y + (height / 2)) + 'H' + svgNumber(x + width));
   hitTarget.setAttribute('aria-hidden', 'true');
   hitTarget.setAttribute('focusable', 'false');
   hitTarget.setAttribute('vector-effect', 'non-scaling-stroke');
   hitTarget.addEventListener('click', activate);
+  record.hitTarget = hitTarget;
   parent.appendChild(hitTarget);
 }
 
@@ -842,15 +1039,27 @@ function closeSourceDialog() {
 }
 
 function addSourceActivation(element, declaration) {
+  const record = {
+    id: String(++sourceMemberTargetCounter),
+    order: sourceMemberTargetCounter,
+    element,
+    declaration,
+    hitTarget: null,
+  };
+  sourceMemberTargets.set(record.id, record);
+
   element.classList.add('source-member-trigger');
+  element.setAttribute('data-source-member-target-id', record.id);
   element.setAttribute('tabindex', '0');
   element.setAttribute('role', 'button');
   element.setAttribute('focusable', 'true');
   element.setAttribute('aria-label', 'Show source for ' + declaration.name + ' in ' + declaration.modulePath);
+  appendSourceMemberMetrics(element, declaration);
 
   const activate = (event) => {
     if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
-    showSourceDialog(declaration, element);
+    const activationRecord = sourceActivationRecordForEvent(event, record) || record;
+    showSourceDialog(activationRecord.declaration, activationRecord.element || element);
   };
   element.addEventListener('click', activate);
   element.addEventListener('keydown', (event) => {
@@ -858,7 +1067,7 @@ function addSourceActivation(element, declaration) {
     event.preventDefault();
     activate(event);
   });
-  addSourceHitTarget(element, activate);
+  addSourceHitTarget(record, activate);
 }
 
 function wireSourceMembers() {
@@ -867,6 +1076,8 @@ function wireSourceMembers() {
     || typeof activeSvg.querySelectorAll !== 'function'
     || (sourceDeclarationLookup.byDisplay.size === 0 && sourceDeclarationLookup.byName.size === 0)
   ) return;
+  sourceMemberTargetCounter = 0;
+  sourceMemberTargets = new Map();
   const labels = [
     ...Array.from(activeSvg.querySelectorAll('text')),
     ...Array.from(activeSvg.querySelectorAll('p')),

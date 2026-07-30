@@ -1,10 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import os from 'node:os';
+import fs from 'node:fs/promises';
 
 import { analyzeProject } from '../src/lib/analyze-project.js';
 
 const fixtureRoot = path.resolve('tests/fixtures/sample-app');
+
+async function writeTempProject(files) {
+  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-analyze-fixture-'));
+  await Promise.all(Object.entries(files).map(async ([relativePath, contents]) => {
+    const filePath = path.join(rootDir, relativePath);
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, contents, 'utf8');
+  }));
+  return rootDir;
+}
 
 test('analyzeProject resolves local modules, import-map aliases, and externals', async () => {
   const result = await analyzeProject({ rootDir: fixtureRoot, entry: 'src/app.jsx' });
@@ -134,9 +146,9 @@ test('analyzeProject exposes JSX import edge metadata', async () => {
     'src/static-child.jsx',
   ]);
   assert.match(result.mermaid, /class app\["28 app\.jsx"\] \{/);
-  assert.match(result.mermaid, /\+16 App\(\)/);
+  assert.match(result.mermaid, /\+App\(\) \[lines: 16 \| refs: 0 \| importers: 0\]/);
   assert.match(result.mermaid, /class static_child\["11 static-child\.jsx"\] \{/);
-  assert.match(result.mermaid, /\+3 StaticNamed\(\)/);
+  assert.match(result.mermaid, /\+StaticNamed\(\) \[lines: 3 \| refs: 1 \| importers: 1\]/);
   assert.ok(result.mermaid.includes('app --> static_child : import'));
   assert.ok(result.mermaid.includes('app --> dynamic_child : lazy'));
   assert.ok(!result.mermaid.includes(': imports'));
@@ -224,4 +236,79 @@ test('analyzeProject exposes JSX import edge metadata', async () => {
       ],
     },
   ]);
+});
+
+test('analyzeProject renders Mermaid member metrics from declaration import metadata', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import { FormatThing as FormatAlias } from './shared.js';",
+      "import { Panel } from './panel.jsx';",
+      "import { View } from './view.jsx';",
+      '',
+      'export function App() {',
+      '  return <Panel value={FormatAlias()}>',
+      '    <View />',
+      '  </Panel>;',
+      '}',
+    ].join('\n'),
+    'src/panel.jsx': [
+      "import { App as AppReference } from './app.jsx';",
+      "import { FormatThing } from './shared.js';",
+      '',
+      'export function Panel({ children }) {',
+      '  return <section>{FormatThing()}{AppReference && children}</section>;',
+      '}',
+    ].join('\n'),
+    'src/view.jsx': [
+      "import { FormatThing as FormatView } from './shared.js';",
+      '',
+      'export function View() {',
+      '  return <article>{FormatView()}</article>;',
+      '}',
+    ].join('\n'),
+    'src/shared.js': [
+      'export function FormatThing() {',
+      "  return 'formatted';",
+      '}',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+
+  assert.match(result.mermaid, /\+FormatAlias \[lines: 3 \| refs: 3 \| importers: 3\]/);
+  assert.match(result.mermaid, /\+App\(\) \[lines: 5 \| refs: 1 \| importers: 1\]/);
+  assert.match(result.mermaid, /\+FormatThing \[lines: 3 \| refs: 3 \| importers: 3\]/);
+  assert.match(result.mermaid, /\+Panel\(\) \[lines: 3 \| refs: 1 \| importers: 1\]/);
+  assert.match(result.mermaid, /\+FormatView \[lines: 3 \| refs: 3 \| importers: 3\]/);
+  assert.match(result.mermaid, /\+View\(\) \[lines: 3 \| refs: 1 \| importers: 1\]/);
+});
+
+test('analyzeProject distinguishes import binding references from distinct importer files', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import { FormatThing as FormatOne, FormatThing as FormatTwo } from './shared.js';",
+      '',
+      'export function App() {',
+      '  return <output>{FormatOne()}{FormatTwo()}</output>;',
+      '}',
+    ].join('\n'),
+    'src/shared.js': [
+      'export function FormatThing() {',
+      "  return 'formatted';",
+      '}',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+  const formatOne = result.sourceCode.declarations.find((item) => item.name === 'FormatOne');
+
+  assert.ok(formatOne, 'expected imported FormatOne declaration source');
+  assert.equal(formatOne.declarationName, 'FormatThing');
+  assert.equal(formatOne.referenceCount, 2);
+  assert.equal(formatOne.importerFileCount, 1);
+  assert.equal(
+    formatOne.sourceDisplayName,
+    'FormatOne [lines: 3 | refs: 2 | importers: 1]',
+  );
+  assert.match(result.mermaid, /\+FormatOne \[lines: 3 \| refs: 2 \| importers: 1\]/);
 });

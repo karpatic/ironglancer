@@ -241,6 +241,7 @@ class FakeDocument {
   constructor(execCommand, renderedSvgFactory) {
     this.elements = new Map();
     this.renderedSvgFactory = renderedSvgFactory;
+    this.elementsFromPointResult = [];
     this.selectedText = '';
     this.body = this.createElement('body');
     this.activeElement = null;
@@ -264,6 +265,10 @@ class FakeDocument {
       this.elements.set(id, element);
     }
     return this.elements.get(id);
+  }
+
+  elementsFromPoint() {
+    return this.elementsFromPointResult;
   }
 }
 
@@ -616,7 +621,7 @@ test('generated viewer opens visible member source snippets from scoped source p
       svg.viewBox = { baseVal: { width: 640, height: 320 } };
       Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
         classId: 'app',
-        memberText: '+16 App()',
+        memberText: '+App() [lines: 16 | refs: 0 | importers: 0]',
       }));
       svg.appendChild(rendered.classGroup);
       return svg;
@@ -664,6 +669,182 @@ test('generated viewer opens visible member source snippets from scoped source p
   assert.equal(dialog.open, false);
 });
 
+test('generated viewer aligns counted Mermaid labels with source navigation metadata', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import { AlphaScript as AlphaLocal } from './shared.js';",
+      "import { Child } from './child.jsx';",
+      '',
+      'export function App() {',
+      '  return <Child text={AlphaLocal()} />;',
+      '}',
+    ].join('\n'),
+    'src/child.jsx': [
+      "import { App as ParentApp } from './app.jsx';",
+      "import { AlphaScript } from './shared.js';",
+      '',
+      'export function Child({ text }) {',
+      '  return <div>{AlphaScript()}{ParentApp && text}</div>;',
+      '}',
+    ].join('\n'),
+    'src/shared.js': [
+      'export function AlphaScript() {',
+      "  return 'alpha';",
+      '}',
+    ].join('\n'),
+  });
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-counted-source-'));
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
+
+  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
+  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
+  const sourcePayload = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
+  const alphaLabel = 'AlphaLocal [lines: 3 | refs: 2 | importers: 2]';
+  const appLabel = 'App() [lines: 3 | refs: 1 | importers: 1]';
+  const alphaDeclaration = sourcePayload.declarations.find((item) => item.name === 'AlphaLocal');
+  const appDeclaration = sourcePayload.declarations.find((item) => item.name === 'App');
+
+  assert.ok(payload.mermaid.includes('+' + alphaLabel));
+  assert.ok(payload.mermaid.includes('+' + appLabel));
+  assert.equal(alphaDeclaration.sourceDisplayName, alphaLabel);
+  assert.equal(alphaDeclaration.referenceCount, 2);
+  assert.equal(alphaDeclaration.importerFileCount, 2);
+  assert.equal(appDeclaration.sourceDisplayName, appLabel);
+  assert.equal(appDeclaration.referenceCount, 1);
+  assert.equal(appDeclaration.importerFileCount, 1);
+
+  const rendered = {};
+  const { document } = await runGeneratedViewerApp({
+    appJs,
+    payload,
+    sourcePayload,
+    renderedSvgFactory: (fakeDocument) => {
+      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.viewBox = { baseVal: { width: 640, height: 320 } };
+      Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
+        classId: 'app',
+        memberTexts: [
+          '+' + alphaLabel,
+          '+' + appLabel,
+        ],
+      }));
+      svg.appendChild(rendered.classGroup);
+      return svg;
+    },
+  });
+
+  const dialog = document.getElementById('source-dialog');
+  rendered.members[0].click();
+  assert.equal(dialog.open, true);
+  assert.equal(document.getElementById('source-dialog-title').textContent, 'AlphaLocal');
+  assert.equal(document.getElementById('source-dialog-path').textContent, 'src/shared.js:1-3');
+
+  document.getElementById('source-dialog-close').click();
+  rendered.members[1].click();
+  assert.equal(dialog.open, true);
+  assert.equal(document.getElementById('source-dialog-title').textContent, 'App');
+  assert.equal(document.getElementById('source-dialog-path').textContent, 'src/app.jsx:4-6');
+});
+
+test('generated viewer renders source member metrics as compact badges from source payload metadata', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import { AlphaScript as AlphaLocal } from './shared.js';",
+      "import { Child } from './child.jsx';",
+      '',
+      'export function App() {',
+      '  return <Child text={AlphaLocal()} />;',
+      '}',
+    ].join('\n'),
+    'src/child.jsx': [
+      "import { AlphaScript } from './shared.js';",
+      '',
+      'export function Child({ text }) {',
+      '  return <div>{AlphaScript()}{text}</div>;',
+      '}',
+    ].join('\n'),
+    'src/shared.js': [
+      'export function AlphaScript() {',
+      "  return 'alpha';",
+      '}',
+    ].join('\n'),
+  });
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-member-metrics-'));
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
+
+  const html = await fs.readFile(path.join(outDir, 'index.html'), 'utf8');
+  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
+  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
+  const sourcePayload = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
+  const alphaDeclaration = sourcePayload.declarations.find((item) => item.name === 'AlphaLocal');
+  assert.ok(alphaDeclaration, 'expected AlphaLocal source declaration');
+  const renderedDisplayName = 'AlphaLocal [lines: 99 | refs: 99 | importers: 99]';
+  alphaDeclaration.name = 'AlphaResolvedByDisplay';
+  alphaDeclaration.sourceDisplayName = renderedDisplayName;
+  alphaDeclaration.referenceCount = 2;
+  alphaDeclaration.importerFileCount = 1;
+  alphaDeclaration.startLine = 1;
+  alphaDeclaration.endLine = 3;
+
+  assert.match(html, /\.diagram-canvas \.source-member-metrics/);
+  assert.match(html, /\.diagram-canvas \.source-member-metric/);
+
+  const rendered = {};
+  const { document } = await runGeneratedViewerApp({
+    appJs,
+    payload,
+    sourcePayload,
+    renderedSvgFactory: (fakeDocument) => {
+      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.viewBox = { baseVal: { width: 640, height: 320 } };
+      Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
+        classId: 'app',
+        memberText: '+' + renderedDisplayName,
+      }));
+      svg.appendChild(rendered.classGroup);
+      return svg;
+    },
+  });
+
+  assert.equal(rendered.member.getAttribute('role'), 'button');
+  assert.equal(rendered.member.getAttribute('tabindex'), '0');
+  assert.equal(rendered.member.getAttribute('aria-label'), 'Show source for AlphaResolvedByDisplay in src/shared.js');
+
+  const metricsGroup = rendered.member.querySelector('span.source-member-metrics');
+  assert.ok(metricsGroup, 'expected source member metric badge group');
+  assert.equal(metricsGroup.getAttribute('aria-hidden'), 'true');
+  assert.equal(rendered.member.querySelector('span.source-member-label-text').textContent, '+AlphaLocal');
+  assert.deepEqual(
+    metricsGroup.querySelectorAll('span.source-member-metric').map((badge) => ({
+      metric: badge.getAttribute('data-metric'),
+      text: badge.textContent,
+    })),
+    [
+      { metric: 'lines', text: 'Lines 3' },
+      { metric: 'refs', text: 'Refs 2' },
+      { metric: 'importers', text: 'Files 1' },
+    ],
+  );
+  assert.equal(rendered.member.textContent.includes('99'), false);
+
+  const viewport = document.getElementById('diagram-viewport');
+  viewport.dispatchEvent({
+    type: 'pointerdown',
+    pointerId: 31,
+    pointerType: 'mouse',
+    clientX: 20,
+    clientY: 30,
+    target: metricsGroup,
+  });
+  assert.deepEqual(viewport.pointerCaptureCalls, []);
+  assert.equal(viewport.classList.contains('is-dragging'), false);
+
+  rendered.member.click();
+  assert.equal(document.getElementById('source-dialog').open, true);
+  assert.equal(document.getElementById('source-dialog-title').textContent, 'AlphaResolvedByDisplay');
+  assert.equal(document.getElementById('source-dialog-path').textContent, 'src/shared.js:1-3');
+});
+
 test('generated viewer navigates imported script member source within its rendered sibling group', async () => {
   const rootDir = await writeTempProject({
     'src/app.jsx': [
@@ -709,21 +890,21 @@ test('generated viewer navigates imported script member source within its render
       sourceOrigin: 'imported-script-member',
       sourceGroup: 'app:imported-script-members',
       sourceOrder: 0,
-      sourceDisplayName: '3 AlphaScript',
+      sourceDisplayName: 'AlphaScript [lines: 3 | refs: 1 | importers: 1]',
     },
     {
       name: 'OmegaScript',
       sourceOrigin: 'imported-script-member',
       sourceGroup: 'app:imported-script-members',
       sourceOrder: 1,
-      sourceDisplayName: '3 OmegaScript',
+      sourceDisplayName: 'OmegaScript [lines: 3 | refs: 1 | importers: 1]',
     },
     {
       name: 'View',
       sourceOrigin: 'current-file-declaration',
       sourceGroup: 'app:current-file-declarations',
       sourceOrder: 0,
-      sourceDisplayName: '3 View()',
+      sourceDisplayName: 'View() [lines: 3 | refs: 0 | importers: 0]',
     },
   ]);
   assert.ok(!sourcePayload.declarations.some((item) => item.name === 'MissingScript'));
@@ -738,10 +919,10 @@ test('generated viewer navigates imported script member source within its render
       Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
         classId: 'app',
         memberTexts: [
-          '+3 AlphaScript',
+          '+AlphaScript [lines: 3 | refs: 1 | importers: 1]',
           '+MissingScript',
-          '+3 OmegaScript',
-          '+3 View()',
+          '+OmegaScript [lines: 3 | refs: 1 | importers: 1]',
+          '+View() [lines: 3 | refs: 0 | importers: 0]',
         ],
       }));
       svg.appendChild(rendered.classGroup);
@@ -818,21 +999,21 @@ test('generated viewer navigates current-file source without crossing into impor
       sourceOrigin: 'imported-script-member',
       sourceGroup: 'app:imported-script-members',
       sourceOrder: 0,
-      sourceDisplayName: '3 AlphaScript',
+      sourceDisplayName: 'AlphaScript [lines: 3 | refs: 1 | importers: 1]',
     },
     {
       name: 'AlphaView',
       sourceOrigin: 'current-file-declaration',
       sourceGroup: 'app:current-file-declarations',
       sourceOrder: 0,
-      sourceDisplayName: '3 AlphaView()',
+      sourceDisplayName: 'AlphaView() [lines: 3 | refs: 0 | importers: 0]',
     },
     {
       name: 'OmegaView',
       sourceOrigin: 'current-file-declaration',
       sourceGroup: 'app:current-file-declarations',
       sourceOrder: 1,
-      sourceDisplayName: '3 OmegaView()',
+      sourceDisplayName: 'OmegaView() [lines: 3 | refs: 0 | importers: 0]',
     },
   ]);
   const rendered = {};
@@ -846,9 +1027,9 @@ test('generated viewer navigates current-file source without crossing into impor
       Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
         classId: 'app',
         memberTexts: [
-          '+3 AlphaScript',
-          '+3 AlphaView()',
-          '+3 OmegaView()',
+          '+AlphaScript [lines: 3 | refs: 1 | importers: 1]',
+          '+AlphaView() [lines: 3 | refs: 0 | importers: 0]',
+          '+OmegaView() [lines: 3 | refs: 0 | importers: 0]',
         ],
       }));
       svg.appendChild(rendered.classGroup);
@@ -915,9 +1096,9 @@ test('generated viewer supports source dialog keyboard navigation and restores t
       Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
         classId: 'app',
         memberTexts: [
-          '+3 AlphaScript',
-          '+3 OmegaScript',
-          '+3 View()',
+          '+AlphaScript [lines: 3 | refs: 1 | importers: 1]',
+          '+OmegaScript [lines: 3 | refs: 1 | importers: 1]',
+          '+View() [lines: 3 | refs: 0 | importers: 0]',
         ],
       }));
       svg.appendChild(rendered.classGroup);
@@ -970,7 +1151,7 @@ test('generated viewer resolves source members from Mermaid class id variants', 
       Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
         classId: 'app',
         classGroupId: 'classId-app',
-        memberText: '+16 App()',
+        memberText: '+App() [lines: 16 | refs: 0 | importers: 0]',
       }));
       svg.appendChild(rendered.classGroup);
       return svg;
@@ -1000,7 +1181,7 @@ test('generated viewer adds non-scaling source member hit targets without duplic
       svg.viewBox = { baseVal: { width: 640, height: 320 } };
       Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
         classId: 'app',
-        memberText: '+16 App()',
+        memberText: '+App() [lines: 16 | refs: 0 | importers: 0]',
         memberBox: { x: 96, y: 144, width: 124, height: 18 },
       }));
       svg.appendChild(rendered.classGroup);
@@ -1038,6 +1219,100 @@ test('generated viewer adds non-scaling source member hit targets without duplic
   assert.equal(document.getElementById('source-dialog').open, true);
 });
 
+test('generated viewer resolves overlapping source hit targets to the visible or nearest source label', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      'export function CreatorShell() {',
+      "  return <div>Shell</div>;",
+      '}',
+      '',
+      'export function CreatorLogin() {',
+      "  return <form>Login</form>;",
+      '}',
+    ].join('\n'),
+  });
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-overlap-source-'));
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
+
+  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
+  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
+  const sourcePayload = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
+  const rendered = {};
+  const { document } = await runGeneratedViewerApp({
+    appJs,
+    payload,
+    sourcePayload,
+    renderedSvgFactory: (fakeDocument) => {
+      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.viewBox = { baseVal: { width: 640, height: 320 } };
+      Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
+        classId: 'app',
+        memberTexts: [
+          '+CreatorShell() [lines: 3 | refs: 0 | importers: 0]',
+          '+CreatorLogin() [lines: 3 | refs: 0 | importers: 0]',
+        ],
+      }));
+      svg.appendChild(rendered.classGroup);
+      return svg;
+    },
+  });
+
+  rendered.members[0].getBoundingClientRect = () => ({
+    left: 120,
+    top: 108,
+    right: 155,
+    bottom: 112.8,
+    width: 35,
+    height: 4.8,
+  });
+  rendered.members[1].getBoundingClientRect = () => ({
+    left: 120,
+    top: 118,
+    right: 148.5,
+    bottom: 122.8,
+    width: 28.5,
+    height: 4.8,
+  });
+
+  const [creatorShellHitTarget, creatorLoginHitTarget] = rendered.classGroup
+    .querySelectorAll('path.source-member-hit-target');
+  assert.ok(creatorShellHitTarget, 'expected CreatorShell hit target');
+  assert.ok(creatorLoginHitTarget, 'expected CreatorLogin hit target');
+
+  const dialog = document.getElementById('source-dialog');
+  document.elementsFromPointResult = [
+    creatorShellHitTarget,
+    creatorLoginHitTarget,
+    rendered.members[1],
+  ];
+  creatorShellHitTarget.dispatchEvent({
+    type: 'click',
+    target: creatorShellHitTarget,
+    clientX: 134.25,
+    clientY: 120.4,
+    stopPropagation() {},
+  });
+  assert.equal(dialog.open, true);
+  assert.equal(document.getElementById('source-dialog-title').textContent, 'CreatorLogin');
+  assert.equal(document.getElementById('source-dialog-path').textContent, 'src/app.jsx:5-7');
+
+  document.getElementById('source-dialog-close').click();
+  document.elementsFromPointResult = [
+    creatorShellHitTarget,
+    creatorLoginHitTarget,
+  ];
+  creatorShellHitTarget.dispatchEvent({
+    type: 'click',
+    target: creatorShellHitTarget,
+    clientX: 112,
+    clientY: 120.4,
+    stopPropagation() {},
+  });
+  assert.equal(dialog.open, true);
+  assert.equal(document.getElementById('source-dialog-title').textContent, 'CreatorLogin');
+  assert.equal(document.getElementById('source-dialog-path').textContent, 'src/app.jsx:5-7');
+});
+
 test('generated viewer disables source popups for mismatched or unavailable source payloads', async () => {
   const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
   const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-source-identity-'));
@@ -1059,7 +1334,7 @@ test('generated viewer disables source popups for mismatched or unavailable sour
         svg.viewBox = { baseVal: { width: 640, height: 320 } };
         Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
           classId: 'app',
-          memberText: '+16 App()',
+          memberText: '+App() [lines: 16 | refs: 0 | importers: 0]',
         }));
         svg.appendChild(rendered.classGroup);
         return svg;
