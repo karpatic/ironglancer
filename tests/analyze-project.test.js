@@ -283,7 +283,7 @@ test('analyzeProject renders Mermaid member metrics from declaration import meta
   assert.match(result.mermaid, /\+View\(\) \[lines: 3 \| refs: 1 \| importers: 1\]/);
 });
 
-test('analyzeProject distinguishes import binding references from distinct importer files', async () => {
+test('analyzeProject distinguishes usage references from distinct importer files', async () => {
   const rootDir = await writeTempProject({
     'src/app.jsx': [
       "import { FormatThing as FormatOne, FormatThing as FormatTwo } from './shared.js';",
@@ -311,4 +311,31 @@ test('analyzeProject distinguishes import binding references from distinct impor
     'FormatOne [lines: 3 | refs: 2 | importers: 1]',
   );
   assert.match(result.mermaid, /\+FormatOne \[lines: 3 \| refs: 2 \| importers: 1\]/);
+});
+
+test('analyzeProject counts function usages rather than import declarations as references', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import { FormatThing as Format } from './shared.js';",
+      '',
+      'export function App() {',
+      "  const example = 'Format()';",
+      '  // Format() in documentation is not a code reference.',
+      '  return <output>{Format()}{Format()}{Format}</output>;',
+      '}',
+    ].join('\n'),
+    'src/shared.js': [
+      'export function FormatThing() {',
+      "  return 'formatted';",
+      '}',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+  const format = result.sourceCode.declarations.find((item) => item.name === 'Format');
+
+  assert.ok(format, 'expected imported Format source declaration');
+  assert.equal(format.referenceCount, 3);
+  assert.equal(format.importerFileCount, 1);
+  assert.match(result.mermaid, /\+Format \[lines: 3 \| refs: 3 \| importers: 1\]/);
 });

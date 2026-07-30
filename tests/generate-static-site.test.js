@@ -1008,7 +1008,7 @@ test('generated viewer navigates current-file source without crossing into impor
       sourceOrigin: 'imported-script-member',
       sourceGroup: 'app:imported-script-members',
       sourceOrder: 0,
-      sourceDisplayName: 'AlphaScript [lines: 3 | refs: 1 | importers: 1]',
+      sourceDisplayName: 'AlphaScript [lines: 3 | refs: 2 | importers: 1]',
     },
     {
       name: 'AlphaView',

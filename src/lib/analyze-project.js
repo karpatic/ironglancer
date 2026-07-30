@@ -1,7 +1,12 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import { extractComponents, extractDeclarationSpans, extractImportRefs } from './import-parser.js';
+import {
+  countIdentifierReferences,
+  extractComponents,
+  extractDeclarationSpans,
+  extractImportRefs,
+} from './import-parser.js';
 import { compareLocale, extensionCandidates, fileExists, isWithinPath, normalizeString, toPosixPath } from './utils.js';
 
 const DEFAULT_ENTRY_CANDIDATES = [
@@ -316,6 +321,16 @@ function declarationImportMetricsFor(metrics, record, declarationName) {
 
 function buildDeclarationImportMetrics(graph) {
   const buckets = new Map();
+  for (const record of graph.modules.values()) {
+    for (const declarationName of declarationSpansByName(record).keys()) {
+      const key = declarationImportMetricKey(record.rel, declarationName);
+      if (!key) continue;
+      buckets.set(key, {
+        referenceCount: Math.max(0, countIdentifierReferences(record.source, declarationName) - 1),
+        importerFiles: new Set(),
+      });
+    }
+  }
   for (const importerRecord of graph.modules.values()) {
     for (const ref of Array.isArray(importerRecord.importRefs) ? importerRecord.importRefs : []) {
       const targetRecord = ref?.localRel ? graph.modules.get(ref.localRel) : null;
@@ -333,7 +348,7 @@ function buildDeclarationImportMetrics(graph) {
           });
         }
         const bucket = buckets.get(key);
-        bucket.referenceCount += 1;
+        bucket.referenceCount += Math.max(0, countIdentifierReferences(importerRecord.source, binding.local) - 1);
         if (importerRecord.rel !== targetRecord.rel) bucket.importerFiles.add(importerRecord.rel);
       }
     }

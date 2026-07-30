@@ -479,6 +479,16 @@ function maskIgnorableSyntax(text) {
   return chars.join('');
 }
 
+export function countIdentifierReferences(source, identifier) {
+  const name = normalizeJsIdentifier(identifier);
+  if (!name) return 0;
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp(`(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])`, 'g');
+  const masked = maskIgnorableSyntax(normalizeString(source))
+    .replace(/<\/\s*[A-Za-z_$][A-Za-z0-9_$]*/g, (closingTag) => ' '.repeat(closingTag.length));
+  return Array.from(masked.matchAll(pattern)).length;
+}
+
 function lineStartIndexes(text) {
   const starts = [0];
   for (let index = 0; index < text.length; index += 1) {
