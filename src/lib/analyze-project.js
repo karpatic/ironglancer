@@ -220,6 +220,78 @@ function declarationLineCount(record, name) {
   return Number.isInteger(span?.lineCount) && span.lineCount > 0 ? span.lineCount : null;
 }
 
+function declarationSnippet(record, span) {
+  const lines = sourceLines(record?.source);
+  if (
+    !span
+    || !Number.isInteger(span.startLine)
+    || !Number.isInteger(span.endLine)
+    || span.startLine < 1
+    || span.endLine < span.startLine
+    || span.endLine > lines.length
+  ) {
+    return '';
+  }
+  return lines.slice(span.startLine - 1, span.endLine).join('\n');
+}
+
+function sourceDeclarationEntry({ moduleId, visibleName, record, span, declarationName = visibleName, sourceMetadata = {} }) {
+  const code = declarationSnippet(record, span);
+  if (!moduleId || !visibleName || !record?.rel || !code) return null;
+  return {
+    key: `${moduleId}\u0000${visibleName}`,
+    moduleId,
+    modulePath: record.rel,
+    name: visibleName,
+    declarationName,
+    kind: span.kind,
+    startLine: span.startLine,
+    endLine: span.endLine,
+    code,
+    ...sourceMetadata,
+  };
+}
+
+function sourceDeclarationEntryWithMetadata(entry, sourceMetadata = {}) {
+  if (!entry) return null;
+  const sourceOrigin = typeof sourceMetadata.sourceOrigin === 'string' && sourceMetadata.sourceOrigin
+    ? sourceMetadata.sourceOrigin
+    : 'source';
+  return {
+    ...entry,
+    key: `${entry.moduleId}\u0000${sourceOrigin}\u0000${entry.name}`,
+    ...sourceMetadata,
+  };
+}
+
+function declarationEntryLineCount(entry) {
+  const startLine = Number.isInteger(entry?.startLine) ? entry.startLine : null;
+  const endLine = Number.isInteger(entry?.endLine) ? entry.endLine : null;
+  return startLine && endLine && endLine >= startLine ? endLine - startLine + 1 : null;
+}
+
+function sourceNavigationGroup(moduleId, origin) {
+  return `${moduleId}:${origin}`;
+}
+
+function importedScriptSourceMetadata(moduleId, entry, sourceOrder) {
+  return {
+    sourceOrigin: 'imported-script-member',
+    sourceGroup: sourceNavigationGroup(moduleId, 'imported-script-members'),
+    sourceOrder,
+    sourceDisplayName: prefixLineCount(entry.name, declarationEntryLineCount(entry)),
+  };
+}
+
+function currentFileSourceMetadata(moduleId, entry, sourceOrder) {
+  return {
+    sourceOrigin: 'current-file-declaration',
+    sourceGroup: sourceNavigationGroup(moduleId, 'current-file-declarations'),
+    sourceOrder,
+    sourceDisplayName: prefixLineCount(`${entry.name}()`, declarationEntryLineCount(entry)),
+  };
+}
+
 function prefixLineCount(label, lineCount) {
   if (!Number.isInteger(lineCount) || lineCount <= 0) return label;
   return `${lineCount} ${label}`;
@@ -296,6 +368,39 @@ function importedScriptMembersForJsx(record, graph) {
     }
   }
   return Array.from(members.values()).sort((a, b) => compareLocale(a.name, b.name));
+}
+
+function importedScriptSourceDeclarationsForJsx(record, graph, moduleId) {
+  const declarations = new Map();
+  for (const ref of Array.isArray(record.importRefs) ? record.importRefs : []) {
+    if (!ref?.localRel || isJsxModule(ref.localRel)) continue;
+    if (isIgnoredExternalLabel(ref?.specifier)) continue;
+    const name = importedScriptVariableName(ref);
+    if (name === 'React') continue;
+    if (!name) continue;
+
+    const targetRecord = graph.modules.get(ref.localRel);
+    const binding = (Array.isArray(ref.bindings) ? ref.bindings : [])
+      .find((candidate) => candidate.local === name);
+    if (!targetRecord || binding?.kind === 'namespace') continue;
+
+    const declarationName = binding?.kind === 'named' ? binding.imported : name;
+    const span = declarationSpansByName(targetRecord).get(declarationName);
+    const entry = sourceDeclarationEntry({
+      moduleId,
+      visibleName: name,
+      record: targetRecord,
+      span,
+      declarationName,
+    });
+    if (entry && !declarations.has(entry.name)) declarations.set(entry.name, entry);
+  }
+  return Array.from(declarations.values())
+    .sort((a, b) => compareLocale(a.name, b.name))
+    .map((entry, sourceOrder) => sourceDeclarationEntryWithMetadata(
+      entry,
+      importedScriptSourceMetadata(moduleId, entry, sourceOrder),
+    ));
 }
 
 function normalizeImportEdgeBinding(binding) {
@@ -424,6 +529,44 @@ function buildMermaid(graph, importEdges) {
     lines.push(`  ${edge.source} --> ${edge.target} : ${edgeRestingLabel(edge.loadKinds)}`);
   }
   return lines.join('\n');
+}
+
+function buildSourceCode(graph) {
+  const jsxModules = Array.from(graph.modules.values())
+    .filter((record) => isJsxModule(record.rel))
+    .sort((a, b) => compareLocale(a.rel, b.rel));
+  const classIds = buildClassIds(jsxModules);
+  const declarations = [];
+  const seen = new Set();
+
+  const pushEntry = (entry) => {
+    if (!entry || seen.has(entry.key)) return;
+    seen.add(entry.key);
+    declarations.push(entry);
+  };
+
+  for (const record of jsxModules) {
+    const moduleId = classIds.get(record.rel);
+    for (const entry of importedScriptSourceDeclarationsForJsx(record, graph, moduleId)) {
+      pushEntry(entry);
+    }
+    const spans = declarationSpansByName(record);
+    for (const [sourceOrder, component] of extractComponents(record.source).entries()) {
+      const entry = sourceDeclarationEntry({
+        moduleId,
+        visibleName: component,
+        record,
+        span: spans.get(component),
+      });
+      if (!entry) continue;
+      pushEntry(sourceDeclarationEntryWithMetadata(
+        entry,
+        currentFileSourceMetadata(moduleId, entry, sourceOrder),
+      ));
+    }
+  }
+
+  return { declarations };
 }
 
 function buildTreeText(graph) {
@@ -575,6 +718,7 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
   const jsxClassCount = jsxScripts.length;
   const importEdges = buildImportEdges(graph);
   const mermaid = buildMermaid(graph, importEdges);
+  const sourceCode = buildSourceCode(graph);
   const treeText = buildTreeText(graph);
   const jsxTreeText = buildJsxTreeText(jsxScripts);
 
@@ -588,6 +732,7 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
     jsxScripts,
     mermaid,
     importEdges,
+    sourceCode,
     summary: {
       moduleCount: modules.size,
       jsxClassCount,

@@ -1,11 +1,108 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import crypto from 'node:crypto';
 
 import { analyzeProject } from './analyze-project.js';
 
 const require = createRequire(import.meta.url);
 const packageMeta = require('../../package.json');
+
+const CREDENTIAL_VALUE_PATTERNS = [
+  /\bAKIA[0-9A-Z]{16}\b/,
+  /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}\b/,
+  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/,
+  /\bsk_live_[A-Za-z0-9]{16,}\b/,
+  /\bsk-[A-Za-z0-9]{20,}\b/,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+];
+const CREDENTIAL_ASSIGNMENT_PATTERN = /(?:^|[^\w$])([A-Za-z_$][A-Za-z0-9_$]*)\s*[:=]\s*(['"`])((?:\\.|(?!\2)[\s\S])*?)\2/g;
+
+function stableJson(value) {
+  if (Array.isArray(value)) return '[' + value.map((item) => stableJson(item)).join(',') + ']';
+  if (value && typeof value === 'object') {
+    return '{' + Object.keys(value).sort().map((key) => (
+      JSON.stringify(key) + ':' + stableJson(value[key])
+    )).join(',') + '}';
+  }
+  return JSON.stringify(value);
+}
+
+function contentHash(value) {
+  return crypto.createHash('sha256').update(stableJson(value)).digest('hex');
+}
+
+function normalizeCredentialIdentifier(identifier) {
+  return String(identifier || '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
+    .toLowerCase();
+}
+
+function isSensitiveCredentialName(identifier) {
+  const normalized = normalizeCredentialIdentifier(identifier);
+  const parts = normalized.split(/[^a-z0-9]+/).filter(Boolean);
+  const joined = parts.join('_');
+  return [
+    'api_key',
+    'access_key',
+    'access_token',
+    'auth_token',
+    'id_token',
+    'refresh_token',
+    'client_secret',
+    'private_key',
+    'secret_access_key',
+    'secret_key',
+  ].some((phrase) => joined.includes(phrase))
+    || parts.includes('credential')
+    || parts.includes('credentials')
+    || parts.includes('passwd')
+    || parts.includes('password')
+    || parts.includes('secret')
+    || parts.includes('token');
+}
+
+function looksLikeCredentialValue(value) {
+  const text = String(value || '').trim();
+  if (CREDENTIAL_VALUE_PATTERNS.some((pattern) => pattern.test(text))) return true;
+  if (text.length < 16) return false;
+  if (/\s/.test(text)) return false;
+  if (!/^[A-Za-z0-9_./+=:-]+$/.test(text)) return false;
+
+  const characterClassCount = [
+    /[a-z]/.test(text),
+    /[A-Z]/.test(text),
+    /\d/.test(text),
+    /[_./+=:-]/.test(text),
+  ].filter(Boolean).length;
+  return characterClassCount >= 2;
+}
+
+function hasCredentialLiteral(code) {
+  if (CREDENTIAL_VALUE_PATTERNS.some((pattern) => pattern.test(code))) return true;
+
+  let match;
+  CREDENTIAL_ASSIGNMENT_PATTERN.lastIndex = 0;
+  while ((match = CREDENTIAL_ASSIGNMENT_PATTERN.exec(code))) {
+    if (isSensitiveCredentialName(match[1]) && looksLikeCredentialValue(match[3])) return true;
+  }
+  return false;
+}
+
+function assertNoCredentialLiterals(sourceCode = {}) {
+  for (const declaration of Array.isArray(sourceCode.declarations) ? sourceCode.declarations : []) {
+    const code = typeof declaration.code === 'string' ? declaration.code : '';
+    if (!code) continue;
+    if (!hasCredentialLiteral(code)) continue;
+    const sourcePath = declaration.modulePath || 'unknown source';
+    const startLine = declaration.startLine || '?';
+    const endLine = declaration.endLine || '?';
+    throw new Error(
+      `Refusing to write source-code.json: credential-looking literal in ${sourcePath}:${startLine}-${endLine}.`,
+    );
+  }
+}
 
 function viewerHtml() {
   return `<!doctype html>
@@ -114,6 +211,16 @@ function viewerHtml() {
         overflow:visible;
       }
       .diagram-canvas path.relation, .diagram-canvas path[data-edge="true"], .diagram-canvas g.edgeLabel { cursor:pointer; }
+      .diagram-canvas .source-member-trigger { cursor:pointer; color:var(--accent); fill:var(--accent); font-weight:700; pointer-events:auto; }
+      .diagram-canvas .source-member-hit-target {
+        fill:none !important;
+        stroke:transparent !important;
+        stroke-linecap:round;
+        stroke-width:24px !important;
+        vector-effect:non-scaling-stroke;
+        pointer-events:stroke;
+        cursor:pointer;
+      }
       .diagram-canvas .edge-hit-target {
         fill:none !important;
         stroke:transparent !important;
@@ -135,6 +242,31 @@ function viewerHtml() {
       .selected-import-row code { overflow-wrap:anywhere; }
       .selected-import-list { display:grid; gap:6px; margin:0; padding:0; list-style:none; }
       .selected-import-list li { border:1px solid var(--border); border-radius:8px; background:#fbfcff; padding:8px 10px; overflow-wrap:anywhere; }
+      .source-dialog {
+        width:min(900px, calc(100vw - 32px));
+        max-height:min(82vh, 760px);
+        border:1px solid var(--border);
+        border-radius:12px;
+        padding:0;
+        color:var(--text);
+        box-shadow:0 24px 80px rgba(24,33,50,.25);
+      }
+      .source-dialog::backdrop { background:rgba(24,33,50,.38); }
+      .source-dialog-body { display:grid; gap:12px; padding:16px; }
+      .source-dialog-header { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
+      .source-dialog-title-group { min-width:0; }
+      .source-dialog-actions { display:flex; gap:8px; flex:0 0 auto; flex-wrap:wrap; justify-content:flex-end; }
+      .source-dialog h2 { margin:0; font-size:1.05rem; overflow-wrap:anywhere; }
+      .source-dialog-path { margin:4px 0 0; color:var(--muted); font-size:.86rem; overflow-wrap:anywhere; }
+      .source-dialog pre {
+        max-height:58vh;
+        padding:12px;
+        border:1px solid #26344f;
+        border-radius:8px;
+        background:#111827;
+        color:#f8fafc;
+        white-space:pre;
+      }
     </style>
   </head>
   <body>
@@ -208,6 +340,22 @@ function viewerHtml() {
         </div>
       </div>
     </div>
+    <dialog id="source-dialog" class="source-dialog" aria-labelledby="source-dialog-title">
+      <div class="source-dialog-body">
+        <div class="source-dialog-header">
+          <div class="source-dialog-title-group">
+            <h2 id="source-dialog-title">Source</h2>
+            <p id="source-dialog-path" class="source-dialog-path"></p>
+          </div>
+          <div class="source-dialog-actions" aria-label="Source navigation">
+            <button id="source-dialog-previous" type="button" aria-label="Previous source item" disabled>Previous</button>
+            <button id="source-dialog-next" type="button" aria-label="Next source item" disabled>Next</button>
+            <button id="source-dialog-close" type="button">Close</button>
+          </div>
+        </div>
+        <pre><code id="source-dialog-code"></code></pre>
+      </div>
+    </dialog>
     <script type="module" src="./app.js"></script>
   </body>
 </html>
@@ -238,6 +386,13 @@ const copyJsxTreeBtn = document.getElementById('copy-jsx-tree-btn');
 const copyMermaidSourceBtn = document.getElementById('copy-mermaid-source-btn');
 const copyJsxTreeStatusEl = document.getElementById('copy-jsx-tree-status');
 const copyMermaidSourceStatusEl = document.getElementById('copy-mermaid-source-status');
+const sourceDialogEl = document.getElementById('source-dialog');
+const sourceDialogTitleEl = document.getElementById('source-dialog-title');
+const sourceDialogPathEl = document.getElementById('source-dialog-path');
+const sourceDialogCodeEl = document.getElementById('source-dialog-code');
+const sourceDialogPreviousBtn = document.getElementById('source-dialog-previous');
+const sourceDialogNextBtn = document.getElementById('source-dialog-next');
+const sourceDialogCloseBtn = document.getElementById('source-dialog-close');
 let latestSvg = '';
 let rawJsxTreeText = '';
 let rawMermaidSourceText = '';
@@ -250,6 +405,10 @@ let maxZoom = 4;
 let dragState = null;
 let pinchState = null;
 const activePointers = new Map();
+let sourceDeclarationLookup = { byDisplay: new Map(), byName: new Map(), groups: new Map() };
+let sourceDialogState = { declaration: null, group: [], index: -1 };
+let sourceDialogRestoreFocusEl = null;
+const svgNamespace = 'http://www.w3.org/2000/svg';
 
 function statCard(label, value) {
   const div = document.createElement('div');
@@ -419,6 +578,306 @@ function hasClass(element, className) {
   return (' ' + (element.getAttribute('class') || '') + ' ').includes(' ' + className + ' ');
 }
 
+function sourceKey(moduleId, name) {
+  return moduleId + '\\u0000' + name;
+}
+
+function sourceDisplayKey(moduleId, displayName) {
+  return moduleId + '\\u0000display\\u0000' + displayName;
+}
+
+function sourceDisplayName(labelText) {
+  return (typeof labelText === 'string' ? labelText : '')
+    .replace(/\\s+/g, ' ')
+    .trim()
+    .replace(/^\\\\?[+#~-]\\s*/, '')
+    .trim();
+}
+
+function validSourceNavigation(declaration) {
+  return typeof declaration?.sourceGroup === 'string'
+    && declaration.sourceGroup.trim()
+    && Number.isInteger(declaration.sourceOrder);
+}
+
+function sourceDeclarationLookupFromPayload(sourcePayload = {}) {
+  const byDisplay = new Map();
+  const byName = new Map();
+  const groupBuckets = new Map();
+  for (const declaration of Array.isArray(sourcePayload?.declarations) ? sourcePayload.declarations : []) {
+    const moduleId = typeof declaration.moduleId === 'string' ? declaration.moduleId : '';
+    const name = typeof declaration.name === 'string' ? declaration.name : '';
+    const displayName = typeof declaration.sourceDisplayName === 'string' ? declaration.sourceDisplayName.trim() : '';
+    if (moduleId && displayName) byDisplay.set(sourceDisplayKey(moduleId, displayName), declaration);
+    if (moduleId && name && !byName.has(sourceKey(moduleId, name))) byName.set(sourceKey(moduleId, name), declaration);
+    if (!validSourceNavigation(declaration)) continue;
+    if (!groupBuckets.has(declaration.sourceGroup)) groupBuckets.set(declaration.sourceGroup, []);
+    groupBuckets.get(declaration.sourceGroup).push(declaration);
+  }
+  const groups = new Map();
+  for (const [sourceGroup, declarations] of groupBuckets) {
+    groups.set(sourceGroup, declarations.sort((a, b) => a.sourceOrder - b.sourceOrder
+      || String(a.name || '').localeCompare(String(b.name || ''))));
+  }
+  return { byDisplay, byName, groups };
+}
+
+function sourcePayloadMatchesOutput(payload = {}, sourcePayload = {}) {
+  const outputMeta = payload && typeof payload.meta === 'object' ? payload.meta : {};
+  const sourceMeta = sourcePayload && typeof sourcePayload.meta === 'object' ? sourcePayload.meta : {};
+  return Boolean(
+    outputMeta.buildId
+    && outputMeta.sourceCodeHash
+    && sourceMeta.buildId
+    && sourceMeta.sourceCodeHash
+    && outputMeta.buildId === sourceMeta.buildId
+    && outputMeta.sourceCodeHash === sourceMeta.sourceCodeHash
+  );
+}
+
+async function loadSourceDeclarationMap(payload) {
+  try {
+    const sourceResponse = await fetch('./source-code.json');
+    if (!sourceResponse.ok) return { byDisplay: new Map(), byName: new Map(), groups: new Map() };
+    const sourcePayload = await sourceResponse.json();
+    if (!sourcePayloadMatchesOutput(payload, sourcePayload)) {
+      return { byDisplay: new Map(), byName: new Map(), groups: new Map() };
+    }
+    return sourceDeclarationLookupFromPayload(sourcePayload);
+  } catch (error) {
+    return { byDisplay: new Map(), byName: new Map(), groups: new Map() };
+  }
+}
+
+function sourceMemberName(label) {
+  let text = (typeof label === 'string' ? label : '').replace(/\\s+/g, ' ').trim();
+  text = text.replace(/^\\\\?[+#~-]\\s*/, '');
+  text = text.replace(/^\\d+\\s+/, '');
+  const parametersIndex = text.indexOf('(');
+  if (parametersIndex !== -1) text = text.slice(0, parametersIndex);
+  return text.trim();
+}
+
+function addModuleIdCandidate(candidates, value) {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!raw) return;
+  const classIdMatch = raw.match(/(?:^|-)classId-(.+?)(?:-\\d+)?$/);
+  if (classIdMatch) {
+    candidates.push(classIdMatch[1]);
+    return;
+  }
+  const classVariantMatch = raw.match(/^(?:class|flowchart)-(.+?)(?:-\\d+)?$/);
+  if (classVariantMatch) {
+    candidates.push(classVariantMatch[1]);
+    return;
+  }
+  candidates.push(raw);
+}
+
+function sourceModuleIdCandidatesFromElement(element) {
+  const candidates = [];
+  if (!element || typeof element.getAttribute !== 'function') return candidates;
+  addModuleIdCandidate(candidates, element.getAttribute('data-id'));
+  addModuleIdCandidate(candidates, element.getAttribute('data-node-id'));
+  addModuleIdCandidate(candidates, element.getAttribute('data-class-id'));
+  addModuleIdCandidate(candidates, element.getAttribute('id'));
+  return Array.from(new Set(candidates));
+}
+
+function sourceDeclarationForLabel(label) {
+  const name = sourceMemberName(label.textContent);
+  const displayName = sourceDisplayName(label.textContent);
+  if (!name && !displayName) return null;
+  let current = label;
+  let fallbackDeclaration = null;
+  while (current && current !== activeSvg) {
+    for (const moduleId of sourceModuleIdCandidatesFromElement(current)) {
+      if (displayName) {
+        const declaration = sourceDeclarationLookup.byDisplay.get(sourceDisplayKey(moduleId, displayName));
+        if (declaration) return declaration;
+      }
+      if (name && !fallbackDeclaration) {
+        fallbackDeclaration = sourceDeclarationLookup.byName.get(sourceKey(moduleId, name)) || null;
+      }
+    }
+    current = current.parentNode;
+  }
+  return fallbackDeclaration;
+}
+
+function svgNumber(value) {
+  if (!Number.isFinite(value)) return '0';
+  return String(Number(value.toFixed(3)));
+}
+
+function validSourceHitBox(box) {
+  return box
+    && Number.isFinite(box.x)
+    && Number.isFinite(box.y)
+    && Number.isFinite(box.width)
+    && Number.isFinite(box.height)
+    && box.width > 0
+    && box.height > 0;
+}
+
+function sourceHitBoxFromAttributes(element) {
+  if (!element || typeof element.getAttribute !== 'function') return null;
+  const box = {
+    x: Number.parseFloat(element.getAttribute('x')),
+    y: Number.parseFloat(element.getAttribute('y')),
+    width: Number.parseFloat(element.getAttribute('width')),
+    height: Number.parseFloat(element.getAttribute('height')),
+  };
+  return validSourceHitBox(box) ? box : null;
+}
+
+function sourceHitTargetReference(element) {
+  let current = element;
+  while (current && current !== activeSvg) {
+    if (typeof current.getBBox === 'function') {
+      try {
+        const box = current.getBBox();
+        if (validSourceHitBox(box)) return { element: current, box };
+      } catch (error) {
+        // Some rendered SVG/HTML hybrids expose getBBox but throw until layout settles.
+      }
+    }
+
+    const attributeBox = sourceHitBoxFromAttributes(current);
+    if (attributeBox) return { element: current, box: attributeBox };
+    current = current.parentNode;
+  }
+  return null;
+}
+
+function addSourceHitTarget(element, activate) {
+  const reference = sourceHitTargetReference(element);
+  const parent = reference?.element?.parentNode;
+  if (!parent) return;
+
+  const { x, y, width, height } = reference.box;
+  const hitTarget = document.createElementNS(svgNamespace, 'path');
+  hitTarget.classList.add('source-member-hit-target');
+  hitTarget.setAttribute('d', 'M' + svgNumber(x) + ' ' + svgNumber(y + (height / 2)) + 'H' + svgNumber(x + width));
+  hitTarget.setAttribute('aria-hidden', 'true');
+  hitTarget.setAttribute('focusable', 'false');
+  hitTarget.setAttribute('vector-effect', 'non-scaling-stroke');
+  hitTarget.addEventListener('click', activate);
+  parent.appendChild(hitTarget);
+}
+
+function sourceDialogNavigationForDeclaration(declaration) {
+  const group = validSourceNavigation(declaration)
+    ? (sourceDeclarationLookup.groups.get(declaration.sourceGroup) || [])
+    : [];
+  const index = group.indexOf(declaration);
+  return { group, index };
+}
+
+function canNavigateSourceDialog(direction) {
+  const nextIndex = sourceDialogState.index + direction;
+  return sourceDialogState.group.length > 1
+    && nextIndex >= 0
+    && nextIndex < sourceDialogState.group.length;
+}
+
+function updateSourceDialogNavigationControls() {
+  if (sourceDialogPreviousBtn) sourceDialogPreviousBtn.disabled = !canNavigateSourceDialog(-1);
+  if (sourceDialogNextBtn) sourceDialogNextBtn.disabled = !canNavigateSourceDialog(1);
+}
+
+function renderSourceDialogDeclaration(declaration) {
+  if (!sourceDialogEl || !declaration) return;
+  sourceDialogTitleEl.textContent = declaration.name || declaration.declarationName || 'Source';
+  sourceDialogPathEl.textContent = (declaration.modulePath || 'unknown source')
+    + ':'
+    + (declaration.startLine || '?')
+    + '-'
+    + (declaration.endLine || '?');
+  sourceDialogCodeEl.textContent = typeof declaration.code === 'string' ? declaration.code : '';
+  updateSourceDialogNavigationControls();
+}
+
+function showSourceDialog(declaration, restoreFocusEl) {
+  if (!sourceDialogEl || !declaration) return;
+  sourceDialogState = {
+    declaration,
+    ...sourceDialogNavigationForDeclaration(declaration),
+  };
+  sourceDialogRestoreFocusEl = restoreFocusEl || null;
+  renderSourceDialogDeclaration(declaration);
+
+  if (typeof sourceDialogEl.showModal === 'function') {
+    if (!sourceDialogEl.open) sourceDialogEl.showModal();
+  } else {
+    sourceDialogEl.setAttribute('open', '');
+  }
+  if (sourceDialogCloseBtn && typeof sourceDialogCloseBtn.focus === 'function') sourceDialogCloseBtn.focus();
+}
+
+function navigateSourceDialog(direction) {
+  if (!canNavigateSourceDialog(direction)) return;
+  const nextIndex = sourceDialogState.index + direction;
+  const declaration = sourceDialogState.group[nextIndex];
+  sourceDialogState = {
+    declaration,
+    group: sourceDialogState.group,
+    index: nextIndex,
+  };
+  renderSourceDialogDeclaration(declaration);
+}
+
+function closeSourceDialog() {
+  if (!sourceDialogEl) return;
+  const restoreFocusEl = sourceDialogRestoreFocusEl;
+  sourceDialogRestoreFocusEl = null;
+  sourceDialogState = { declaration: null, group: [], index: -1 };
+  updateSourceDialogNavigationControls();
+  if (sourceDialogEl.open && typeof sourceDialogEl.close === 'function') {
+    sourceDialogEl.close();
+  } else {
+    sourceDialogEl.removeAttribute('open');
+  }
+  if (restoreFocusEl && typeof restoreFocusEl.focus === 'function') restoreFocusEl.focus();
+}
+
+function addSourceActivation(element, declaration) {
+  element.classList.add('source-member-trigger');
+  element.setAttribute('tabindex', '0');
+  element.setAttribute('role', 'button');
+  element.setAttribute('focusable', 'true');
+  element.setAttribute('aria-label', 'Show source for ' + declaration.name + ' in ' + declaration.modulePath);
+
+  const activate = (event) => {
+    if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
+    showSourceDialog(declaration, element);
+  };
+  element.addEventListener('click', activate);
+  element.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    activate(event);
+  });
+  addSourceHitTarget(element, activate);
+}
+
+function wireSourceMembers() {
+  if (
+    !activeSvg
+    || typeof activeSvg.querySelectorAll !== 'function'
+    || (sourceDeclarationLookup.byDisplay.size === 0 && sourceDeclarationLookup.byName.size === 0)
+  ) return;
+  const labels = [
+    ...Array.from(activeSvg.querySelectorAll('text')),
+    ...Array.from(activeSvg.querySelectorAll('p')),
+  ];
+  for (const label of labels) {
+    const declaration = sourceDeclarationForLabel(label);
+    if (!declaration) continue;
+    addSourceActivation(label, declaration);
+  }
+}
+
 function findEdgeLabelGroup(label, dataId) {
   const groups = Array.from(label.querySelectorAll('g.label[data-id]'));
   return groups.find((group) => group.getAttribute('data-id') === dataId) || groups[0] || null;
@@ -557,6 +1016,15 @@ function isEdgePointerTarget(target) {
   return false;
 }
 
+function isSourcePointerTarget(target) {
+  let element = target;
+  while (element && element !== viewportEl) {
+    if (hasClass(element, 'source-member-trigger') || hasClass(element, 'source-member-hit-target')) return true;
+    element = element.parentNode;
+  }
+  return false;
+}
+
 function wireImportEdges(importEdges) {
   if (!activeSvg || typeof activeSvg.querySelectorAll !== 'function') return;
   const paths = Array.from(activeSvg.querySelectorAll('path[data-id]'))
@@ -634,7 +1102,7 @@ function bindInteraction() {
   }, { passive: false });
 
   viewportEl.addEventListener('pointerdown', (event) => {
-    if (isEdgePointerTarget(event.target)) return;
+    if (isEdgePointerTarget(event.target) || isSourcePointerTarget(event.target)) return;
 
     activePointers.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY });
 
@@ -706,6 +1174,23 @@ function bindInteraction() {
   zoomOutBtn.addEventListener('click', () => applyZoom(zoom / 1.2));
   fitBtn.addEventListener('click', fitToViewport);
   resetViewBtn.addEventListener('click', resetView);
+  sourceDialogPreviousBtn.addEventListener('click', () => navigateSourceDialog(-1));
+  sourceDialogNextBtn.addEventListener('click', () => navigateSourceDialog(1));
+  sourceDialogCloseBtn.addEventListener('click', closeSourceDialog);
+  sourceDialogEl.addEventListener('click', (event) => {
+    if (event.target === sourceDialogEl) closeSourceDialog();
+  });
+  sourceDialogEl.addEventListener('keydown', (event) => {
+    if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      navigateSourceDialog(-1);
+    } else if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      navigateSourceDialog(1);
+    } else if (event.key === 'Escape') {
+      closeSourceDialog();
+    }
+  });
 }
 
 function prepareSvgForInteraction(svgMarkup, importEdges) {
@@ -730,6 +1215,7 @@ function prepareSvgForInteraction(svgMarkup, importEdges) {
   zoom = 1;
   updateZoomStatus();
   wireImportEdges(importEdges);
+  wireSourceMembers();
   requestAnimationFrame(() => fitToViewport());
 }
 
@@ -748,6 +1234,7 @@ async function main() {
   const response = await fetch('./output.json');
   if (!response.ok) throw new Error('Failed to load output.json');
   const payload = await response.json();
+  sourceDeclarationLookup = await loadSourceDeclarationMap(payload);
   rawJsxTreeText = typeof payload.jsxTreeText === 'string' ? payload.jsxTreeText : '';
   rawMermaidSourceText = typeof payload.mermaid === 'string' ? payload.mermaid : '';
   subtitleEl.textContent = payload.entry + '  •  ' + payload.rootDir;
@@ -818,12 +1305,40 @@ async function copyMermaidAsset(outDir) {
 export async function generateStaticSite({ rootDir, entry, outDir, routeAliases } = {}) {
   const resolvedOutDir = path.resolve(outDir || 'ironglancer-site');
   const analysis = await analyzeProject({ rootDir, entry, routeAliases });
+  assertNoCredentialLiterals(analysis.sourceCode);
   const generatedAt = new Date().toISOString();
+  const sourceCodePayload = { ...analysis.sourceCode };
+  const sourceCodeHash = contentHash(sourceCodePayload);
+  const buildId = contentHash({
+    packageName: packageMeta.name,
+    version: packageMeta.version,
+    rootDir: analysis.rootDir,
+    entry: analysis.entryRel,
+    treeText: analysis.treeText,
+    jsxTreeText: analysis.jsxTreeText,
+    jsScripts: analysis.jsScripts,
+    jsxScripts: analysis.jsxScripts,
+    mermaid: analysis.mermaid,
+    importEdges: analysis.importEdges,
+    summary: analysis.summary,
+    sourceCodeHash,
+  });
+  const meta = {
+    packageName: packageMeta.name,
+    version: packageMeta.version,
+    generatedAt,
+    buildId,
+    sourceCodeHash,
+  };
   await fs.rm(resolvedOutDir, { recursive: true, force: true });
   await fs.mkdir(resolvedOutDir, { recursive: true });
   await fs.writeFile(path.join(resolvedOutDir, 'index.html'), viewerHtml(), 'utf8');
   await fs.writeFile(path.join(resolvedOutDir, 'app.js'), viewerAppJs(), 'utf8');
   await fs.writeFile(path.join(resolvedOutDir, 'diagram.mmd'), analysis.mermaid + '\n', 'utf8');
+  await fs.writeFile(path.join(resolvedOutDir, 'source-code.json'), JSON.stringify({
+    ...sourceCodePayload,
+    meta,
+  }, null, 2) + '\n', 'utf8');
   await fs.writeFile(path.join(resolvedOutDir, 'output.json'), JSON.stringify({
     rootDir: analysis.rootDir,
     entry: analysis.entryRel,
@@ -834,11 +1349,7 @@ export async function generateStaticSite({ rootDir, entry, outDir, routeAliases 
     mermaid: analysis.mermaid,
     importEdges: analysis.importEdges,
     summary: analysis.summary,
-    meta: {
-      packageName: packageMeta.name,
-      version: packageMeta.version,
-      generatedAt,
-    },
+    meta,
   }, null, 2) + '\n', 'utf8');
   await copyMermaidAsset(resolvedOutDir);
   return { outDir: resolvedOutDir, ...analysis };

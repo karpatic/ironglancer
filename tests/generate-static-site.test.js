@@ -28,6 +28,7 @@ class FakeElement {
     this.clientWidth = 800;
     this.clientHeight = 600;
     this.pointerCaptureCalls = [];
+    this.open = false;
     this._textContent = '';
     this._innerHTML = '';
     this.classList = {
@@ -143,12 +144,25 @@ class FakeElement {
   }
 
   click() {
+    if (this.disabled) return;
     for (const listener of this.listeners.get('click') || []) {
-      listener({ type: 'click', preventDefault() {} });
+      listener({ type: 'click', target: this, preventDefault() {} });
     }
   }
 
-  focus() {}
+  showModal() {
+    this.open = true;
+    this.setAttribute('open', '');
+  }
+
+  close() {
+    this.open = false;
+    this.removeAttribute('open');
+  }
+
+  focus() {
+    if (this.ownerDocument) this.ownerDocument.activeElement = this;
+  }
 
   select() {
     this.ownerDocument.selectedText = this.value;
@@ -178,6 +192,7 @@ class FakeElement {
     clone.scrollHeight = this.scrollHeight;
     clone.clientWidth = this.clientWidth;
     clone.clientHeight = this.clientHeight;
+    clone.open = this.open;
     clone._textContent = this._textContent;
     clone._innerHTML = this._innerHTML;
     clone.style = { ...this.style };
@@ -228,6 +243,7 @@ class FakeDocument {
     this.renderedSvgFactory = renderedSvgFactory;
     this.selectedText = '';
     this.body = this.createElement('body');
+    this.activeElement = null;
     this.execCommand = (command) => (execCommand ? execCommand(command, this) : false);
   }
 
@@ -260,6 +276,9 @@ async function flushAsyncWork() {
 async function runGeneratedViewerApp({
   appJs,
   payload,
+  sourcePayload,
+  sourceResponseOk = true,
+  sourceFetchReject = false,
   clipboardWriteText,
   execCommand,
   renderedSvgFactory,
@@ -274,10 +293,19 @@ async function runGeneratedViewerApp({
     },
     document,
     navigator: clipboardWriteText ? { clipboard: { writeText: clipboardWriteText } } : {},
-    fetch: async () => ({
-      ok: true,
-      json: async () => payload,
-    }),
+    fetch: async (url) => {
+      if (!String(url).includes('source-code.json')) {
+        return {
+          ok: true,
+          json: async () => payload,
+        };
+      }
+      if (sourceFetchReject) throw new Error('source-code.json unavailable');
+      return {
+        ok: sourceResponseOk,
+        json: async () => sourcePayload,
+      };
+    },
     requestAnimationFrame: (callback) => {
       callback();
       return 1;
@@ -305,6 +333,16 @@ async function runGeneratedViewerApp({
   throw new Error('generated viewer app did not finish rendering test payload');
 }
 
+async function writeTempProject(files) {
+  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-fixture-'));
+  await Promise.all(Object.entries(files).map(async ([relativePath, contents]) => {
+    const filePath = path.join(rootDir, relativePath);
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, contents, 'utf8');
+  }));
+  return rootDir;
+}
+
 function createFakeMermaidEdge(document, { source, target, labelText = 'import' }) {
   const dataId = `id_${source}_${target}_fake`;
   const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
@@ -327,6 +365,44 @@ function createFakeMermaidEdge(document, { source, target, labelText = 'import' 
   return { edgeLabel, group, labelGroup, originalLabel, pathElement };
 }
 
+function createFakeMermaidClass(document, {
+  classId,
+  memberText,
+  memberTexts = [memberText],
+  classGroupId = 'classId-' + classId + '-0',
+  memberBox = { x: 24, y: 48, width: 180, height: 18 },
+}) {
+  const classGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+  const methodsGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+  const labelGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+  const foreignObject = document.createElementNS('http://www.w3.org/2000/svg', 'foreignObject');
+  const wrapper = document.createElement('div');
+  const span = document.createElement('span');
+  const members = [];
+
+  classGroup.setAttribute('id', classGroupId);
+  methodsGroup.setAttribute('class', 'methods-group text');
+  labelGroup.setAttribute('class', 'label');
+  foreignObject.setAttribute('x', String(memberBox.x));
+  foreignObject.setAttribute('y', String(memberBox.y));
+  foreignObject.setAttribute('width', String(memberBox.width));
+  foreignObject.setAttribute('height', String(memberBox.height));
+  foreignObject.getBBox = () => ({ ...memberBox });
+  for (const text of memberTexts.filter((value) => typeof value === 'string')) {
+    const member = document.createElement('p');
+    member.textContent = text;
+    members.push(member);
+    span.appendChild(member);
+  }
+
+  wrapper.appendChild(span);
+  foreignObject.appendChild(wrapper);
+  labelGroup.appendChild(foreignObject);
+  methodsGroup.appendChild(labelGroup);
+  classGroup.appendChild(methodsGroup);
+  return { classGroup, member: members[0] || null, members };
+}
+
 test('generateStaticSite writes a static viewer bundle', async () => {
   const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-'));
   const result = await generateStaticSite({ rootDir: fixtureRoot, entry: 'src/app.jsx', outDir });
@@ -336,6 +412,7 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.ok(files.includes('index.html'));
   assert.ok(files.includes('app.js'));
   assert.ok(files.includes('output.json'));
+  assert.ok(files.includes('source-code.json'));
   assert.ok(files.includes('vendor'));
 
   const html = await fs.readFile(path.join(outDir, 'index.html'), 'utf8');
@@ -349,6 +426,8 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.doesNotMatch(html, />Open JSON</);
   assert.doesNotMatch(html, />Open Mermaid</);
   assert.doesNotMatch(html, /<details[^>]*\sopen(?:\s|>|=)/);
+  assert.match(html, /id="source-dialog-previous"[^>]*aria-label="Previous source item"[^>]*disabled>Previous<\/button>/);
+  assert.match(html, /id="source-dialog-next"[^>]*aria-label="Next source item"[^>]*disabled>Next<\/button>/);
 
   const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
   assert.match(appJs, /payload\.jsxTreeText/);
@@ -369,8 +448,655 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.ok(!output.jsxTreeText.includes('[external]'));
   assert.deepEqual(output.importEdges, result.importEdges);
 
+  const sourceOutput = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
+  assert.match(output.meta.buildId, /^[a-f0-9]{64}$/);
+  assert.match(output.meta.sourceCodeHash, /^[a-f0-9]{64}$/);
+  assert.equal(sourceOutput.meta.buildId, output.meta.buildId);
+  assert.equal(sourceOutput.meta.sourceCodeHash, output.meta.sourceCodeHash);
+  assert.equal(sourceOutput.meta.packageName, output.meta.packageName);
+  assert.equal(sourceOutput.meta.version, output.meta.version);
+  assert.equal(sourceOutput.meta.generatedAt, output.meta.generatedAt);
+  const helperSource = sourceOutput.declarations.find((item) => item.name === 'helper');
+  assert.equal(helperSource.moduleId, 'app');
+  assert.equal(helperSource.modulePath, 'src/lib/util.js');
+  assert.equal(helperSource.startLine, 1);
+  assert.equal(helperSource.endLine, 3);
+  assert.equal(helperSource.code, "export function helper() {\n  return 'helper';\n}");
+  assert.ok(!sourceOutput.declarations.some((item) => item.name === 'theme'));
+  assert.ok(!sourceOutput.declarations.some((item) => item.name === 'remoteLib'));
+
   const vendorFiles = await fs.readdir(path.join(outDir, 'vendor'));
   assert.ok(vendorFiles.some((name) => name.includes('mermaid')));
+});
+
+test('generateStaticSite refuses credential-looking source snippets without rejecting validation copy', async () => {
+  const safeRootDir = await writeTempProject({
+    'src/app.jsx': [
+      'export function App() {',
+      '  const validationRules = {',
+      "    password: 'Must be at least eight characters',",
+      "    token: 'Enter the token from your email',",
+      '  };',
+      '  return <pre>{validationRules.password}</pre>;',
+      '}',
+    ].join('\n'),
+  });
+  await assert.doesNotReject(generateStaticSite({
+    rootDir: safeRootDir,
+    entry: 'src/app.jsx',
+    outDir: path.join(safeRootDir, 'site'),
+  }));
+
+  const cases = [
+    {
+      name: 'VITE_API_KEY',
+      importName: 'VITE_API_KEY',
+      source: "export const VITE_API_KEY = 'vite_pk_1234567890abcdefABCDEF';",
+    },
+    {
+      name: 'AWS_SECRET_ACCESS_KEY',
+      importName: 'AWS_SECRET_ACCESS_KEY',
+      source: "export const AWS_SECRET_ACCESS_KEY = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';",
+    },
+    {
+      name: 'plain token',
+      importName: 'token',
+      source: "export const token = 'tok_1234567890abcdefABCDEF';",
+    },
+    {
+      name: 'Stripe live key',
+      importName: 'publishable',
+      source: "export const publishable = '"
+        + ['sk', 'live', '1234567890abcdefABCDEF123456'].join('_')
+        + "';",
+    },
+  ];
+
+  for (const credentialCase of cases) {
+    const rootDir = await writeTempProject({
+      'src/app.jsx': [
+        'export function App() {',
+        `  ${credentialCase.source.replace('export const ', 'const ')}`,
+        `  return <pre>{${credentialCase.importName}}</pre>;`,
+        '}',
+      ].join('\n'),
+    });
+
+    await assert.rejects(
+      generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir: path.join(rootDir, 'site') }),
+      /credential-looking literal/,
+      credentialCase.name,
+    );
+  }
+});
+
+test('generated viewer opens visible member source snippets from scoped source payload', async () => {
+  const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-source-'));
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
+
+  const files = await fs.readdir(outDir);
+  assert.ok(files.includes('source-code.json'));
+
+  const sourcePayload = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
+  const appSource = await fs.readFile(path.join(rootDir, 'src/app.jsx'), 'utf8');
+  const appLines = appSource.split(/\r\n|\r|\n/).slice(12, 28).join('\n');
+  assert.deepEqual(sourcePayload.declarations.map(({ moduleId, modulePath, name, startLine, endLine }) => ({
+    moduleId,
+    modulePath,
+    name,
+    startLine,
+    endLine,
+  })), [
+    {
+      moduleId: 'app',
+      modulePath: 'src/app.jsx',
+      name: 'App',
+      startLine: 13,
+      endLine: 28,
+    },
+    {
+      moduleId: 'dynamic_child',
+      modulePath: 'src/dynamic-child.jsx',
+      name: 'DynamicExport',
+      startLine: 1,
+      endLine: 3,
+    },
+    {
+      moduleId: 'faculty_body_child',
+      modulePath: 'src/faculty-body-child.jsx',
+      name: 'CreatorViewBody',
+      startLine: 1,
+      endLine: 3,
+    },
+    {
+      moduleId: 'faculty_editor_child',
+      modulePath: 'src/faculty-editor-child.jsx',
+      name: 'CreatorQuizEntryEditor',
+      startLine: 1,
+      endLine: 3,
+    },
+    {
+      moduleId: 'static_child',
+      modulePath: 'src/static-child.jsx',
+      name: 'StaticDefault',
+      startLine: 1,
+      endLine: 3,
+    },
+    {
+      moduleId: 'static_child',
+      modulePath: 'src/static-child.jsx',
+      name: 'StaticNamed',
+      startLine: 5,
+      endLine: 7,
+    },
+    {
+      moduleId: 'static_child',
+      modulePath: 'src/static-child.jsx',
+      name: 'StaticSame',
+      startLine: 9,
+      endLine: 11,
+    },
+  ]);
+  assert.equal(sourcePayload.declarations.find((item) => item.name === 'App').code, appLines);
+  assert.ok(!sourcePayload.declarations.some((item) => item.name === 'useCreatorModule'));
+  assert.ok(!sourcePayload.declarations.some((item) => item.name === 'UnusedChild'));
+
+  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
+  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
+  assert.equal(sourcePayload.meta.buildId, payload.meta.buildId);
+  assert.equal(sourcePayload.meta.sourceCodeHash, payload.meta.sourceCodeHash);
+  const rendered = {};
+  const { document } = await runGeneratedViewerApp({
+    appJs,
+    payload,
+    sourcePayload,
+    renderedSvgFactory: (fakeDocument) => {
+      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.viewBox = { baseVal: { width: 640, height: 320 } };
+      Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
+        classId: 'app',
+        memberText: '+16 App()',
+      }));
+      svg.appendChild(rendered.classGroup);
+      return svg;
+    },
+  });
+
+  assert.equal(rendered.member.getAttribute('role'), 'button');
+  assert.equal(rendered.member.getAttribute('tabindex'), '0');
+  assert.equal(rendered.member.getAttribute('aria-label'), 'Show source for App in src/app.jsx');
+
+  const viewport = document.getElementById('diagram-viewport');
+  viewport.dispatchEvent({
+    type: 'pointerdown',
+    pointerId: 17,
+    pointerType: 'mouse',
+    clientX: 20,
+    clientY: 30,
+    target: rendered.member,
+  });
+  assert.deepEqual(viewport.pointerCaptureCalls, []);
+  assert.equal(viewport.classList.contains('is-dragging'), false);
+
+  rendered.member.dispatchEvent({ type: 'keydown', key: 'Enter' });
+  const dialog = document.getElementById('source-dialog');
+  assert.equal(dialog.open, true);
+  assert.equal(document.getElementById('source-dialog-title').textContent, 'App');
+  assert.equal(document.getElementById('source-dialog-path').textContent, 'src/app.jsx:13-28');
+  const codeEl = document.getElementById('source-dialog-code');
+  assert.equal(codeEl.textContent, appLines);
+  assert.equal(codeEl.innerHTML, '');
+  assert.equal(document.getElementById('source-dialog-previous').disabled, true);
+  assert.equal(document.getElementById('source-dialog-next').disabled, true);
+
+  document.getElementById('source-dialog-close').click();
+  assert.equal(dialog.open, false);
+
+  rendered.member.click();
+  assert.equal(dialog.open, true);
+  dialog.dispatchEvent({ type: 'click' });
+  assert.equal(dialog.open, false);
+
+  rendered.member.dispatchEvent({ type: 'keydown', key: ' ' });
+  assert.equal(dialog.open, true);
+  dialog.dispatchEvent({ type: 'keydown', key: 'Escape' });
+  assert.equal(dialog.open, false);
+});
+
+test('generated viewer navigates imported script member source within its rendered sibling group', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import { AlphaScript } from './shared.js';",
+      "import { MissingScript } from './shared.js';",
+      "import { OmegaScript } from './shared.js';",
+      '',
+      'export function View() {',
+      '  return <div>{AlphaScript()}{MissingScript}{OmegaScript()}</div>;',
+      '}',
+    ].join('\n'),
+    'src/shared.js': [
+      'export function AlphaScript() {',
+      "  return 'alpha';",
+      '}',
+      '',
+      'export function OmegaScript() {',
+      "  return 'omega';",
+      '}',
+    ].join('\n'),
+  });
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-import-nav-'));
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
+
+  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
+  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
+  const sourcePayload = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
+  assert.deepEqual(sourcePayload.declarations.map(({
+    name,
+    sourceOrigin,
+    sourceGroup,
+    sourceOrder,
+    sourceDisplayName,
+  }) => ({
+    name,
+    sourceOrigin,
+    sourceGroup,
+    sourceOrder,
+    sourceDisplayName,
+  })), [
+    {
+      name: 'AlphaScript',
+      sourceOrigin: 'imported-script-member',
+      sourceGroup: 'app:imported-script-members',
+      sourceOrder: 0,
+      sourceDisplayName: '3 AlphaScript',
+    },
+    {
+      name: 'OmegaScript',
+      sourceOrigin: 'imported-script-member',
+      sourceGroup: 'app:imported-script-members',
+      sourceOrder: 1,
+      sourceDisplayName: '3 OmegaScript',
+    },
+    {
+      name: 'View',
+      sourceOrigin: 'current-file-declaration',
+      sourceGroup: 'app:current-file-declarations',
+      sourceOrder: 0,
+      sourceDisplayName: '3 View()',
+    },
+  ]);
+  assert.ok(!sourcePayload.declarations.some((item) => item.name === 'MissingScript'));
+  const rendered = {};
+  const { document } = await runGeneratedViewerApp({
+    appJs,
+    payload,
+    sourcePayload,
+    renderedSvgFactory: (fakeDocument) => {
+      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.viewBox = { baseVal: { width: 640, height: 320 } };
+      Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
+        classId: 'app',
+        memberTexts: [
+          '+3 AlphaScript',
+          '+MissingScript',
+          '+3 OmegaScript',
+          '+3 View()',
+        ],
+      }));
+      svg.appendChild(rendered.classGroup);
+      return svg;
+    },
+  });
+
+  const dialog = document.getElementById('source-dialog');
+  const previousBtn = document.getElementById('source-dialog-previous');
+  const nextBtn = document.getElementById('source-dialog-next');
+  rendered.members[0].click();
+  assert.equal(dialog.open, true);
+  assert.equal(document.getElementById('source-dialog-title').textContent, 'AlphaScript');
+  assert.equal(document.getElementById('source-dialog-path').textContent, 'src/shared.js:1-3');
+  assert.equal(previousBtn.disabled, true);
+  assert.equal(nextBtn.disabled, false);
+
+  nextBtn.click();
+  assert.equal(dialog.open, true);
+  assert.equal(document.getElementById('source-dialog-title').textContent, 'OmegaScript');
+  assert.equal(document.getElementById('source-dialog-path').textContent, 'src/shared.js:5-7');
+  assert.equal(
+    document.getElementById('source-dialog-code').textContent,
+    "export function OmegaScript() {\n  return 'omega';\n}",
+  );
+  assert.equal(previousBtn.disabled, false);
+  assert.equal(nextBtn.disabled, true);
+
+  previousBtn.click();
+  assert.equal(document.getElementById('source-dialog-title').textContent, 'AlphaScript');
+  assert.equal(document.getElementById('source-dialog-path').textContent, 'src/shared.js:1-3');
+});
+
+test('generated viewer navigates current-file source without crossing into imported members', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import { AlphaScript } from './shared.js';",
+      '',
+      'export function AlphaView() {',
+      "  return AlphaScript('alpha');",
+      '}',
+      '',
+      'export function OmegaView() {',
+      "  return AlphaScript('omega');",
+      '}',
+    ].join('\n'),
+    'src/shared.js': [
+      'export function AlphaScript(value) {',
+      '  return value;',
+      '}',
+    ].join('\n'),
+  });
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-current-nav-'));
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
+
+  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
+  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
+  const sourcePayload = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
+  assert.deepEqual(sourcePayload.declarations.map(({
+    name,
+    sourceOrigin,
+    sourceGroup,
+    sourceOrder,
+    sourceDisplayName,
+  }) => ({
+    name,
+    sourceOrigin,
+    sourceGroup,
+    sourceOrder,
+    sourceDisplayName,
+  })), [
+    {
+      name: 'AlphaScript',
+      sourceOrigin: 'imported-script-member',
+      sourceGroup: 'app:imported-script-members',
+      sourceOrder: 0,
+      sourceDisplayName: '3 AlphaScript',
+    },
+    {
+      name: 'AlphaView',
+      sourceOrigin: 'current-file-declaration',
+      sourceGroup: 'app:current-file-declarations',
+      sourceOrder: 0,
+      sourceDisplayName: '3 AlphaView()',
+    },
+    {
+      name: 'OmegaView',
+      sourceOrigin: 'current-file-declaration',
+      sourceGroup: 'app:current-file-declarations',
+      sourceOrder: 1,
+      sourceDisplayName: '3 OmegaView()',
+    },
+  ]);
+  const rendered = {};
+  const { document } = await runGeneratedViewerApp({
+    appJs,
+    payload,
+    sourcePayload,
+    renderedSvgFactory: (fakeDocument) => {
+      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.viewBox = { baseVal: { width: 640, height: 320 } };
+      Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
+        classId: 'app',
+        memberTexts: [
+          '+3 AlphaScript',
+          '+3 AlphaView()',
+          '+3 OmegaView()',
+        ],
+      }));
+      svg.appendChild(rendered.classGroup);
+      return svg;
+    },
+  });
+
+  const dialog = document.getElementById('source-dialog');
+  const previousBtn = document.getElementById('source-dialog-previous');
+  const nextBtn = document.getElementById('source-dialog-next');
+  rendered.members[1].click();
+  assert.equal(dialog.open, true);
+  assert.equal(document.getElementById('source-dialog-title').textContent, 'AlphaView');
+  assert.equal(document.getElementById('source-dialog-path').textContent, 'src/app.jsx:3-5');
+  assert.equal(previousBtn.disabled, true);
+  assert.equal(nextBtn.disabled, false);
+
+  nextBtn.click();
+  assert.equal(dialog.open, true);
+  assert.equal(document.getElementById('source-dialog-title').textContent, 'OmegaView');
+  assert.equal(document.getElementById('source-dialog-path').textContent, 'src/app.jsx:7-9');
+  assert.equal(previousBtn.disabled, false);
+  assert.equal(nextBtn.disabled, true);
+
+  previousBtn.click();
+  assert.equal(document.getElementById('source-dialog-title').textContent, 'AlphaView');
+  assert.equal(document.getElementById('source-dialog-path').textContent, 'src/app.jsx:3-5');
+});
+
+test('generated viewer supports source dialog keyboard navigation and restores trigger focus', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import { AlphaScript } from './shared.js';",
+      "import { OmegaScript } from './shared.js';",
+      '',
+      'export function View() {',
+      '  return <div>{AlphaScript()}{OmegaScript()}</div>;',
+      '}',
+    ].join('\n'),
+    'src/shared.js': [
+      'export function AlphaScript() {',
+      "  return 'alpha';",
+      '}',
+      '',
+      'export function OmegaScript() {',
+      "  return 'omega';",
+      '}',
+    ].join('\n'),
+  });
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-dialog-a11y-'));
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
+
+  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
+  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
+  const sourcePayload = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
+  const rendered = {};
+  const { document } = await runGeneratedViewerApp({
+    appJs,
+    payload,
+    sourcePayload,
+    renderedSvgFactory: (fakeDocument) => {
+      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.viewBox = { baseVal: { width: 640, height: 320 } };
+      Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
+        classId: 'app',
+        memberTexts: [
+          '+3 AlphaScript',
+          '+3 OmegaScript',
+          '+3 View()',
+        ],
+      }));
+      svg.appendChild(rendered.classGroup);
+      return svg;
+    },
+  });
+
+  const dialog = document.getElementById('source-dialog');
+  const closeBtn = document.getElementById('source-dialog-close');
+  rendered.members[0].click();
+  assert.equal(dialog.open, true);
+  assert.equal(document.activeElement, closeBtn);
+
+  dialog.dispatchEvent({ type: 'keydown', key: 'ArrowRight' });
+  assert.equal(dialog.open, true);
+  assert.equal(document.getElementById('source-dialog-title').textContent, 'OmegaScript');
+  assert.equal(document.getElementById('source-dialog-path').textContent, 'src/shared.js:5-7');
+
+  dialog.dispatchEvent({ type: 'keydown', key: 'ArrowLeft' });
+  assert.equal(document.getElementById('source-dialog-title').textContent, 'AlphaScript');
+  assert.equal(document.getElementById('source-dialog-path').textContent, 'src/shared.js:1-3');
+
+  dialog.dispatchEvent({ type: 'keydown', key: 'Escape' });
+  assert.equal(dialog.open, false);
+  assert.equal(document.activeElement, rendered.members[0]);
+
+  rendered.members[1].click();
+  assert.equal(dialog.open, true);
+  closeBtn.click();
+  assert.equal(dialog.open, false);
+  assert.equal(document.activeElement, rendered.members[1]);
+});
+
+test('generated viewer resolves source members from Mermaid class id variants', async () => {
+  const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-source-id-'));
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
+
+  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
+  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
+  const sourcePayload = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
+  const rendered = {};
+  const { document } = await runGeneratedViewerApp({
+    appJs,
+    payload,
+    sourcePayload,
+    renderedSvgFactory: (fakeDocument) => {
+      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.viewBox = { baseVal: { width: 640, height: 320 } };
+      Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
+        classId: 'app',
+        classGroupId: 'classId-app',
+        memberText: '+16 App()',
+      }));
+      svg.appendChild(rendered.classGroup);
+      return svg;
+    },
+  });
+
+  assert.equal(rendered.member.getAttribute('role'), 'button');
+  rendered.member.click();
+  assert.equal(document.getElementById('source-dialog').open, true);
+});
+
+test('generated viewer adds non-scaling source member hit targets without duplicate semantics', async () => {
+  const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-source-hit-target-'));
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
+
+  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
+  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
+  const sourcePayload = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
+  const rendered = {};
+  const { document } = await runGeneratedViewerApp({
+    appJs,
+    payload,
+    sourcePayload,
+    renderedSvgFactory: (fakeDocument) => {
+      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.viewBox = { baseVal: { width: 640, height: 320 } };
+      Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
+        classId: 'app',
+        memberText: '+16 App()',
+        memberBox: { x: 96, y: 144, width: 124, height: 18 },
+      }));
+      svg.appendChild(rendered.classGroup);
+      return svg;
+    },
+  });
+
+  assert.equal(rendered.member.getAttribute('role'), 'button');
+  assert.equal(rendered.member.getAttribute('tabindex'), '0');
+  assert.equal(rendered.member.getAttribute('aria-label'), 'Show source for App in src/app.jsx');
+
+  const hitTarget = rendered.classGroup.querySelector('path.source-member-hit-target');
+  assert.ok(hitTarget, 'expected generated viewer to add a source member hit target');
+  assert.equal(hitTarget.getAttribute('vector-effect'), 'non-scaling-stroke');
+  assert.equal(hitTarget.getAttribute('aria-hidden'), 'true');
+  assert.equal(hitTarget.getAttribute('focusable'), 'false');
+  assert.equal(hitTarget.getAttribute('role'), null);
+  assert.equal(hitTarget.getAttribute('tabindex'), null);
+  assert.equal(hitTarget.getAttribute('aria-label'), null);
+  assert.match(hitTarget.getAttribute('d'), /^M96 153H220$/);
+
+  const viewport = document.getElementById('diagram-viewport');
+  viewport.dispatchEvent({
+    type: 'pointerdown',
+    pointerId: 23,
+    pointerType: 'mouse',
+    clientX: 100,
+    clientY: 152,
+    target: hitTarget,
+  });
+  assert.deepEqual(viewport.pointerCaptureCalls, []);
+  assert.equal(viewport.classList.contains('is-dragging'), false);
+
+  hitTarget.click();
+  assert.equal(document.getElementById('source-dialog').open, true);
+});
+
+test('generated viewer disables source popups for mismatched or unavailable source payloads', async () => {
+  const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-source-identity-'));
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
+
+  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
+  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
+  const sourcePayload = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
+
+  async function renderSourceMember(sourceOptions) {
+    const rendered = {};
+    const harness = await runGeneratedViewerApp({
+      appJs,
+      payload,
+      sourcePayload,
+      ...sourceOptions,
+      renderedSvgFactory: (fakeDocument) => {
+        const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.viewBox = { baseVal: { width: 640, height: 320 } };
+        Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
+          classId: 'app',
+          memberText: '+16 App()',
+        }));
+        svg.appendChild(rendered.classGroup);
+        return svg;
+      },
+    });
+    return { ...harness, rendered };
+  }
+
+  const matching = await renderSourceMember({});
+  assert.equal(matching.rendered.member.getAttribute('role'), 'button');
+  matching.rendered.member.click();
+  assert.equal(matching.document.getElementById('source-dialog').open, true);
+
+  const mismatchedSourcePayload = {
+    ...sourcePayload,
+    meta: {
+      ...sourcePayload.meta,
+      buildId: '0'.repeat(64),
+    },
+  };
+  const mismatched = await renderSourceMember({ sourcePayload: mismatchedSourcePayload });
+  assert.equal(mismatched.document.getElementById('mermaid').textContent, payload.mermaid);
+  assert.equal(mismatched.rendered.member.getAttribute('role'), null);
+  assert.equal(mismatched.rendered.member.getAttribute('tabindex'), null);
+  assert.equal(mismatched.rendered.member.getAttribute('aria-label'), null);
+  mismatched.rendered.member.click();
+  assert.equal(mismatched.document.getElementById('source-dialog').open, false);
+
+  const missing = await renderSourceMember({ sourceResponseOk: false });
+  assert.equal(missing.document.getElementById('mermaid').textContent, payload.mermaid);
+  assert.equal(missing.rendered.member.getAttribute('role'), null);
+  missing.rendered.member.dispatchEvent({ type: 'keydown', key: 'Enter' });
+  assert.equal(missing.document.getElementById('source-dialog').open, false);
+
+  const unavailable = await renderSourceMember({ sourceFetchReject: true });
+  assert.equal(unavailable.document.getElementById('mermaid').textContent, payload.mermaid);
+  assert.equal(unavailable.rendered.member.getAttribute('role'), null);
 });
 
 test('generated viewer copy controls copy raw output values and report success', async () => {
