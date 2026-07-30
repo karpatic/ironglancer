@@ -4,6 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs/promises';
 import vm from 'node:vm';
+import crypto from 'node:crypto';
 
 import { generateStaticSite } from '../src/lib/generate-static-site.js';
 
@@ -420,8 +421,17 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.ok(files.includes('source-code.json'));
   assert.ok(files.includes('vendor'));
 
+  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
+  const expectedAppHash = crypto.createHash('sha256').update(appJs).digest('hex');
   const html = await fs.readFile(path.join(outDir, 'index.html'), 'utf8');
-  assert.match(html, /\.\/app\.js/);
+  const appScriptMatch = html.match(/<script type="module" src="([^"]+)"><\/script>/);
+  assert.ok(appScriptMatch, 'expected generated HTML to load the viewer app as a module script');
+  assert.equal(appScriptMatch[1], `./app.js?v=${expectedAppHash}`);
+  assert.doesNotMatch(appScriptMatch[1], /[<>"'&]/);
+  assert.equal(
+    new URL(appScriptMatch[1], 'https://static.example/analysis/index.html').href,
+    `https://static.example/analysis/app.js?v=${expectedAppHash}`,
+  );
   assert.match(html, /<details class="panel collapsible-panel" id="jsx-tree-panel">/);
   assert.match(html, /<details class="panel collapsible-panel" id="mermaid-source-panel">/);
   assert.match(html, /<div id="selected-import" class="body selected-import-details"/);
@@ -434,7 +444,6 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.match(html, /id="source-dialog-previous"[^>]*aria-label="Previous source item"[^>]*disabled>Previous<\/button>/);
   assert.match(html, /id="source-dialog-next"[^>]*aria-label="Next source item"[^>]*disabled>Next<\/button>/);
 
-  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
   assert.match(appJs, /payload\.jsxTreeText/);
   assert.doesNotMatch(appJs, /jsxScriptsEl|renderJsxScripts|jsxScriptsFromPayload/);
 

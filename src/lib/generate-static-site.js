@@ -32,6 +32,20 @@ function contentHash(value) {
   return crypto.createHash('sha256').update(stableJson(value)).digest('hex');
 }
 
+function textContentHash(value) {
+  return crypto.createHash('sha256').update(String(value)).digest('hex');
+}
+
+function escapeHtmlAttribute(value) {
+  return String(value).replace(/[&<>"']/g, (character) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[character]));
+}
+
 function normalizeCredentialIdentifier(identifier) {
   return String(identifier || '')
     .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
@@ -104,7 +118,8 @@ function assertNoCredentialLiterals(sourceCode = {}) {
   }
 }
 
-function viewerHtml() {
+function viewerHtml({ appScriptSrc = './app.js' } = {}) {
+  const escapedAppScriptSrc = escapeHtmlAttribute(appScriptSrc);
   return `<!doctype html>
 <html lang="en">
   <head>
@@ -374,7 +389,7 @@ function viewerHtml() {
         <pre><code id="source-dialog-code"></code></pre>
       </div>
     </dialog>
-    <script type="module" src="./app.js"></script>
+    <script type="module" src="${escapedAppScriptSrc}"></script>
   </body>
 </html>
 `;
@@ -1520,6 +1535,8 @@ export async function generateStaticSite({ rootDir, entry, outDir, routeAliases 
   const generatedAt = new Date().toISOString();
   const sourceCodePayload = { ...analysis.sourceCode };
   const sourceCodeHash = contentHash(sourceCodePayload);
+  const appJs = viewerAppJs();
+  const appScriptSrc = `./app.js?v=${textContentHash(appJs)}`;
   const buildId = contentHash({
     packageName: packageMeta.name,
     version: packageMeta.version,
@@ -1543,8 +1560,8 @@ export async function generateStaticSite({ rootDir, entry, outDir, routeAliases 
   };
   await fs.rm(resolvedOutDir, { recursive: true, force: true });
   await fs.mkdir(resolvedOutDir, { recursive: true });
-  await fs.writeFile(path.join(resolvedOutDir, 'index.html'), viewerHtml(), 'utf8');
-  await fs.writeFile(path.join(resolvedOutDir, 'app.js'), viewerAppJs(), 'utf8');
+  await fs.writeFile(path.join(resolvedOutDir, 'index.html'), viewerHtml({ appScriptSrc }), 'utf8');
+  await fs.writeFile(path.join(resolvedOutDir, 'app.js'), appJs, 'utf8');
   await fs.writeFile(path.join(resolvedOutDir, 'diagram.mmd'), analysis.mermaid + '\n', 'utf8');
   await fs.writeFile(path.join(resolvedOutDir, 'source-code.json'), JSON.stringify({
     ...sourceCodePayload,
