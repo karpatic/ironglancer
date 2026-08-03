@@ -867,6 +867,44 @@ function statementContinuationStarts(text, index) {
   return '([{.,?:+-*/%&|^<>=!~'.includes(char);
 }
 
+function hasLineTerminatorBetween(text, start, end) {
+  for (let index = start; index < end; index += 1) {
+    if (text[index] === '\n' || text[index] === '\r') return true;
+  }
+  return false;
+}
+
+function identifierEndIndex(text, start) {
+  if (!/[A-Za-z_$]/.test(text[start] || '')) return start;
+  let index = start + 1;
+  while (index < text.length && /[A-Za-z0-9_$]/.test(text[index])) index += 1;
+  return index;
+}
+
+function templateLiteralEndIndex(text, start, limit) {
+  let index = start + 1;
+  let expressionDepth = 0;
+  while (index < limit) {
+    const char = text[index];
+    if (char === '`' && expressionDepth === 0) return index + 1;
+    if (char === '$' && text[index + 1] === '{' && expressionDepth === 0) {
+      expressionDepth = 1;
+      index += 2;
+      continue;
+    }
+    if (expressionDepth > 0) {
+      if (char === '`') {
+        index = templateLiteralEndIndex(text, index, limit);
+        continue;
+      }
+      if (char === '{') expressionDepth += 1;
+      else if (char === '}') expressionDepth -= 1;
+    }
+    index += 1;
+  }
+  return limit;
+}
+
 function expressionStatementEndIndex(masked, start, limit) {
   let parenDepth = 0;
   let bracketDepth = 0;
@@ -875,7 +913,10 @@ function expressionStatementEndIndex(masked, start, limit) {
   for (let index = start; index < limit; index += 1) {
     const char = masked[index];
     if (!/\s/.test(char)) lastNonWhitespace = index;
-    if (char === '(') parenDepth += 1;
+    if (char === '`') {
+      index = templateLiteralEndIndex(masked, index, limit) - 1;
+      lastNonWhitespace = Math.max(lastNonWhitespace, index);
+    } else if (char === '(') parenDepth += 1;
     else if (char === ')') parenDepth = Math.max(0, parenDepth - 1);
     else if (char === '[') bracketDepth += 1;
     else if (char === ']') bracketDepth = Math.max(0, bracketDepth - 1);
@@ -961,6 +1002,28 @@ function doStatementEndIndex(masked, start, limit) {
   return masked[semicolonIndex] === ';' ? semicolonIndex + 1 : conditionEnd + 1;
 }
 
+function restrictedExpressionStatementEndIndex(masked, start, keyword, limit) {
+  const keywordEnd = start + keyword.length;
+  const nextIndex = findNextNonWhitespaceIndex(masked, keywordEnd);
+  if (hasLineTerminatorBetween(masked, keywordEnd, nextIndex)) return keywordEnd;
+  const semicolonIndex = findNextNonWhitespaceIndex(masked, keywordEnd);
+  if (masked[semicolonIndex] === ';') return semicolonIndex + 1;
+  return expressionStatementEndIndex(masked, start, limit);
+}
+
+function restrictedJumpStatementEndIndex(masked, start, keyword, limit) {
+  const keywordEnd = start + keyword.length;
+  const nextIndex = findNextNonWhitespaceIndex(masked, keywordEnd);
+  if (hasLineTerminatorBetween(masked, keywordEnd, nextIndex)) return keywordEnd;
+  if (masked[nextIndex] === ';') return nextIndex + 1;
+  const labelEnd = identifierEndIndex(masked, nextIndex);
+  if (labelEnd > nextIndex) {
+    const afterLabel = findNextNonWhitespaceIndex(masked, labelEnd);
+    return masked[afterLabel] === ';' ? afterLabel + 1 : labelEnd;
+  }
+  return keywordEnd;
+}
+
 function loopHeaderBoundsAt(masked, forIndex, limit) {
   if (!wordAt(masked, forIndex, 'for')) return null;
   let headerStart = findNextNonWhitespaceIndex(masked, forIndex + 'for'.length);
@@ -1018,6 +1081,21 @@ function singleStatementEndIndex(masked, start, limit) {
   }
   if (wordAt(masked, statementStart, 'try')) return tryStatementEndIndex(masked, statementStart, limit);
   if (wordAt(masked, statementStart, 'do')) return doStatementEndIndex(masked, statementStart, limit);
+  if (wordAt(masked, statementStart, 'return')) {
+    return restrictedExpressionStatementEndIndex(masked, statementStart, 'return', limit);
+  }
+  if (wordAt(masked, statementStart, 'throw')) {
+    return restrictedExpressionStatementEndIndex(masked, statementStart, 'throw', limit);
+  }
+  if (wordAt(masked, statementStart, 'yield')) {
+    return restrictedExpressionStatementEndIndex(masked, statementStart, 'yield', limit);
+  }
+  if (wordAt(masked, statementStart, 'break')) {
+    return restrictedJumpStatementEndIndex(masked, statementStart, 'break', limit);
+  }
+  if (wordAt(masked, statementStart, 'continue')) {
+    return restrictedJumpStatementEndIndex(masked, statementStart, 'continue', limit);
+  }
   return expressionStatementEndIndex(masked, statementStart, limit);
 }
 
