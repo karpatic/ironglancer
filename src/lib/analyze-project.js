@@ -51,6 +51,8 @@ const EXCLUDED_DISCOVERY_DIRS = new Set([
   '.vite',
 ]);
 const lexicalBlockRangeCache = new WeakMap();
+const loopScopeRangeCache = new WeakMap();
+const stringConstantValueCache = new WeakMap();
 
 async function loadImportAliases(rootDir, entryRel = '') {
   const aliases = new Map();
@@ -853,11 +855,63 @@ function lexicalBlockRanges(record) {
   return ranges;
 }
 
+function loopBodyEndIndex(masked, bodyStart, limit) {
+  if (bodyStart >= limit) return limit;
+  if (masked[bodyStart] === '{') {
+    const closeIndex = findMatchingBrace(masked, bodyStart);
+    return closeIndex === -1 ? limit : closeIndex + 1;
+  }
+  if (masked[bodyStart] === ';') return bodyStart + 1;
+  return findStatementEnd(masked, bodyStart, limit);
+}
+
+function loopScopeRanges(record) {
+  if (!record || typeof record !== 'object') return [];
+  if (loopScopeRangeCache.has(record)) return loopScopeRangeCache.get(record);
+  const masked = maskIgnorableSyntax(record?.source);
+  const ranges = [];
+  const forPattern = /\bfor\b/g;
+  let match;
+  while ((match = forPattern.exec(masked))) {
+    let headerStart = findNextNonWhitespaceIndex(masked, forPattern.lastIndex);
+    if (wordAt(masked, headerStart, 'await')) {
+      headerStart = findNextNonWhitespaceIndex(masked, headerStart + 'await'.length);
+    }
+    if (masked[headerStart] !== '(') continue;
+    const headerEnd = findMatchingDelimiter(masked, headerStart, '(', ')');
+    if (headerEnd === -1) continue;
+    const bodyStart = findNextNonWhitespaceIndex(masked, headerEnd + 1);
+    const endIndex = loopBodyEndIndex(masked, bodyStart, masked.length);
+    ranges.push({
+      startIndex: match.index,
+      headerStartIndex: headerStart,
+      headerEndIndex: headerEnd + 1,
+      endIndex,
+    });
+  }
+  ranges.sort((a, b) => (a.endIndex - a.startIndex) - (b.endIndex - b.startIndex)
+    || b.startIndex - a.startIndex);
+  loopScopeRangeCache.set(record, ranges);
+  return ranges;
+}
+
 function nearestLexicalBlockForLocation(record, location, ownerSpan) {
   const ownerEnd = declarationSpanExclusiveEnd(ownerSpan);
   return lexicalBlockRanges(record).find((range) => (
     location.index >= range.startIndex
     && location.endIndex <= range.endIndex
+    && (!ownerSpan || (
+      range.startIndex >= ownerSpan.startIndex
+      && range.endIndex <= ownerEnd
+    ))
+  )) || null;
+}
+
+function loopHeaderScopeForLocation(record, location, ownerSpan) {
+  const ownerEnd = declarationSpanExclusiveEnd(ownerSpan);
+  return loopScopeRanges(record).find((range) => (
+    location.index > range.headerStartIndex
+    && location.endIndex <= range.headerEndIndex
     && (!ownerSpan || (
       range.startIndex >= ownerSpan.startIndex
       && range.endIndex <= ownerEnd
@@ -873,6 +927,13 @@ function spanScope(span) {
 }
 
 function blockScopedBindingScope(record, ownerSpan, location) {
+  const loopScope = loopHeaderScopeForLocation(record, location, ownerSpan);
+  if (loopScope) {
+    return {
+      scopeStart: loopScope.startIndex,
+      scopeEnd: loopScope.endIndex,
+    };
+  }
   const block = nearestLexicalBlockForLocation(record, location, ownerSpan);
   return block ? {
     scopeStart: block.startIndex,
@@ -897,9 +958,11 @@ function variableBindingLocations(record, span, identifier) {
     const declarationStart = declarationPattern.lastIndex;
     const declarationText = masked.slice(declarationStart, statementEnd);
     for (const part of splitTopLevel(declarationText)) {
+      const declaratorStart = declarationStart + part.startIndex;
+      const declaratorEnd = declaratorStart + part.text.length;
       locations.push(...bindingIdentifierLocations(
         part.text,
-        declarationStart + part.startIndex,
+        declaratorStart,
         identifier,
       ).filter((location) => locationOwnedByDeclaration(record, span, location))
         .map((location) => ({
@@ -911,6 +974,8 @@ function variableBindingLocations(record, span, identifier) {
             : blockScopedBindingScope(record, span, location)),
           statementStart: match.index,
           statementEnd,
+          declaratorStart,
+          declaratorEnd,
         })));
     }
   }
@@ -1000,6 +1065,71 @@ function sameLocation(a, b) {
   return a?.index === b?.index && a?.endIndex === b?.endIndex;
 }
 
+function unescapeStringLiteralValue(value) {
+  return normalizeString(value).replace(/\\(['"\\])/g, '$1');
+}
+
+function stringLiteralExpressionValue(expression) {
+  const match = normalizeString(expression).trim().match(/^(['"])((?:\\.|(?!\1)[\s\S])*?)\1$/);
+  return match ? unescapeStringLiteralValue(match[2]) : '';
+}
+
+function stringConstantValues(record) {
+  if (!record || typeof record !== 'object') return new Map();
+  if (stringConstantValueCache.has(record)) return stringConstantValueCache.get(record);
+  const source = normalizeString(record?.source);
+  const masked = maskIgnorableSyntax(source);
+  const constants = new Map();
+  const pattern = /\b(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(['"])((?:\\.|(?!\2)[\s\S])*?)\2/g;
+  let match;
+  while ((match = pattern.exec(source))) {
+    if (!/\S/.test(masked[match.index] || '')) continue;
+    constants.set(match[1], unescapeStringLiteralValue(match[3]));
+  }
+  stringConstantValueCache.set(record, constants);
+  return constants;
+}
+
+function normalizeSpecifierExpression(expression) {
+  let text = normalizeString(expression).trim();
+  const paneUrlMatch = text.match(/^paneUrl\s*\(\s*([\s\S]*?)\s*\)$/);
+  if (paneUrlMatch) text = paneUrlMatch[1].trim();
+  return text;
+}
+
+function specifierExpressionMatchesRef(record, expression, specifier) {
+  const text = normalizeSpecifierExpression(expression);
+  if (!text) return false;
+  const literalValue = stringLiteralExpressionValue(text);
+  if (literalValue) return literalValue === specifier;
+  const identifierMatch = text.match(/^[A-Za-z_$][A-Za-z0-9_$]*$/);
+  return Boolean(identifierMatch) && stringConstantValues(record).get(text) === specifier;
+}
+
+function declarationSpecifierMatchesRef(record, declaration, refKind, specifier) {
+  const specifierExpression = `((?:paneUrl\\s*\\(\\s*)?(?:['"](?:\\\\.|[^'"])*['"]|[A-Za-z_$][A-Za-z0-9_$]*)\\s*\\)?)`;
+  const callPattern = refKind === 'require'
+    ? new RegExp(`\\brequire\\s*\\(\\s*${specifierExpression}\\s*\\)`, 'g')
+    : new RegExp(`\\b(?:import|window\\.import)\\s*\\(\\s*${specifierExpression}\\s*\\)`, 'g');
+  let match;
+  while ((match = callPattern.exec(declaration))) {
+    if (specifierExpressionMatchesRef(record, match[1], specifier)) return true;
+  }
+  return false;
+}
+
+function localBindingDeclarationSource(record, localBinding) {
+  const source = normalizeString(record?.source);
+  const start = Number.isInteger(localBinding?.declaratorStart)
+    ? localBinding.declaratorStart
+    : localBinding?.statementStart;
+  const end = Number.isInteger(localBinding?.declaratorEnd)
+    ? localBinding.declaratorEnd
+    : localBinding?.statementEnd;
+  if (!Number.isInteger(start) || !Number.isInteger(end) || end <= start) return '';
+  return source.slice(start, end);
+}
+
 function localBindingIsImportDeclaration(record, localBinding, binding, ref) {
   if (
     localBinding?.kind !== 'variable'
@@ -1007,15 +1137,21 @@ function localBindingIsImportDeclaration(record, localBinding, binding, ref) {
   ) {
     return false;
   }
-  const statement = normalizeString(record?.source)
-    .slice(localBinding.statementStart, localBinding.statementEnd);
+  const declaration = localBindingDeclarationSource(record, localBinding);
+  const maskedDeclaration = maskIgnorableSyntax(declaration);
   const refKind = normalizeString(ref?.kind).trim();
-  if ((refKind === 'dynamic' || refKind === 'require') && /\b(?:import|window\.import|require)\s*\(/.test(statement)) {
-    return true;
+  if (refKind === 'dynamic' || refKind === 'require') {
+    const loaderPattern = refKind === 'require'
+      ? /\brequire\s*\(/
+      : /\b(?:import|window\.import)\s*\(/;
+    const specifier = normalizeString(ref?.specifier).trim();
+    return Boolean(specifier)
+      && loaderPattern.test(maskedDeclaration)
+      && declarationSpecifierMatchesRef(record, declaration, refKind, specifier);
   }
   if (refKind === 'lazy' && binding?.inferred) {
     const imported = escapeRegExp(normalizeIdentifier(binding.imported));
-    return imported ? new RegExp(`\\.\\s*${imported}\\b`).test(statement) : false;
+    return imported ? new RegExp(`\\.\\s*${imported}\\b`).test(declaration) : false;
   }
   return false;
 }
@@ -1023,14 +1159,13 @@ function localBindingIsImportDeclaration(record, localBinding, binding, ref) {
 function isShadowedReferenceLocation(record, span, identifier, location, { binding, ref } = {}) {
   for (const localBinding of visibleLocalBindingLocations(record, span, identifier)) {
     if (sameLocation(localBinding, location)) return true;
-    if (localBindingIsImportDeclaration(record, localBinding, binding, ref)) continue;
     if (
       Number.isInteger(localBinding.scopeStart)
       && Number.isInteger(localBinding.scopeEnd)
       && location.index >= localBinding.scopeStart
       && location.endIndex <= localBinding.scopeEnd
     ) {
-      return true;
+      return !localBindingIsImportDeclaration(record, localBinding, binding, ref);
     }
   }
   return false;
