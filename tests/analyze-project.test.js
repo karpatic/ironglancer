@@ -339,3 +339,55 @@ test('analyzeProject counts function usages rather than import declarations as r
   assert.equal(format.importerFileCount, 1);
   assert.match(result.mermaid, /\+Format \[lines: 3 \| refs: 3 \| importers: 1\]/);
 });
+
+test('analyzeProject resolves local require forms and preserves require edge metadata', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "const { RequiredChild: RequiredAlias } = require('./child.jsx');",
+      "const shared = require('./shared.js');",
+      "require('./register.js');",
+      "const ignored = require('./' + computedName);",
+      '',
+      'export function App() {',
+      '  return <RequiredAlias label={shared.FormatLabel()} />;',
+      '}',
+    ].join('\n'),
+    'src/child.jsx': [
+      'export function RequiredChild({ label }) {',
+      '  return <span>{label}</span>;',
+      '}',
+    ].join('\n'),
+    'src/shared.js': [
+      'export function FormatLabel() {',
+      "  return 'required';",
+      '}',
+    ].join('\n'),
+    'src/register.js': [
+      'export function register() {',
+      '  return true;',
+      '}',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+  const requireEdge = result.importEdges.find((edge) => edge.targetPath === 'src/child.jsx');
+
+  assert.deepEqual(result.jsScripts.map((item) => item.path), [
+    'src/app.jsx',
+    'src/child.jsx',
+    'src/register.js',
+    'src/shared.js',
+  ]);
+  assert.ok(!result.treeText.includes("computedName"));
+  assert.ok(requireEdge, 'expected a JSX import edge for the required child');
+  assert.deepEqual(requireEdge.loadKinds, ['require']);
+  assert.deepEqual(requireEdge.imports, [
+    {
+      imported: 'RequiredChild',
+      local: 'RequiredAlias',
+      kind: 'named',
+      inferred: false,
+      lineCount: 3,
+    },
+  ]);
+});

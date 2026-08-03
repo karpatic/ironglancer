@@ -1,7 +1,79 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { extractComponents, extractDeclarationSpans } from '../src/lib/import-parser.js';
+import { extractComponents, extractDeclarationSpans, extractImportRefs } from '../src/lib/import-parser.js';
+
+test('extractImportRefs classifies dynamic, lazy, and require refs without dead duplicates', () => {
+  const source = [
+    "import DefaultThing, { NamedThing as namedAlias } from './static.js';",
+    "import './side-effect.js';",
+    "export { ReExport } from './re-export.js';",
+    "const DYNAMIC_SPECIFIER = './dynamic.js';",
+    "const WINDOW_SPECIFIER = './window.js';",
+    "const LAZY_SPECIFIER = './lazy.js';",
+    "const REQUIRE_SPECIFIER = './required.js';",
+    'const { DynamicThing: DynamicAlias } = await import(DYNAMIC_SPECIFIER);',
+    'const WindowModule = await window.import(WINDOW_SPECIFIER);',
+    'loadCreatorModuleOnce(LAZY_SPECIFIER);',
+    '<LazyBoundary specifier={LAZY_SPECIFIER} exportName="LazyExport" />;',
+    'const { RequiredThing: RequiredAlias } = require(REQUIRE_SPECIFIER);',
+    "const requiredNamespace = require('./namespace.cjs');",
+    "require('./register.js');",
+    "await import('./' + computedName);",
+    'loadCreatorModuleOnce(computedSpecifier);',
+    "// import Hidden from './commented.js';",
+    'const text = "require(\'./string.js\')";',
+  ].join('\n');
+
+  assert.deepEqual(extractImportRefs(source), [
+    {
+      specifier: './static.js',
+      bindings: [
+        { imported: 'default', local: 'DefaultThing', kind: 'default', inferred: false },
+        { imported: 'NamedThing', local: 'namedAlias', kind: 'named', inferred: false },
+      ],
+      kind: 'static',
+    },
+    { specifier: './side-effect.js', bindings: [], kind: 'side-effect' },
+    { specifier: './re-export.js', bindings: [], kind: 'export' },
+    {
+      specifier: './dynamic.js',
+      bindings: [
+        { imported: 'DynamicThing', local: 'DynamicAlias', kind: 'named', inferred: false },
+      ],
+      kind: 'dynamic',
+    },
+    {
+      specifier: './window.js',
+      bindings: [
+        { imported: '*', local: 'WindowModule', kind: 'namespace', inferred: false },
+      ],
+      kind: 'dynamic',
+    },
+    {
+      specifier: './required.js',
+      bindings: [
+        { imported: 'RequiredThing', local: 'RequiredAlias', kind: 'named', inferred: false },
+      ],
+      kind: 'require',
+    },
+    {
+      specifier: './namespace.cjs',
+      bindings: [
+        { imported: '*', local: 'requiredNamespace', kind: 'namespace', inferred: false },
+      ],
+      kind: 'require',
+    },
+    { specifier: './register.js', bindings: [], kind: 'require' },
+    {
+      specifier: './lazy.js',
+      bindings: [
+        { imported: 'LazyExport', local: 'LazyExport', kind: 'named', inferred: true },
+      ],
+      kind: 'lazy',
+    },
+  ]);
+});
 
 test('extractDeclarationSpans measures one-line function and arrow declarations', () => {
   const source = [
