@@ -228,6 +228,9 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
       .dead-function-evidence b { color:var(--text); }
       .dead-function-actions { display:flex; gap:8px; flex-wrap:wrap; }
       .source-dialog {
+        position:fixed;
+        inset:0;
+        z-index:1000;
         width:min(900px, calc(100vw - 32px));
         max-height:min(82vh, 760px);
         border:1px solid var(--border);
