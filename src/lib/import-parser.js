@@ -21,10 +21,6 @@ function importBindingKind(imported) {
   return imported === 'default' ? 'default' : 'named';
 }
 
-function parseNamedImportBindings(text, { destructured = false } = {}) {
-  return parseNamedImportBindingMetadata(text, { destructured }).map((binding) => binding.local);
-}
-
 function parseNamedImportBindingMetadata(text, { destructured = false, inferred = false } = {}) {
   const names = [];
   for (const part of splitImportBindingParts(text)) {
@@ -43,24 +39,6 @@ function parseNamedImportBindingMetadata(text, { destructured = false, inferred 
     }
   }
   return names;
-}
-
-function parseStaticImportSymbols(clause) {
-  const text = normalizeString(clause).trim().replace(/^(?:type|typeof)\s+/, '');
-  if (!text) return [];
-  const names = [];
-  const namedMatch = text.match(/\{([\s\S]*?)\}/);
-  if (namedMatch) names.push(...parseNamedImportBindings(namedMatch[1]));
-  const namespaceMatch = text.match(/\*\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)/);
-  if (namespaceMatch) names.push(namespaceMatch[1]);
-  const defaultPart = text
-    .replace(/\{[\s\S]*?\}/g, '')
-    .replace(/\*\s+as\s+[A-Za-z_$][A-Za-z0-9_$]*/g, '')
-    .split(',')
-    .map((part) => normalizeJsIdentifier(part))
-    .find(Boolean);
-  if (defaultPart) names.push(defaultPart);
-  return Array.from(new Set(names));
 }
 
 function parseStaticImportBindings(clause) {
@@ -83,17 +61,6 @@ function parseStaticImportBindings(clause) {
   const namedMatch = text.match(/\{([\s\S]*?)\}/);
   if (namedMatch) bindings.push(...parseNamedImportBindingMetadata(namedMatch[1]));
   return bindings;
-}
-
-function parseDynamicImportSymbols(binding) {
-  const text = normalizeString(binding).trim();
-  if (!text) return [];
-  const destructured = text.match(/^\{([\s\S]*?)\}$/);
-  if (destructured) {
-    return Array.from(new Set(parseNamedImportBindings(destructured[1], { destructured: true })));
-  }
-  const name = normalizeJsIdentifier(text);
-  return name ? [name] : [];
 }
 
 function parseDynamicImportBindings(binding) {
@@ -168,7 +135,6 @@ function collectModulePropertyBindings(text, constants, specifierExpression) {
     const binding = inferredNamedBinding(match[3], match[1]);
     if (binding) refs.push({
       specifier: candidate.specifier,
-      symbols: [],
       bindings: [binding],
       kind: 'lazy',
     });
@@ -191,7 +157,7 @@ function collectJsxExportNameBindings(text, constants) {
       ? unescapeStringLiteralValue(specifierMatch[3])
       : resolveSpecifierExpression(specifierMatch[1], constants);
     const binding = inferredNamedBinding(unescapeStringLiteralValue(exportNameMatch[2]));
-    if (specifier && binding) refs.push({ specifier, symbols: [], bindings: [binding], kind: 'lazy' });
+    if (specifier && binding) refs.push({ specifier, bindings: [binding], kind: 'lazy' });
   }
   return refs;
 }
@@ -222,9 +188,6 @@ function pushImportRef(refs, ref) {
   const seenBindings = new Set();
   refs.push({
     specifier,
-    symbols: Array.from(new Set((Array.isArray(ref.symbols) ? ref.symbols : [])
-      .map((symbol) => normalizeJsIdentifier(symbol))
-      .filter(Boolean))),
     bindings: bindings.filter((binding) => {
       const key = `${binding.kind}\u0000${binding.imported}\u0000${binding.local}\u0000${binding.inferred}`;
       if (seenBindings.has(key)) return false;
@@ -260,41 +223,39 @@ export function extractImportRefs(source) {
     const specifier = mark(match[2]);
     pushImportRef(refs, {
       specifier,
-      symbols: parseStaticImportSymbols(match[1]),
       bindings: parseStaticImportBindings(match[1]),
       kind: 'static',
     });
   }
   while ((match = sideEffectImportPattern.exec(text))) {
     const specifier = mark(match[1]);
-    pushImportRef(refs, { specifier, symbols: [], kind: 'side-effect' });
+    pushImportRef(refs, { specifier, kind: 'side-effect' });
   }
   while ((match = exportFromPattern.exec(text))) {
     const specifier = mark(match[1]);
-    pushImportRef(refs, { specifier, symbols: [], kind: 'export' });
+    pushImportRef(refs, { specifier, kind: 'export' });
   }
   while ((match = assignedDynamicImportPattern.exec(text))) {
     const specifier = mark(resolveSpecifierExpression(match[2], constants));
     pushImportRef(refs, {
       specifier,
-      symbols: parseDynamicImportSymbols(match[1]),
       bindings: parseDynamicImportBindings(match[1]),
       kind: 'dynamic',
     });
   }
   while ((match = dynamicImportPattern.exec(text))) {
     const specifier = mark(resolveSpecifierExpression(match[1], constants));
-    pushImportRef(refs, { specifier, symbols: [], kind: 'dynamic' });
+    pushImportRef(refs, { specifier, kind: 'dynamic' });
   }
   while ((match = lazyModuleCallPattern.exec(text))) {
     const specifier = mark(resolveSpecifierExpression(match[1], constants));
-    pushImportRef(refs, { specifier, symbols: [], kind: 'lazy' });
+    pushImportRef(refs, { specifier, kind: 'lazy' });
   }
   while ((match = jsxSpecifierPropPattern.exec(text))) {
     const specifier = match[3]
       ? mark(unescapeStringLiteralValue(match[3]))
       : mark(resolveSpecifierExpression(match[1], constants));
-    pushImportRef(refs, { specifier, symbols: [], kind: 'lazy' });
+    pushImportRef(refs, { specifier, kind: 'lazy' });
   }
   for (const ref of collectModulePropertyBindings(text, constants, specifierExpression)) {
     mark(ref.specifier);
@@ -311,7 +272,7 @@ export function extractImportRefs(source) {
     const bindingKey = ref.bindings
       .map((binding) => `${binding.kind}\u0002${binding.imported}\u0002${binding.local}\u0002${binding.inferred}`)
       .join('\u0001');
-    const key = `${ref.kind}\u0000${ref.specifier}\u0000${ref.symbols.join('\u0001')}\u0000${bindingKey}`;
+    const key = `${ref.kind}\u0000${ref.specifier}\u0000${bindingKey}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;

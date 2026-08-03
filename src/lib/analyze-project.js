@@ -393,11 +393,6 @@ function currentFileSourceMetadata(moduleId, entry, sourceOrder, metrics) {
   };
 }
 
-function prefixLineCount(label, lineCount) {
-  if (!Number.isInteger(lineCount) || lineCount <= 0) return label;
-  return `${lineCount} ${label}`;
-}
-
 function mermaidClassLabel(record) {
   return `${record.stats.lineCount} ${path.posix.basename(record.rel)}`;
 }
@@ -445,8 +440,11 @@ function buildClassIds(records) {
 }
 
 function importedScriptVariableName(ref) {
-  if (!ref || Array.isArray(ref.symbols) === false || ref.symbols.length === 0) return '';
-  return ref.symbols[0] || '';
+  const bindings = Array.isArray(ref?.bindings) ? ref.bindings : [];
+  const binding = bindings.find((candidate) => candidate.kind === 'named')
+    || bindings.find((candidate) => candidate.kind === 'namespace')
+    || bindings.find((candidate) => candidate.kind === 'default');
+  return normalizeString(binding?.local).trim();
 }
 
 function importedScriptMembersForJsx(record, graph, declarationImportMetrics) {
