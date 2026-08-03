@@ -88,6 +88,70 @@ test('analyzeProject maps URL-rooted imports through route aliases', async () =>
   assert.ok(result.mermaid.includes('CreatorLinkedContentEditor()'));
 });
 
+test('analyzeProject excludes transient project discovery directories only', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import { reachable } from './reachable.js';",
+      "import { generatedViewerApp } from '../.cache/ironglancer/app.js';",
+      '',
+      'export function App() {',
+      '  return reachable() + generatedViewerApp();',
+      '}',
+    ].join('\n'),
+    'src/reachable.js': [
+      'export function reachable() {',
+      "  return 'source';",
+      '}',
+    ].join('\n'),
+    'src/ordinary-orphan.js': [
+      'export function ordinaryOrphan() {',
+      "  return 'still discovered';",
+      '}',
+    ].join('\n'),
+    '.storybook/preview.js': [
+      'export function preview() {',
+      "  return 'hidden but not transient';",
+      '}',
+    ].join('\n'),
+    '.worktrees/faculty/src/generated.js': [
+      'export function embeddedWorktreeModule() {',
+      "  return 'excluded';",
+      '}',
+    ].join('\n'),
+    '.codex-worktrees/session/src/generated.jsx': [
+      'export function embeddedCodexWorktreeModule() {',
+      "  return 'excluded';",
+      '}',
+    ].join('\n'),
+    '.cache/ironglancer/app.js': [
+      'export function generatedViewerApp() {',
+      "  return 'reachable local cache module';",
+      '}',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+
+  assert.deepEqual(result.jsScripts.map((item) => item.path), [
+    '.cache/ironglancer/app.js',
+    '.storybook/preview.js',
+    'src/app.jsx',
+    'src/ordinary-orphan.js',
+    'src/reachable.js',
+  ]);
+  assert.equal(result.summary.moduleCount, 5);
+  assert.equal(result.summary.reachableModuleCount, 3);
+  assert.equal(result.summary.externalCount, 0);
+  assert.ok(!result.jsScripts.some((item) => item.path.startsWith('.worktrees/')));
+  assert.ok(!result.jsScripts.some((item) => item.path.startsWith('.codex-worktrees/')));
+
+  const appModule = result.graph.modules.get('src/app.jsx');
+  assert.deepEqual(appModule.localDeps, [
+    '.cache/ironglancer/app.js',
+    'src/reachable.js',
+  ]);
+});
+
 const reactIgnoreRoot = path.resolve('tests/fixtures/react-ignore');
 
 test('analyzeProject ignores React imports in diagrams while keeping other externals', async () => {

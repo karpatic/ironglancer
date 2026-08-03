@@ -43,6 +43,8 @@ const EXCLUDED_DISCOVERY_DIRS = new Set([
   'out',
   'site',
   'docs',
+  '.worktrees',
+  '.codex-worktrees',
   '.next',
   '.nuxt',
   '.svelte-kit',
