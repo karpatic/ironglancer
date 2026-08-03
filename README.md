@@ -22,6 +22,7 @@ Examples
 - ironglancer ./my-app --entry src/app.jsx --out ./ironglancer-site
 - npx ironglancer ./my-app --entry src/main.js --out ./docs/ironglancer
 - ironglancer ./my-app --entry src/web/app.jsx --route-alias /creator/=src/web/creator/
+- ironglancer ./my-app/src/web/creator --entry app.jsx --route-alias /creator/=
 - ironglancer ./my-app --entry src/app.jsx --out ./ironglancer-site --serve
 - ironglancer ./my-app --serve --host 127.0.0.1 --port 0
 
@@ -41,10 +42,11 @@ console.log(service.url, service.apiBaseUrl);
 ```
 
 Read-only API
-- serve mode loads generated `output.json`, `source-code.json`, and `.ironglancer-api/source-modules.json` once at startup and does not reparse the project per request
+- serve mode loads generated `output.json`, `source-code.json`, `.ironglancer-api/source-modules.json`, and `.ironglancer-api/function-map.json` once at startup and does not reparse the project per request
 - source endpoints only return bounded excerpts from modules saved in the analyzed run
 - the built-in server does not serve `.ironglancer-api/` as static files
 - symbol relation endpoints expose static import/export/reference relationships IronGlancer captures, not runtime call graphs or data lineage
+- function dependency endpoints expose static identifier usage inside declared function spans; direct call, optional-call, tagged-template, and JSX element syntax are labeled when visible, while generic references remain `reference`
 - JSON errors are shaped as `{ "ok": false, "error": { "status": 404, "code": "not_found", "message": "..." } }`
 
 Routes
@@ -54,6 +56,7 @@ Routes
 - `GET /api/v1/modules/:id`
 - `GET /api/v1/modules/:id/dependencies`
 - `GET /api/v1/modules/:id/dependents`
+- `GET /api/v1/modules/:id/functions`
 - `GET /api/v1/modules/:id/source?startLine=1&endLine=40`
 - `GET /api/v1/source?path=src/app.jsx&startLine=1&endLine=40`
 - `GET /api/v1/symbols?search=helper&modulePath=src/app.jsx`
@@ -61,6 +64,11 @@ Routes
 - `GET /api/v1/symbols/:id`
 - `GET /api/v1/symbols/:id/references`
 - `GET /api/v1/symbols/:id/callers`
+- `GET /api/v1/functions?modulePath=src/app.jsx&component=true`
+- `GET /api/v1/functions/search?q=RootApp`
+- `GET /api/v1/functions/:id`
+- `GET /api/v1/functions/:id/dependencies`
+- `GET /api/v1/functions/:id/users`
 - `GET /api/v1/query?modulePath=src/app.jsx&symbol=RootApp`
 
 API examples
@@ -68,6 +76,7 @@ API examples
 curl http://127.0.0.1:4173/api/v1/run
 curl 'http://127.0.0.1:4173/api/v1/modules?reachable=true&extension=.jsx'
 curl 'http://127.0.0.1:4173/api/v1/symbols/search?q=RootApp'
+curl 'http://127.0.0.1:4173/api/v1/functions/search?q=RootApp'
 ```
 
 Development

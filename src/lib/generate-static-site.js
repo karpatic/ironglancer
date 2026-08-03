@@ -185,6 +185,14 @@ function moduleSourcePayload(sourceCode = {}) {
   };
 }
 
+function functionDependencyPayload(functionDependencyMap = {}) {
+  return {
+    limitations: Array.isArray(functionDependencyMap.limitations) ? functionDependencyMap.limitations : [],
+    functions: Array.isArray(functionDependencyMap.functions) ? functionDependencyMap.functions : [],
+    edges: Array.isArray(functionDependencyMap.edges) ? functionDependencyMap.edges : [],
+  };
+}
+
 function isJsxModulePath(modulePath) {
   return /\.jsx$/i.test(modulePath);
 }
@@ -263,6 +271,10 @@ export async function generateStaticSite({ rootDir, entry, outDir, routeAliases 
   await fs.mkdir(path.join(resolvedOutDir, API_DATA_DIR), { recursive: true });
   await writeJson(path.join(resolvedOutDir, API_DATA_DIR, 'source-modules.json'), {
     ...moduleSourcePayload(analysis.sourceCode),
+    meta,
+  });
+  await writeJson(path.join(resolvedOutDir, API_DATA_DIR, 'function-map.json'), {
+    ...functionDependencyPayload(analysis.functionDependencyMap),
     meta,
   });
   await writeJson(path.join(resolvedOutDir, 'output.json'), { ...output, meta });

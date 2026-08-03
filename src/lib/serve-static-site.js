@@ -12,6 +12,12 @@ const DEFAULT_PAGE_LIMIT = 50;
 const MAX_PAGE_LIMIT = 200;
 const MAX_SOURCE_EXCERPT_LINES = 80;
 const API_DATA_DIR = '.ironglancer-api';
+const FUNCTION_DEPENDENCY_LIMITATIONS = [
+  'Static function dependencies are based on identifier references inside saved declaration spans; IronGlancer does not execute code or prove runtime control flow.',
+  'Usage syntax is labeled as call, optional-call, tagged-template, jsx-element, or reference from nearby source syntax; reference entries are not claimed to be definite runtime calls.',
+  'Imported targets are limited to statically resolved local imports, dynamic imports, require calls, and supported lazy-module patterns with resolvable bindings.',
+  'Same-module targets are limited to named function declarations and named arrow-function variable declarations discovered in the same file; dynamic property dispatch, aliasing through arbitrary values, and unresolved re-exports are outside this map.',
+];
 
 class ApiError extends Error {
   constructor(status, code, message, details) {
@@ -72,6 +78,17 @@ function symbolIdForDeclaration(declaration = {}) {
     declaration.modulePath,
     declaration.sourceOrigin,
     declaration.name,
+    declaration.startLine,
+    declaration.endLine,
+  ].map((part) => normalizeString(part)).join('\u0000'));
+}
+
+function functionIdForDeclaration(declaration = {}) {
+  return encodedId([
+    'function',
+    declaration.modulePath,
+    declaration.name,
+    declaration.kind,
     declaration.startLine,
     declaration.endLine,
   ].map((part) => normalizeString(part)).join('\u0000'));
@@ -197,6 +214,126 @@ function normalizeDeclarations(sourcePayload = {}) {
     .filter((declaration) => declaration.modulePath && declaration.name);
 }
 
+function normalizeUsageLine(value) {
+  const line = Number(value);
+  return Number.isInteger(line) && line > 0 ? line : null;
+}
+
+function normalizeUsages(value) {
+  const seen = new Set();
+  return (Array.isArray(value) ? value : [])
+    .map((usage) => ({
+      line: normalizeUsageLine(usage?.line),
+      syntax: normalizeString(usage?.syntax).trim(),
+    }))
+    .filter((usage) => usage.line && usage.syntax)
+    .filter((usage) => {
+      const key = `${usage.line}\u0000${usage.syntax}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => a.line - b.line || compareLocale(a.syntax, b.syntax));
+}
+
+function normalizeUsageLines(value, usages) {
+  const lines = Array.isArray(value) && value.length > 0
+    ? value.map(normalizeUsageLine)
+    : normalizeUsages(usages).map((usage) => usage.line);
+  return Array.from(new Set(lines.filter(Boolean))).sort((a, b) => a - b);
+}
+
+function normalizeFunctionNode(node = {}) {
+  const normalized = {
+    id: normalizeString(node.id).trim(),
+    modulePath: normalizeString(node.modulePath).trim(),
+    name: normalizeString(node.name).trim(),
+    declarationName: normalizeString(node.declarationName || node.name).trim(),
+    kind: normalizeString(node.kind || 'function').trim() || 'function',
+    component: Boolean(node.component),
+    startLine: Number.isInteger(node.startLine) ? node.startLine : null,
+    endLine: Number.isInteger(node.endLine) ? node.endLine : null,
+    lineCount: Number.isInteger(node.lineCount) ? node.lineCount : null,
+  };
+  if (!normalized.id) normalized.id = functionIdForDeclaration(normalized);
+  return normalized;
+}
+
+function compareFunctionNode(a, b) {
+  return compareLocale(a.modulePath, b.modulePath)
+    || a.startLine - b.startLine
+    || a.endLine - b.endLine
+    || compareLocale(a.name, b.name)
+    || compareLocale(a.kind, b.kind);
+}
+
+function normalizeFunctionImportInfo(value = {}) {
+  const info = {
+    specifier: normalizeString(value.specifier).trim(),
+    loadKind: normalizeString(value.loadKind || 'import').trim() || 'import',
+    bindingKind: normalizeString(value.bindingKind || 'named').trim() || 'named',
+    importedName: normalizeString(value.importedName).trim(),
+    localName: normalizeString(value.localName).trim(),
+    inferred: Boolean(value.inferred),
+  };
+  return Object.values(info).some((entry) => entry === true || normalizeString(entry).trim())
+    ? info
+    : null;
+}
+
+function normalizeFunctionEdge(edge = {}) {
+  const usages = normalizeUsages(edge.usages);
+  const usageLines = normalizeUsageLines(edge.usageLines, usages);
+  const syntaxKinds = Array.from(new Set(
+    (Array.isArray(edge.syntaxKinds) ? edge.syntaxKinds : usages.map((usage) => usage.syntax))
+      .map((kind) => normalizeString(kind).trim())
+      .filter(Boolean),
+  )).sort(compareLocale);
+  const relationKind = normalizeString(edge.relationKind).trim()
+    || (syntaxKinds.length === 1 && syntaxKinds[0] === 'reference'
+      ? 'static-reference'
+      : syntaxKinds.length === 1 && syntaxKinds[0] === 'jsx-element'
+        ? 'static-jsx-element'
+        : syntaxKinds.length === 1
+          ? 'static-call'
+          : 'mixed-static-usage');
+  const importInfo = edge.import && typeof edge.import === 'object'
+    ? normalizeFunctionImportInfo(edge.import)
+    : null;
+  return {
+    id: normalizeString(edge.id).trim(),
+    scope: normalizeString(edge.scope).trim() || 'same-module',
+    relationKind,
+    syntaxKinds,
+    usageLines,
+    usages,
+    referenceCount: Number.isInteger(edge.referenceCount) ? edge.referenceCount : usageLines.length,
+    sourceId: normalizeString(edge.sourceId).trim(),
+    sourceModulePath: normalizeString(edge.sourceModulePath).trim(),
+    sourceFunction: normalizeString(edge.sourceFunction).trim(),
+    sourceKind: normalizeString(edge.sourceKind).trim(),
+    sourceStartLine: Number.isInteger(edge.sourceStartLine) ? edge.sourceStartLine : null,
+    sourceEndLine: Number.isInteger(edge.sourceEndLine) ? edge.sourceEndLine : null,
+    targetId: normalizeString(edge.targetId).trim(),
+    targetModulePath: normalizeString(edge.targetModulePath).trim(),
+    targetFunction: normalizeString(edge.targetFunction).trim(),
+    targetKind: normalizeString(edge.targetKind).trim(),
+    targetStartLine: Number.isInteger(edge.targetStartLine) ? edge.targetStartLine : null,
+    targetEndLine: Number.isInteger(edge.targetEndLine) ? edge.targetEndLine : null,
+    ...(importInfo ? { import: importInfo } : {}),
+  };
+}
+
+function compareFunctionEdge(a, b) {
+  return compareLocale(a.sourceModulePath, b.sourceModulePath)
+    || a.sourceStartLine - b.sourceStartLine
+    || compareLocale(a.targetModulePath, b.targetModulePath)
+    || a.targetStartLine - b.targetStartLine
+    || compareLocale(a.scope, b.scope)
+    || compareLocale(a.targetFunction, b.targetFunction)
+    || compareLocale(a.import?.localName || '', b.import?.localName || '');
+}
+
 function createModuleSummaryFactory(index) {
   return (module) => ({
     id: module.id,
@@ -210,6 +347,7 @@ function createModuleSummaryFactory(index) {
     dependentCount: module.dependents.length,
     externalDependencyCount: module.externalDependencies.length,
     symbolCount: (index.symbolsByModulePath.get(module.path) || []).length,
+    functionCount: (index.functionsByModulePath.get(module.path) || []).length,
     sourceAvailable: index.sourceModuleByPath.has(module.path),
   });
 }
@@ -235,11 +373,32 @@ function createSymbolSummary(declaration) {
   };
 }
 
-function createAnalysisIndex(outputPayload, sourcePayload, moduleSourcePayload) {
+function createFunctionSummary(index, node) {
+  return {
+    id: node.id,
+    moduleId: moduleIdForPath(node.modulePath),
+    modulePath: node.modulePath,
+    name: node.name,
+    declarationName: node.declarationName,
+    kind: node.kind,
+    component: node.component,
+    startLine: node.startLine,
+    endLine: node.endLine,
+    lineCount: node.lineCount,
+    dependencyCount: (index.dependenciesByFunctionId.get(node.id) || []).length,
+    userCount: (index.usersByFunctionId.get(node.id) || []).length,
+    sourceAvailable: index.sourceModuleByPath.has(node.modulePath),
+  };
+}
+
+function createAnalysisIndex(outputPayload, sourcePayload, moduleSourcePayload, functionMapPayload = {}) {
   const declarationSourceIsUsable = sourcePayloadMatchesOutput(outputPayload, sourcePayload)
     && Array.isArray(sourcePayload?.declarations);
   const modernModuleSourceIsUsable = sourcePayloadMatchesOutput(outputPayload, moduleSourcePayload)
     && Array.isArray(moduleSourcePayload?.modules);
+  const functionMapIsUsable = sourcePayloadMatchesOutput(outputPayload, functionMapPayload)
+    && Array.isArray(functionMapPayload?.functions)
+    && Array.isArray(functionMapPayload?.edges);
   const legacyModuleSourceIsUsable = declarationSourceIsUsable
     && Array.isArray(sourcePayload?.modules)
     && !modernModuleSourceIsUsable;
@@ -289,6 +448,36 @@ function createAnalysisIndex(outputPayload, sourcePayload, moduleSourcePayload) 
     symbolsByModulePath.get(symbol.modulePath).push(symbol);
   }
 
+  const functions = functionMapIsUsable
+    ? (Array.isArray(functionMapPayload.functions) ? functionMapPayload.functions : [])
+      .map(normalizeFunctionNode)
+      .filter((node) => node.id && node.modulePath && node.name && moduleByPath.has(node.modulePath))
+      .sort(compareFunctionNode)
+    : [];
+  const functionById = new Map();
+  const functionsByModulePath = new Map();
+  for (const node of functions) {
+    if (functionById.has(node.id)) continue;
+    functionById.set(node.id, node);
+    if (!functionsByModulePath.has(node.modulePath)) functionsByModulePath.set(node.modulePath, []);
+    functionsByModulePath.get(node.modulePath).push(node);
+  }
+
+  const functionEdges = functionMapIsUsable
+    ? (Array.isArray(functionMapPayload.edges) ? functionMapPayload.edges : [])
+      .map(normalizeFunctionEdge)
+      .filter((edge) => edge.id && functionById.has(edge.sourceId) && functionById.has(edge.targetId))
+      .sort(compareFunctionEdge)
+    : [];
+  const dependenciesByFunctionId = new Map();
+  const usersByFunctionId = new Map();
+  for (const edge of functionEdges) {
+    if (!dependenciesByFunctionId.has(edge.sourceId)) dependenciesByFunctionId.set(edge.sourceId, []);
+    if (!usersByFunctionId.has(edge.targetId)) usersByFunctionId.set(edge.targetId, []);
+    dependenciesByFunctionId.get(edge.sourceId).push(edge);
+    usersByFunctionId.get(edge.targetId).push(edge);
+  }
+
   const index = {
     output: outputPayload,
     source: sourcePayload,
@@ -296,6 +485,10 @@ function createAnalysisIndex(outputPayload, sourcePayload, moduleSourcePayload) 
     declarationSourceIsUsable,
     moduleSourceIsUsable: modernModuleSourceIsUsable || legacyModuleSourceIsUsable,
     legacyModuleSourceIsUsable,
+    functionMapIsUsable,
+    functionLimitations: Array.isArray(functionMapPayload?.limitations) && functionMapPayload.limitations.length > 0
+      ? functionMapPayload.limitations
+      : FUNCTION_DEPENDENCY_LIMITATIONS,
     modules: Array.from(moduleByPath.values()).sort((a, b) => compareLocale(a.path, b.path)),
     moduleByPath,
     moduleById,
@@ -303,6 +496,12 @@ function createAnalysisIndex(outputPayload, sourcePayload, moduleSourcePayload) 
     symbols,
     symbolById,
     symbolsByModulePath,
+    functions,
+    functionById,
+    functionsByModulePath,
+    functionEdges,
+    dependenciesByFunctionId,
+    usersByFunctionId,
   };
   index.moduleSummary = createModuleSummaryFactory(index);
   return index;
@@ -313,6 +512,7 @@ export async function loadStaticAnalysisRun({ outDir } = {}) {
   const output = await readJsonFile(path.join(resolvedOutDir, 'output.json'));
   let source = {};
   let moduleSource = {};
+  let functionMap = {};
   try {
     source = await readJsonFile(path.join(resolvedOutDir, 'source-code.json'));
   } catch {
@@ -323,9 +523,14 @@ export async function loadStaticAnalysisRun({ outDir } = {}) {
   } catch {
     moduleSource = {};
   }
+  try {
+    functionMap = await readJsonFile(path.join(resolvedOutDir, API_DATA_DIR, 'function-map.json'));
+  } catch {
+    functionMap = {};
+  }
   return {
     outDir: resolvedOutDir,
-    index: createAnalysisIndex(output, source, moduleSource),
+    index: createAnalysisIndex(output, source, moduleSource, functionMap),
   };
 }
 
@@ -360,6 +565,7 @@ function routeEntries() {
     { method: 'GET', path: '/api/v1/modules/:id', description: 'Return one analyzed module with dependencies, dependents, imports, and symbols.' },
     { method: 'GET', path: '/api/v1/modules/:id/dependencies', description: 'Return local and external dependencies for one analyzed module.' },
     { method: 'GET', path: '/api/v1/modules/:id/dependents', description: 'Return modules that import one analyzed module.' },
+    { method: 'GET', path: '/api/v1/modules/:id/functions', description: 'Return functions declared in one module with outgoing static dependencies and reverse users.' },
     { method: 'GET', path: '/api/v1/modules/:id/source', description: 'Return a bounded source excerpt from saved analyzed module source.' },
     { method: 'GET', path: '/api/v1/source', description: 'Return a bounded source excerpt by exact analyzed module path.' },
     { method: 'GET', path: '/api/v1/symbols', description: 'List saved source symbols with search, modulePath, kind, sourceOrigin, limit, and offset filters.' },
@@ -367,6 +573,11 @@ function routeEntries() {
     { method: 'GET', path: '/api/v1/symbols/:id', description: 'Return one saved source symbol and its declaration source snippet.' },
     { method: 'GET', path: '/api/v1/symbols/:id/references', description: 'Return captured static reference/importer relationships for one symbol.' },
     { method: 'GET', path: '/api/v1/symbols/:id/callers', description: 'Alias for static importer relationships; this is not a runtime call graph.' },
+    { method: 'GET', path: '/api/v1/functions', description: 'List saved function declarations with search, modulePath, kind, component, limit, and offset filters.' },
+    { method: 'GET', path: '/api/v1/functions/search', description: 'Search saved function declarations using q or search.' },
+    { method: 'GET', path: '/api/v1/functions/:id', description: 'Return one function with outgoing static dependencies and reverse users.' },
+    { method: 'GET', path: '/api/v1/functions/:id/dependencies', description: 'Return outgoing static function dependencies for one function.' },
+    { method: 'GET', path: '/api/v1/functions/:id/users', description: 'Return reverse static users for one function.' },
     { method: 'GET', path: '/api/v1/query', description: 'Aggregate exact modulePath and symbol search results without adding inferred semantics.' },
   ];
 }
@@ -379,13 +590,16 @@ function discovery(index) {
     examples: [
       '/api/v1/run',
       '/api/v1/modules?reachable=true&extension=.jsx&limit=25',
+      '/api/v1/modules/<module-id>/functions',
       '/api/v1/modules/<module-id>/source?startLine=1&endLine=40',
       '/api/v1/symbols/search?q=App',
+      '/api/v1/functions/search?q=CreatorShell',
       '/api/v1/query?modulePath=src/app.jsx&symbol=RootApp',
     ],
     semantics: {
-      analysis: 'Responses are served from generated output.json, source-code.json, and .ironglancer-api/source-modules.json loaded once at server start.',
+      analysis: 'Responses are served from generated output.json, source-code.json, .ironglancer-api/source-modules.json, and .ironglancer-api/function-map.json loaded once at server start.',
       relations: 'Symbol relation endpoints expose static import/export/reference relationships captured by IronGlancer, not runtime call graphs or data lineage.',
+      functionDependencies: index.functionLimitations,
       source: `Source excerpts are bounded to ${MAX_SOURCE_EXCERPT_LINES} lines and only come from modules saved in the analyzed run.`,
     },
   };
@@ -412,8 +626,11 @@ function runMetadata(index, outDir) {
       sourceCodeAvailable: index.sourceIsUsable,
       declarationSourceAvailable: index.declarationSourceIsUsable,
       moduleSourceAvailable: index.moduleSourceIsUsable,
+      functionMapAvailable: index.functionMapIsUsable,
       moduleSourceCount: index.sourceModuleByPath.size,
       symbolSourceCount: index.symbols.length,
+      functionCount: index.functions.length,
+      functionEdgeCount: index.functionEdges.length,
     },
   };
 }
@@ -574,6 +791,100 @@ function sourceExcerpt(index, module, url) {
   };
 }
 
+function functionDependencySemantics(index) {
+  return {
+    relationSemantics: 'Static function dependency edges record identifier usage syntax inside caller declaration spans. call, optional-call, tagged-template, and jsx-element are syntax observations; reference is not a definite runtime call.',
+    limitations: index.functionLimitations,
+  };
+}
+
+function functionEdgePayload(index, edge) {
+  const source = index.functionById.get(edge.sourceId);
+  const target = index.functionById.get(edge.targetId);
+  return {
+    id: edge.id,
+    scope: edge.scope,
+    relationKind: edge.relationKind,
+    syntaxKinds: edge.syntaxKinds,
+    usageLines: edge.usageLines,
+    usages: edge.usages,
+    referenceCount: edge.referenceCount,
+    sourceId: edge.sourceId,
+    sourceModulePath: edge.sourceModulePath,
+    sourceFunction: edge.sourceFunction,
+    sourceStartLine: edge.sourceStartLine,
+    targetId: edge.targetId,
+    targetModulePath: edge.targetModulePath,
+    targetFunction: edge.targetFunction,
+    targetStartLine: edge.targetStartLine,
+    ...(edge.import ? { import: edge.import } : {}),
+    source: source ? createFunctionSummary(index, source) : null,
+    target: target ? createFunctionSummary(index, target) : null,
+  };
+}
+
+function functionDetail(index, node) {
+  return {
+    function: createFunctionSummary(index, node),
+    staticAnalysis: functionDependencySemantics(index),
+    dependencies: (index.dependenciesByFunctionId.get(node.id) || []).map((edge) => functionEdgePayload(index, edge)),
+    users: (index.usersByFunctionId.get(node.id) || []).map((edge) => functionEdgePayload(index, edge)),
+  };
+}
+
+function functionDependenciesPayload(index, node) {
+  return {
+    function: createFunctionSummary(index, node),
+    staticAnalysis: functionDependencySemantics(index),
+    dependencies: (index.dependenciesByFunctionId.get(node.id) || []).map((edge) => functionEdgePayload(index, edge)),
+  };
+}
+
+function functionUsersPayload(index, node) {
+  return {
+    function: createFunctionSummary(index, node),
+    staticAnalysis: functionDependencySemantics(index),
+    users: (index.usersByFunctionId.get(node.id) || []).map((edge) => functionEdgePayload(index, edge)),
+  };
+}
+
+function moduleFunctionsPayload(index, module) {
+  return {
+    module: index.moduleSummary(module),
+    staticAnalysis: functionDependencySemantics(index),
+    functions: (index.functionsByModulePath.get(module.path) || []).map((node) => functionDetail(index, node)),
+  };
+}
+
+function getFunctionById(index, id) {
+  const node = index.functionById.get(normalizeString(id).trim());
+  if (!node) throw apiError(404, 'function_not_found', 'No saved function declaration exists for that id.');
+  return node;
+}
+
+function functionList(index, url, { requireSearch = false, modulePath } = {}) {
+  const search = lowerSearch(url.searchParams.get('search') || url.searchParams.get('q'));
+  if (requireSearch && !search) throw apiError(400, 'missing_query', 'Provide q or search.');
+  const kind = lowerSearch(url.searchParams.get('kind'));
+  const component = parseBoolean(url.searchParams.get('component'), 'component');
+  const explicitModulePath = modulePath || normalizeString(url.searchParams.get('modulePath')).trim();
+  const moduleFilter = explicitModulePath ? getModuleByPath(index, explicitModulePath).path : '';
+  const items = index.functions
+    .filter((node) => !moduleFilter || node.modulePath === moduleFilter)
+    .filter((node) => !search || [
+      node.name,
+      node.declarationName,
+      node.modulePath,
+    ].some((value) => lowerSearch(value).includes(search)))
+    .filter((node) => !kind || lowerSearch(node.kind) === kind)
+    .filter((node) => component == null || node.component === component)
+    .map((node) => createFunctionSummary(index, node));
+  return {
+    ...paginated(items, url),
+    staticAnalysis: functionDependencySemantics(index),
+  };
+}
+
 function symbolList(index, url, { requireSearch = false, modulePath } = {}) {
   const search = lowerSearch(url.searchParams.get('search') || url.searchParams.get('q'));
   if (requireSearch && !search) throw apiError(400, 'missing_query', 'Provide q or search.');
@@ -675,6 +986,9 @@ function handleApiRequest({ request, response, index, outDir }) {
     if (parts.length === 5 && parts[4] === 'dependents') {
       return sendApiData(response, moduleDependentsPayload(index, module));
     }
+    if (parts.length === 5 && parts[4] === 'functions') {
+      return sendApiData(response, moduleFunctionsPayload(index, module));
+    }
     if (parts.length === 5 && parts[4] === 'source') {
       return sendApiData(response, sourceExcerpt(index, module, url));
     }
@@ -692,6 +1006,20 @@ function handleApiRequest({ request, response, index, outDir }) {
     if (parts.length === 4) return sendApiData(response, symbolDetail(symbol));
     if (parts.length === 5 && (parts[4] === 'references' || parts[4] === 'callers')) {
       return sendApiData(response, symbolReferences(symbol));
+    }
+  }
+  if (resource === 'functions') {
+    if (parts.length === 3) return sendApiData(response, functionList(index, url));
+    if (parts.length === 4 && parts[3] === 'search') {
+      return sendApiData(response, functionList(index, url, { requireSearch: true }));
+    }
+    const node = getFunctionById(index, parts[3]);
+    if (parts.length === 4) return sendApiData(response, functionDetail(index, node));
+    if (parts.length === 5 && parts[4] === 'dependencies') {
+      return sendApiData(response, functionDependenciesPayload(index, node));
+    }
+    if (parts.length === 5 && parts[4] === 'users') {
+      return sendApiData(response, functionUsersPayload(index, node));
     }
   }
   if (resource === 'query' && parts.length === 3) return sendApiData(response, queryPayload(index, url));

@@ -53,6 +53,14 @@ const EXCLUDED_DISCOVERY_DIRS = new Set([
 const lexicalBlockRangeCache = new WeakMap();
 const loopScopeRangeCache = new WeakMap();
 const stringConstantValueCache = new WeakMap();
+const identifierReferenceLocationCache = new WeakMap();
+const visibleLocalBindingLocationCache = new WeakMap();
+const FUNCTION_DEPENDENCY_LIMITATIONS = [
+  'Static function dependencies are based on identifier references inside saved declaration spans; IronGlancer does not execute code or prove runtime control flow.',
+  'Usage syntax is labeled as call, optional-call, tagged-template, jsx-element, or reference from nearby source syntax; reference entries are not claimed to be definite runtime calls.',
+  'Imported targets are limited to statically resolved local imports, dynamic imports, require calls, and supported lazy-module patterns with resolvable bindings.',
+  'Same-module targets are limited to named function declarations and named arrow-function variable declarations discovered in the same file; dynamic property dispatch, aliasing through arbitrary values, and unresolved re-exports are outside this map.',
+];
 
 async function loadImportAliases(rootDir, entryRel = '') {
   const aliases = new Map();
@@ -119,8 +127,8 @@ export function normalizeRouteAliases(routeAliases = []) {
       const from = normalizeRouteAliasFrom(Array.isArray(entry) ? entry[0] : entry?.from);
       const targetSource = Array.isArray(entry) ? entry[1] : entry?.to;
       const to = normalizeRouteAliasTarget(targetSource);
-      if (!from || normalizeString(targetSource).trim() === '') {
-        throw new Error('Route aliases must include a non-empty route and target path.');
+      if (!from || targetSource == null) {
+        throw new Error('Route aliases must include a route and target path.');
       }
       return { from, to, index };
     })
@@ -644,7 +652,7 @@ function isAnyDeclarationNameLocation(record, location) {
 }
 
 function declarationIdentifierMetrics(record, span, publicApiInfo) {
-  const locations = identifierReferenceLocations(record?.source, span?.name);
+  const locations = cachedIdentifierReferenceLocations(record, span?.name);
   const declarationLocations = locations.filter((location) => isDeclarationNameLocation(span, location));
   const nonDeclarationLocations = locations.filter((location) => !isDeclarationNameLocation(span, location));
   const publicApiLocations = nonDeclarationLocations
@@ -1303,6 +1311,27 @@ function declarationScopeChain(record, span) {
 }
 
 function visibleLocalBindingLocations(record, span, identifier) {
+  const name = normalizeIdentifier(identifier);
+  if (!name) return [];
+  if (record && typeof record === 'object') {
+    if (!visibleLocalBindingLocationCache.has(record)) {
+      visibleLocalBindingLocationCache.set(record, new Map());
+    }
+    const recordCache = visibleLocalBindingLocationCache.get(record);
+    const key = [
+      span?.startIndex,
+      declarationSpanExclusiveEnd(span),
+      name,
+    ].join('\u0000');
+    if (recordCache.has(key)) return recordCache.get(key);
+    const bindings = visibleLocalBindingLocationsUncached(record, span, name);
+    recordCache.set(key, bindings);
+    return bindings;
+  }
+  return visibleLocalBindingLocationsUncached(record, span, name);
+}
+
+function visibleLocalBindingLocationsUncached(record, span, identifier) {
   const bindings = [];
   const seen = new Set();
   for (const scopeSpan of declarationScopeChain(record, span)) {
@@ -1320,6 +1349,47 @@ function visibleLocalBindingLocations(record, span, identifier) {
 
 function sameLocation(a, b) {
   return a?.index === b?.index && a?.endIndex === b?.endIndex;
+}
+
+function cachedIdentifierReferenceLocations(record, identifier) {
+  const name = normalizeIdentifier(identifier);
+  if (!name) return [];
+  if (!record || typeof record !== 'object') return identifierReferenceLocations(record?.source, name);
+  if (!identifierReferenceLocationCache.has(record)) {
+    identifierReferenceLocationCache.set(record, new Map());
+  }
+  const recordCache = identifierReferenceLocationCache.get(record);
+  if (!recordCache.has(name)) {
+    recordCache.set(name, identifierReferenceLocations(record.source, name));
+  }
+  return recordCache.get(name);
+}
+
+function lineStartIndexesForSource(source) {
+  const text = normalizeString(source);
+  const starts = [0];
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === '\n') starts.push(index + 1);
+  }
+  return starts;
+}
+
+function lineNumberAtSourceIndex(source, index) {
+  if (!Number.isInteger(index) || index < 0) return null;
+  const starts = lineStartIndexesForSource(source);
+  let low = 0;
+  let high = starts.length - 1;
+  let found = 0;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    if (starts[mid] <= index) {
+      found = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return found + 1;
 }
 
 function unescapeStringLiteralValue(value) {
@@ -1413,8 +1483,13 @@ function localBindingIsImportDeclaration(record, localBinding, binding, ref) {
   return false;
 }
 
-function isShadowedReferenceLocation(record, span, identifier, location, { binding, ref } = {}) {
+function isShadowedReferenceLocation(record, span, identifier, location, {
+  binding,
+  ref,
+  ignoredBindingLocations = [],
+} = {}) {
   for (const localBinding of visibleLocalBindingLocations(record, span, identifier)) {
+    if (ignoredBindingLocations.some((ignored) => sameLocation(localBinding, ignored))) continue;
     if (sameLocation(localBinding, location)) return true;
     if (
       Number.isInteger(localBinding.scopeStart)
@@ -1591,6 +1666,7 @@ function isJsxOpeningIdentifierReference(source, location) {
   const text = normalizeString(source);
   const previousIndex = previousNonWhitespaceIndex(text, location?.index);
   if (text[previousIndex] !== '<') return false;
+  if (/\s/.test(text[location.endIndex] || '')) return true;
   const nextIndex = findNextNonWhitespaceIndex(text, location.endIndex);
   return ['/', '>'].includes(text[nextIndex]) || /\s/.test(text[nextIndex] || '');
 }
@@ -1599,6 +1675,87 @@ function isDirectCallableIdentifierReference(source, location) {
   const text = normalizeString(source);
   const nextIndex = findNextNonWhitespaceIndex(text, location?.endIndex);
   return text[nextIndex] === '(' || isJsxOpeningIdentifierReference(text, location);
+}
+
+function isOptionalCallIdentifierReference(source, location) {
+  const text = normalizeString(source);
+  const questionIndex = findNextNonWhitespaceIndex(text, location?.endIndex);
+  if (text[questionIndex] !== '?' || text[questionIndex + 1] !== '.') return false;
+  return text[findNextNonWhitespaceIndex(text, questionIndex + 2)] === '(';
+}
+
+function isTaggedTemplateIdentifierReference(source, location) {
+  const text = normalizeString(source);
+  return text[findNextNonWhitespaceIndex(text, location?.endIndex)] === '`';
+}
+
+function isJsxOpeningMemberReference(source, location) {
+  const text = normalizeString(source);
+  let dotIndex = previousNonWhitespaceIndex(text, location?.index);
+  if (text[dotIndex] !== '.') return false;
+
+  while (dotIndex !== -1) {
+    let index = previousNonWhitespaceIndex(text, dotIndex);
+    if (!/[A-Za-z0-9_$]/.test(text[index] || '')) return false;
+    while (index > 0 && /[A-Za-z0-9_$]/.test(text[index - 1])) index -= 1;
+    const previousIndex = previousNonWhitespaceIndex(text, index);
+    if (text[previousIndex] === '<') return true;
+    if (text[previousIndex] !== '.') return false;
+    dotIndex = previousIndex;
+  }
+  return false;
+}
+
+function usageSyntaxForLocation(source, location) {
+  const text = normalizeString(source);
+  if (isJsxOpeningIdentifierReference(text, location) || isJsxOpeningMemberReference(text, location)) {
+    return 'jsx-element';
+  }
+  if (isOptionalCallIdentifierReference(text, location)) return 'optional-call';
+  if (isTaggedTemplateIdentifierReference(text, location)) return 'tagged-template';
+  const nextIndex = findNextNonWhitespaceIndex(text, location?.endIndex);
+  return text[nextIndex] === '(' ? 'call' : 'reference';
+}
+
+function compactReferenceUsages(record, referenceLocations) {
+  const seen = new Set();
+  return (Array.isArray(referenceLocations) ? referenceLocations : [])
+    .map((location) => ({
+      line: Number.isInteger(location?.line)
+        ? location.line
+        : lineNumberAtSourceIndex(record?.source, location?.index),
+      syntax: usageSyntaxForLocation(record?.source, location),
+    }))
+    .filter((usage) => Number.isInteger(usage.line) && usage.line > 0 && usage.syntax)
+    .filter((usage) => {
+      const key = `${usage.line}\u0000${usage.syntax}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => a.line - b.line || compareLocale(a.syntax, b.syntax));
+}
+
+function usageLinesForUsages(usages) {
+  return Array.from(new Set((Array.isArray(usages) ? usages : [])
+    .map((usage) => usage.line)
+    .filter((line) => Number.isInteger(line) && line > 0)))
+    .sort((a, b) => a - b);
+}
+
+function syntaxKindsForUsages(usages) {
+  return Array.from(new Set((Array.isArray(usages) ? usages : [])
+    .map((usage) => normalizeString(usage.syntax).trim())
+    .filter(Boolean)))
+    .sort(compareLocale);
+}
+
+function relationKindForSyntaxKinds(syntaxKinds) {
+  const kinds = Array.isArray(syntaxKinds) ? syntaxKinds : [];
+  if (kinds.length !== 1) return 'mixed-static-usage';
+  if (kinds[0] === 'jsx-element') return 'static-jsx-element';
+  if (kinds[0] === 'reference') return 'static-reference';
+  return 'static-call';
 }
 
 function namespaceReferenceMaskedSource(source) {
@@ -1638,11 +1795,16 @@ function declarationReferenceLocations(record, span, identifier, {
   directCallableOnly = false,
   binding,
   ref,
+  ignoredBindingLocations = [],
 } = {}) {
-  const locations = identifierReferenceLocations(record?.source, identifier)
+  const locations = cachedIdentifierReferenceLocations(record, identifier)
     .filter((location) => !isAnyDeclarationNameLocation(record, location))
     .filter((location) => locationOwnedByDeclaration(record, span, location))
-    .filter((location) => !isShadowedReferenceLocation(record, span, identifier, location, { binding, ref }));
+    .filter((location) => !isShadowedReferenceLocation(record, span, identifier, location, {
+      binding,
+      ref,
+      ignoredBindingLocations,
+    }));
   return directCallableOnly
     ? locations.filter((location) => isDirectCallableIdentifierReference(record?.source, location))
     : locations;
@@ -1743,13 +1905,16 @@ function bindingReferenceGroups({
 }
 
 function compactUseRelationship({
+  importerRecord,
   targetRecord,
   target,
   binding,
   ref,
-  referenceCount,
+  referenceLocations,
 }) {
   const localName = normalizeString(target.localName || binding?.local).trim();
+  const usages = compactReferenceUsages(importerRecord, referenceLocations);
+  const syntaxKinds = syntaxKindsForUsages(usages);
   return {
     name: localName || target.declarationName,
     declarationName: target.declarationName,
@@ -1761,7 +1926,11 @@ function compactUseRelationship({
     modulePath: targetRecord.rel,
     startLine: target.span.startLine,
     endLine: target.span.endLine,
-    referenceCount,
+    referenceCount: Array.isArray(referenceLocations) ? referenceLocations.length : 0,
+    relationKind: relationKindForSyntaxKinds(syntaxKinds),
+    syntaxKinds,
+    usageLines: usageLinesForUsages(usages),
+    usages,
   };
 }
 
@@ -1772,9 +1941,11 @@ function compactImportedByRelationship({
   target,
   binding,
   ref,
-  referenceCount,
+  referenceLocations,
 }) {
   const localName = normalizeString(target?.localName || binding?.local).trim();
+  const usages = compactReferenceUsages(importerRecord, referenceLocations);
+  const syntaxKinds = syntaxKindsForUsages(usages);
   return {
     name: importerName,
     declarationName: importerName,
@@ -1786,7 +1957,11 @@ function compactImportedByRelationship({
     modulePath: importerRecord.rel,
     startLine: importerSpan.startLine,
     endLine: importerSpan.endLine,
-    referenceCount,
+    referenceCount: Array.isArray(referenceLocations) ? referenceLocations.length : 0,
+    relationKind: relationKindForSyntaxKinds(syntaxKinds),
+    syntaxKinds,
+    usageLines: usageLinesForUsages(usages),
+    usages,
   };
 }
 
@@ -1856,14 +2031,22 @@ function buildDeclarationRelationships(graph) {
               'importedFunctionUses',
               seenUses,
               relationshipKey,
-              compactUseRelationship({ targetRecord, target, binding, ref, referenceCount }),
+              compactUseRelationship({ importerRecord, targetRecord, target, binding, ref, referenceLocations }),
             );
             addDeclarationRelationship(
               importedByBucket,
               'importedBy',
               seenImportedBy,
               relationshipKey,
-              compactImportedByRelationship({ importerRecord, importerName, importerSpan, target, binding, ref, referenceCount }),
+              compactImportedByRelationship({
+                importerRecord,
+                importerName,
+                importerSpan,
+                target,
+                binding,
+                ref,
+                referenceLocations,
+              }),
             );
           }
         }
@@ -2222,6 +2405,275 @@ function buildImportEdges(graph, { reachableOnly = false } = {}) {
       || compareLocale(a.target, b.target));
 }
 
+function encodedStaticId(value) {
+  return Buffer.from(normalizeString(value), 'utf8').toString('base64url');
+}
+
+function functionSpanKey(record, span) {
+  return [
+    normalizeString(record?.rel).trim(),
+    normalizeString(span?.name).trim(),
+    normalizeString(span?.kind).trim(),
+    span?.startLine,
+    span?.endLine,
+  ].join('\u0000');
+}
+
+function functionIdForSpan(record, span) {
+  return encodedStaticId(`function\u0000${functionSpanKey(record, span)}`);
+}
+
+function functionDependencyEdgeId({ sourceNode, targetNode, scope, importInfo }) {
+  return encodedStaticId([
+    'function-edge',
+    sourceNode?.id,
+    targetNode?.id,
+    scope,
+    importInfo?.specifier || '',
+    importInfo?.loadKind || '',
+    importInfo?.bindingKind || '',
+    importInfo?.importedName || '',
+    importInfo?.localName || '',
+  ].join('\u0000'));
+}
+
+function compareFunctionNode(a, b) {
+  return compareLocale(a.modulePath, b.modulePath)
+    || a.startLine - b.startLine
+    || a.endLine - b.endLine
+    || compareLocale(a.name, b.name)
+    || compareLocale(a.kind, b.kind);
+}
+
+function compareFunctionEdge(a, b) {
+  return compareLocale(a.sourceModulePath, b.sourceModulePath)
+    || a.sourceStartLine - b.sourceStartLine
+    || compareLocale(a.targetModulePath, b.targetModulePath)
+    || a.targetStartLine - b.targetStartLine
+    || compareLocale(a.scope, b.scope)
+    || compareLocale(a.targetFunction, b.targetFunction)
+    || compareLocale(a.import?.localName || '', b.import?.localName || '');
+}
+
+function functionNodeForSpan(record, span) {
+  const name = normalizeString(span?.name).trim();
+  return {
+    id: functionIdForSpan(record, span),
+    modulePath: record.rel,
+    name,
+    declarationName: name,
+    kind: normalizeString(span?.kind).trim() || 'function',
+    component: /^[A-Z]/.test(name),
+    startLine: span.startLine,
+    endLine: span.endLine,
+    lineCount: span.lineCount,
+  };
+}
+
+function functionNodeDescriptors(graph) {
+  const descriptors = [];
+  const bySpanKey = new Map();
+  const byModulePath = new Map();
+
+  for (const record of moduleRecords(graph)) {
+    const spans = (Array.isArray(record?.declarationSpans) ? record.declarationSpans : [])
+      .filter((span) => ['function', 'arrow'].includes(span?.kind))
+      .sort((a, b) => a.startLine - b.startLine
+        || a.endLine - b.endLine
+        || compareLocale(a.name, b.name)
+        || compareLocale(a.kind, b.kind));
+    for (const span of spans) {
+      const node = functionNodeForSpan(record, span);
+      const descriptor = { node, record, span };
+      descriptors.push(descriptor);
+      bySpanKey.set(functionSpanKey(record, span), descriptor);
+      if (!byModulePath.has(record.rel)) byModulePath.set(record.rel, []);
+      byModulePath.get(record.rel).push(descriptor);
+    }
+  }
+
+  descriptors.sort((a, b) => compareFunctionNode(a.node, b.node));
+  for (const list of byModulePath.values()) {
+    list.sort((a, b) => compareFunctionNode(a.node, b.node));
+  }
+  return { descriptors, bySpanKey, byModulePath };
+}
+
+function uniqueSameModuleTargets(descriptors) {
+  const targets = new Map();
+  for (const descriptor of descriptors) {
+    if (!targets.has(descriptor.node.name)) targets.set(descriptor.node.name, descriptor);
+  }
+  return Array.from(targets.values());
+}
+
+function sameModuleReferenceLocations(record, callerSpan, targetSpan) {
+  return declarationReferenceLocations(record, callerSpan, targetSpan?.name, {
+    ignoredBindingLocations: [{
+      index: targetSpan?.nameStartIndex,
+      endIndex: targetSpan?.nameEndIndex,
+    }],
+  });
+}
+
+function declarationSearchText(record, span) {
+  const source = normalizeString(record?.source);
+  const endIndex = declarationSpanExclusiveEnd(span);
+  if (!Number.isInteger(span?.nameEndIndex) || !Number.isInteger(endIndex) || endIndex <= span.nameEndIndex) {
+    return '';
+  }
+  return source.slice(span.nameEndIndex, endIndex);
+}
+
+function functionImportInfo(target, binding, ref) {
+  const localName = normalizeString(target?.localName || binding?.local).trim();
+  return {
+    specifier: normalizeString(ref?.specifier).trim(),
+    loadKind: normalizeString(ref?.kind).trim() || 'import',
+    bindingKind: normalizeString(binding?.kind || 'named').trim() || 'named',
+    importedName: normalizeString(target?.importedName || binding?.imported).trim(),
+    localName,
+    inferred: Boolean(binding?.inferred),
+  };
+}
+
+function createFunctionDependencyEdge({
+  sourceDescriptor,
+  targetDescriptor,
+  scope,
+  referenceLocations,
+  importInfo = null,
+}) {
+  const usages = compactReferenceUsages(sourceDescriptor.record, referenceLocations);
+  const syntaxKinds = syntaxKindsForUsages(usages);
+  const sourceNode = sourceDescriptor.node;
+  const targetNode = targetDescriptor.node;
+  return {
+    id: functionDependencyEdgeId({ sourceNode, targetNode, scope, importInfo }),
+    scope,
+    relationKind: relationKindForSyntaxKinds(syntaxKinds),
+    syntaxKinds,
+    usageLines: usageLinesForUsages(usages),
+    usages,
+    referenceCount: Array.isArray(referenceLocations) ? referenceLocations.length : 0,
+    sourceId: sourceNode.id,
+    sourceModulePath: sourceNode.modulePath,
+    sourceFunction: sourceNode.name,
+    sourceKind: sourceNode.kind,
+    sourceStartLine: sourceNode.startLine,
+    sourceEndLine: sourceNode.endLine,
+    targetId: targetNode.id,
+    targetModulePath: targetNode.modulePath,
+    targetFunction: targetNode.name,
+    targetKind: targetNode.kind,
+    targetStartLine: targetNode.startLine,
+    targetEndLine: targetNode.endLine,
+    ...(importInfo ? { import: importInfo } : {}),
+  };
+}
+
+function mergeFunctionDependencyEdge(edgeMap, edge) {
+  if (!edgeMap.has(edge.id)) {
+    edgeMap.set(edge.id, edge);
+    return;
+  }
+
+  const existing = edgeMap.get(edge.id);
+  existing.referenceCount += edge.referenceCount;
+  const usages = [...existing.usages, ...edge.usages]
+    .filter((usage, index, all) => (
+      all.findIndex((candidate) => (
+        candidate.line === usage.line && candidate.syntax === usage.syntax
+      )) === index
+    ))
+    .sort((a, b) => a.line - b.line || compareLocale(a.syntax, b.syntax));
+  existing.usages = usages;
+  existing.usageLines = usageLinesForUsages(usages);
+  existing.syntaxKinds = syntaxKindsForUsages(usages);
+  existing.relationKind = relationKindForSyntaxKinds(existing.syntaxKinds);
+}
+
+function buildSameModuleFunctionEdges({ byModulePath }) {
+  const edgeMap = new Map();
+  for (const descriptors of byModulePath.values()) {
+    const targets = uniqueSameModuleTargets(descriptors);
+    for (const callerDescriptor of descriptors) {
+      const searchText = declarationSearchText(callerDescriptor.record, callerDescriptor.span);
+      for (const targetDescriptor of targets) {
+        if (callerDescriptor.node.id === targetDescriptor.node.id) continue;
+        if (!searchText.includes(targetDescriptor.node.name)) continue;
+        const referenceLocations = sameModuleReferenceLocations(
+          callerDescriptor.record,
+          callerDescriptor.span,
+          targetDescriptor.span,
+        );
+        if (referenceLocations.length === 0) continue;
+        mergeFunctionDependencyEdge(edgeMap, createFunctionDependencyEdge({
+          sourceDescriptor: callerDescriptor,
+          targetDescriptor,
+          scope: 'same-module',
+          referenceLocations,
+        }));
+      }
+    }
+  }
+  return edgeMap;
+}
+
+function buildImportedFunctionEdges(graph, { bySpanKey }) {
+  const edgeMap = new Map();
+  for (const importerRecord of graph.modules.values()) {
+    const importerSpans = Array.from(declarationSpansByName(importerRecord).values());
+    if (importerSpans.length === 0) continue;
+    for (const ref of Array.isArray(importerRecord.importRefs) ? importerRecord.importRefs : []) {
+      const targetRecord = ref?.localRel ? graph.modules.get(ref.localRel) : null;
+      if (!targetRecord) continue;
+      for (const binding of Array.isArray(ref.bindings) ? ref.bindings : []) {
+        if (!binding?.local) continue;
+        for (const importerSpan of importerSpans) {
+          const sourceDescriptor = bySpanKey.get(functionSpanKey(importerRecord, importerSpan));
+          if (!sourceDescriptor) continue;
+          for (const { target, referenceLocations } of bindingReferenceGroups({
+            importerRecord,
+            importerSpan,
+            targetRecord,
+            binding,
+            ref,
+          })) {
+            const targetDescriptor = bySpanKey.get(functionSpanKey(targetRecord, target.span));
+            if (!targetDescriptor || referenceLocations.length === 0) continue;
+            mergeFunctionDependencyEdge(edgeMap, createFunctionDependencyEdge({
+              sourceDescriptor,
+              targetDescriptor,
+              scope: 'imported',
+              referenceLocations,
+              importInfo: functionImportInfo(target, binding, ref),
+            }));
+          }
+        }
+      }
+    }
+  }
+  return edgeMap;
+}
+
+function buildFunctionDependencyMap(graph) {
+  const descriptorIndex = functionNodeDescriptors(graph);
+  const sameModuleEdges = buildSameModuleFunctionEdges(descriptorIndex);
+  const importedEdges = buildImportedFunctionEdges(graph, descriptorIndex);
+  const edges = [
+    ...sameModuleEdges.values(),
+    ...importedEdges.values(),
+  ].sort(compareFunctionEdge);
+  return {
+    limitations: FUNCTION_DEPENDENCY_LIMITATIONS,
+    functions: descriptorIndex.descriptors
+      .map((descriptor) => descriptor.node)
+      .sort(compareFunctionNode),
+    edges,
+  };
+}
+
 function buildMermaid(graph, importEdges, declarationImportMetrics, { reachableOnly = false } = {}) {
   const jsxModules = jsxModuleRecords(graph, { reachableOnly });
   const classIds = buildClassIds(jsxModules);
@@ -2490,6 +2942,7 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
   const importEdges = buildImportEdges(graph, { reachableOnly: true });
   const reachableDeclarationImportMetrics = buildDeclarationImportMetrics(reachableGraph);
   const declarationRelationships = buildDeclarationRelationships(graph);
+  const functionDependencyMap = buildFunctionDependencyMap(graph);
   const mermaid = buildMermaid(graph, importEdges, reachableDeclarationImportMetrics, { reachableOnly: true });
   const sourceCode = buildSourceCode(
     graph,
@@ -2510,6 +2963,7 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
     mermaid,
     importEdges,
     sourceCode,
+    functionDependencyMap,
     summary: {
       moduleCount: modules.size,
       reachableModuleCount: reachableModules.size,
