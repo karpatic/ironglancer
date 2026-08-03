@@ -1041,6 +1041,7 @@ function buildDeadFunctionCandidates(graph, declarationImportMetrics) {
   const candidates = [];
   for (const record of Array.from(graph.modules.values()).sort((a, b) => compareLocale(a.rel, b.rel))) {
     for (const span of Array.isArray(record.declarationSpans) ? record.declarationSpans : []) {
+      if (span.declarationType === 'function-expression-name') continue;
       const metrics = declarationImportMetricsFor(declarationImportMetrics, record, span.name);
       if (metrics.directIdentifierReferenceCount !== 0 || metrics.importerFileCount !== 0) continue;
       candidates.push(buildDeadFunctionCandidate({

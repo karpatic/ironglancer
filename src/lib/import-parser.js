@@ -338,6 +338,59 @@ function maskQuotedText(chars, text, start, quote) {
   return index;
 }
 
+function maskTemplateExpression(chars, text, start) {
+  let index = start;
+  let depth = 1;
+  while (index < text.length) {
+    const char = text[index];
+    const next = text[index + 1];
+    if (char === '/' && next === '/') {
+      index = maskLineComment(chars, text, index);
+    } else if (char === '/' && next === '*') {
+      index = maskBlockComment(chars, text, index);
+    } else if (char === '/' && isRegexLiteralStart(chars, index)) {
+      index = maskRegexLiteral(chars, text, index);
+    } else if (char === '"' || char === "'") {
+      index = maskQuotedText(chars, text, index, char);
+    } else if (char === '`') {
+      index = maskTemplateLiteral(chars, text, index);
+    } else if (char === '{') {
+      depth += 1;
+      index += 1;
+    } else if (char === '}') {
+      depth -= 1;
+      index += 1;
+      if (depth === 0) return index;
+    } else {
+      index += 1;
+    }
+  }
+  return index;
+}
+
+function maskTemplateLiteral(chars, text, start) {
+  let index = start + 1;
+  let literalStart = index;
+  while (index < text.length) {
+    const char = text[index];
+    const next = text[index + 1];
+    if (char === '\\') {
+      index += 2;
+    } else if (char === '`') {
+      preserveNewlinesAsSpaces(chars, literalStart, index);
+      return index + 1;
+    } else if (char === '$' && next === '{') {
+      preserveNewlinesAsSpaces(chars, literalStart, index);
+      index = maskTemplateExpression(chars, text, index + 2);
+      literalStart = index;
+    } else {
+      index += 1;
+    }
+  }
+  preserveNewlinesAsSpaces(chars, literalStart, text.length);
+  return index;
+}
+
 function maskLineComment(chars, text, start) {
   let index = start + 2;
   while (index < text.length && text[index] !== '\n' && text[index] !== '\r') index += 1;
@@ -465,8 +518,10 @@ export function maskIgnorableSyntax(text) {
       index = maskBlockComment(chars, text, index);
     } else if (char === '/' && isRegexLiteralStart(chars, index)) {
       index = maskRegexLiteral(chars, text, index);
-    } else if (char === '"' || char === "'" || char === '`') {
+    } else if (char === '"' || char === "'") {
       index = maskQuotedText(chars, text, index, char);
+    } else if (char === '`') {
+      index = maskTemplateLiteral(chars, text, index);
     } else {
       index += 1;
     }
@@ -604,7 +659,7 @@ function findRegexLiteralEnd(text, start) {
   return -1;
 }
 
-function declarationSpan({ name, kind, startIndex, endIndex, nameStartIndex, lineStarts }) {
+function declarationSpan({ name, kind, startIndex, endIndex, nameStartIndex, lineStarts, declarationType }) {
   const startLine = lineNumberAt(startIndex, lineStarts);
   const endLine = lineNumberAt(endIndex, lineStarts);
   const span = {
@@ -619,6 +674,7 @@ function declarationSpan({ name, kind, startIndex, endIndex, nameStartIndex, lin
     endIndex: { value: endIndex },
     nameStartIndex: { value: nameStartIndex },
     nameEndIndex: { value: Number.isInteger(nameStartIndex) ? nameStartIndex + name.length : null },
+    declarationType: { value: declarationType },
   });
   return span;
 }
@@ -628,6 +684,12 @@ function compareDeclarationSpan(a, b) {
     || a.startLine - b.startLine
     || a.endLine - b.endLine
     || a.kind.localeCompare(b.kind);
+}
+
+function functionDeclarationTypeAt(masked, startIndex) {
+  const previousIndex = previousSignificantIndex(masked, startIndex);
+  if (previousIndex === -1 || ';{}'.includes(masked[previousIndex])) return 'function-declaration';
+  return 'function-expression-name';
 }
 
 export function extractDeclarationSpans(source) {
@@ -653,6 +715,7 @@ export function extractDeclarationSpans(source) {
       startIndex: match.index,
       endIndex: bodyEnd,
       nameStartIndex: match.index + match[0].lastIndexOf(match[1]),
+      declarationType: functionDeclarationTypeAt(masked, match.index),
       lineStarts,
     }));
   }
@@ -684,6 +747,7 @@ export function extractDeclarationSpans(source) {
       startIndex: match.index,
       endIndex: bodyEnd,
       nameStartIndex: match.index + match[0].lastIndexOf(match[1]),
+      declarationType: 'arrow-variable',
       lineStarts,
     }));
   }

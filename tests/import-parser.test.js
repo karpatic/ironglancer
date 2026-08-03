@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { extractDeclarationSpans, extractImportRefs } from '../src/lib/import-parser.js';
+import { countIdentifierReferences, extractDeclarationSpans, extractImportRefs } from '../src/lib/import-parser.js';
 
 test('extractImportRefs classifies dynamic, lazy, and require refs without dead duplicates', () => {
   const source = [
@@ -73,6 +73,18 @@ test('extractImportRefs classifies dynamic, lazy, and require refs without dead 
       kind: 'lazy',
     },
   ]);
+});
+
+test('countIdentifierReferences preserves template interpolation code and ignores template text', () => {
+  const source = [
+    'const text = `helper appears as literal text',
+    '  ${helper()}',
+    '  ${nested(`${helperTwo()} helperTwo literal`)}',
+    '`;',
+  ].join('\n');
+
+  assert.equal(countIdentifierReferences(source, 'helper'), 1);
+  assert.equal(countIdentifierReferences(source, 'helperTwo'), 1);
 });
 
 test('extractDeclarationSpans measures one-line function and arrow declarations', () => {

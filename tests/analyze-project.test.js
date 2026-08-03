@@ -471,3 +471,67 @@ test('analyzeProject classifies zero-reference dead function candidates with sta
   assert.ok(abandonedSource.candidateId);
   assert.equal(abandonedSource.sourceOrigin, 'dead-function-candidate');
 });
+
+test('analyzeProject excludes named function expression internal names from dead candidates', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import { run } from './tasks.js';",
+      '',
+      'export function App() {',
+      '  return <main>{run()}</main>;',
+      '}',
+    ].join('\n'),
+    'src/tasks.js': [
+      'export const run = function helper() {',
+      "  return 'running';",
+      '};',
+      '',
+      'setTimeout(function tick() {',
+      "  return 'later';",
+      '}, 1);',
+      '',
+      'function abandonedTask() {',
+      "  return 'dead';",
+      '}',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
+
+  assert.ok(!candidatesByName.has('helper'));
+  assert.ok(!candidatesByName.has('tick'));
+  assert.equal(candidatesByName.get('abandonedTask').confidence, 'high-confidence');
+});
+
+test('analyzeProject keeps template interpolation references live while ignoring template text', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import { renderMessage } from './feature.js';",
+      '',
+      'export function App() {',
+      '  return <main>{renderMessage()}</main>;',
+      '}',
+    ].join('\n'),
+    'src/feature.js': [
+      'export function renderMessage() {',
+      '  return `literalOnly appears only as text ${helper()}`;',
+      '}',
+      '',
+      'function helper() {',
+      "  return 'live';",
+      '}',
+      '',
+      'function literalOnly() {',
+      "  return 'dead';",
+      '}',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
+
+  assert.ok(!candidatesByName.has('helper'));
+  assert.equal(candidatesByName.get('literalOnly').confidence, 'high-confidence');
+  assert.equal(candidatesByName.get('literalOnly').counts.directIdentifierReferences, 0);
+});
