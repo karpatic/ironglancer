@@ -864,7 +864,7 @@ function canEndStatementAtIndex(text, index) {
 function statementContinuationStarts(text, index) {
   const char = text[index];
   if (!char) return false;
-  return '([{.,?:+-*/%&|^<>=!~'.includes(char);
+  return '`([{.,?:+-*/%&|^<>=!~'.includes(char);
 }
 
 function hasLineTerminatorBetween(text, start, end) {
