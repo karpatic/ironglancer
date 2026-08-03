@@ -665,11 +665,3 @@ export function extractDeclarationSpans(source) {
 
   return spans.sort(compareDeclarationSpan);
 }
-
-export function extractComponents(source) {
-  const names = new Set();
-  for (const span of extractDeclarationSpans(source)) {
-    if (/^[A-Z]/.test(span.name)) names.add(span.name);
-  }
-  return Array.from(names).sort((a, b) => a.localeCompare(b));
-}

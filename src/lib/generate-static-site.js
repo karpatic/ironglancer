@@ -30,12 +30,8 @@ function stableJson(value) {
   return JSON.stringify(value);
 }
 
-function contentHash(value) {
-  return crypto.createHash('sha256').update(stableJson(value)).digest('hex');
-}
-
-function textContentHash(value) {
-  return crypto.createHash('sha256').update(String(value)).digest('hex');
+function sha256(value) {
+  return crypto.createHash('sha256').update(value).digest('hex');
 }
 
 function normalizeCredentialIdentifier(identifier) {
@@ -132,7 +128,11 @@ async function writeJson(filePath, payload) {
   await fs.writeFile(filePath, JSON.stringify(payload, null, 2) + '\n', 'utf8');
 }
 
-function outputPayload(analysis, meta) {
+function contentHash(value) {
+  return sha256(stableJson(value));
+}
+
+function analysisPayload(analysis) {
   return {
     rootDir: analysis.rootDir,
     entry: analysis.entryRel,
@@ -143,7 +143,6 @@ function outputPayload(analysis, meta) {
     mermaid: analysis.mermaid,
     importEdges: analysis.importEdges,
     summary: analysis.summary,
-    meta,
   };
 }
 
@@ -152,22 +151,14 @@ export async function generateStaticSite({ rootDir, entry, outDir, routeAliases 
   const analysis = await analyzeProject({ rootDir, entry, routeAliases });
   assertNoCredentialLiterals(analysis.sourceCode);
   const generatedAt = new Date().toISOString();
-  const sourceCodePayload = { ...analysis.sourceCode };
-  const sourceCodeHash = contentHash(sourceCodePayload);
+  const sourceCodeHash = contentHash(analysis.sourceCode);
+  const output = analysisPayload(analysis);
   const appJs = await fs.readFile(viewerAppUrl, 'utf8');
-  const appScriptSrc = `./app.js?v=${textContentHash(appJs)}`;
+  const appScriptSrc = `./app.js?v=${sha256(appJs)}`;
   const buildId = contentHash({
     packageName: packageMeta.name,
     version: packageMeta.version,
-    rootDir: analysis.rootDir,
-    entry: analysis.entryRel,
-    treeText: analysis.treeText,
-    jsxTreeText: analysis.jsxTreeText,
-    jsScripts: analysis.jsScripts,
-    jsxScripts: analysis.jsxScripts,
-    mermaid: analysis.mermaid,
-    importEdges: analysis.importEdges,
-    summary: analysis.summary,
+    ...output,
     sourceCodeHash,
   });
   const meta = {
@@ -177,17 +168,16 @@ export async function generateStaticSite({ rootDir, entry, outDir, routeAliases 
     buildId,
     sourceCodeHash,
   };
-  const output = outputPayload(analysis, meta);
   await fs.rm(resolvedOutDir, { recursive: true, force: true });
   await fs.mkdir(resolvedOutDir, { recursive: true });
   await fs.writeFile(path.join(resolvedOutDir, 'index.html'), viewerHtml({ appScriptSrc }), 'utf8');
   await fs.writeFile(path.join(resolvedOutDir, 'app.js'), appJs, 'utf8');
   await fs.writeFile(path.join(resolvedOutDir, 'diagram.mmd'), analysis.mermaid + '\n', 'utf8');
   await writeJson(path.join(resolvedOutDir, 'source-code.json'), {
-    ...sourceCodePayload,
+    ...analysis.sourceCode,
     meta,
   });
-  await writeJson(path.join(resolvedOutDir, 'output.json'), output);
+  await writeJson(path.join(resolvedOutDir, 'output.json'), { ...output, meta });
   await copyMermaidAsset(resolvedOutDir);
   return { outDir: resolvedOutDir, ...analysis };
 }

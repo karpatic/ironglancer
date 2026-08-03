@@ -349,6 +349,19 @@ async function writeTempProject(files) {
   return rootDir;
 }
 
+async function generateTestSite({ rootDir = fixtureRoot, entry = 'src/app.jsx', prefix = 'ironglancer-static-' } = {}) {
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  const result = await generateStaticSite({ rootDir, entry, outDir });
+  const readJson = async (fileName) => JSON.parse(await fs.readFile(path.join(outDir, fileName), 'utf8'));
+  const [html, appJs, payload, sourcePayload] = await Promise.all([
+    fs.readFile(path.join(outDir, 'index.html'), 'utf8'),
+    fs.readFile(path.join(outDir, 'app.js'), 'utf8'),
+    readJson('output.json'),
+    readJson('source-code.json'),
+  ]);
+  return { outDir, html, appJs, payload, sourcePayload, result };
+}
+
 function createFakeMermaidEdge(document, { source, target, labelText = 'import' }) {
   const dataId = `id_${source}_${target}_fake`;
   const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
@@ -409,9 +422,23 @@ function createFakeMermaidClass(document, {
   return { classGroup, member: members[0] || null, members };
 }
 
+async function runGeneratedViewerWithClass({ classOptions, ...viewerOptions }) {
+  const rendered = {};
+  const harness = await runGeneratedViewerApp({
+    ...viewerOptions,
+    renderedSvgFactory: (fakeDocument) => {
+      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.viewBox = { baseVal: { width: 640, height: 320 } };
+      Object.assign(rendered, createFakeMermaidClass(fakeDocument, classOptions));
+      svg.appendChild(rendered.classGroup);
+      return svg;
+    },
+  });
+  return { ...harness, rendered };
+}
+
 test('generateStaticSite writes a static viewer bundle', async () => {
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-'));
-  const result = await generateStaticSite({ rootDir: fixtureRoot, entry: 'src/app.jsx', outDir });
+  const { outDir, html, appJs, payload: output, sourcePayload: sourceOutput, result } = await generateTestSite();
 
   assert.equal(result.entryRel, 'src/app.jsx');
   const files = await fs.readdir(outDir);
@@ -421,9 +448,7 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.ok(files.includes('source-code.json'));
   assert.ok(files.includes('vendor'));
 
-  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
   const expectedAppHash = crypto.createHash('sha256').update(appJs).digest('hex');
-  const html = await fs.readFile(path.join(outDir, 'index.html'), 'utf8');
   const appScriptMatch = html.match(/<script type="module" src="([^"]+)"><\/script>/);
   assert.ok(appScriptMatch, 'expected generated HTML to load the viewer app as a module script');
   assert.equal(appScriptMatch[1], `./app.js?v=${expectedAppHash}`);
@@ -444,10 +469,6 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.match(html, /id="source-dialog-previous"[^>]*aria-label="Previous source item"[^>]*disabled>Previous<\/button>/);
   assert.match(html, /id="source-dialog-next"[^>]*aria-label="Next source item"[^>]*disabled>Next<\/button>/);
 
-  assert.match(appJs, /payload\.jsxTreeText/);
-  assert.doesNotMatch(appJs, /jsxScriptsEl|renderJsxScripts|jsxScriptsFromPayload/);
-
-  const output = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
   assert.equal(output.entry, 'src/app.jsx');
   assert.equal(output.summary.moduleCount, 5);
   assert.equal(output.summary.jsxFileCount, 3);
@@ -462,7 +483,6 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.ok(!output.jsxTreeText.includes('[external]'));
   assert.deepEqual(output.importEdges, result.importEdges);
 
-  const sourceOutput = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
   assert.match(output.meta.buildId, /^[a-f0-9]{64}$/);
   assert.match(output.meta.sourceCodeHash, /^[a-f0-9]{64}$/);
   assert.equal(sourceOutput.meta.buildId, output.meta.buildId);
@@ -546,13 +566,14 @@ test('generateStaticSite refuses credential-looking source snippets without reje
 
 test('generated viewer opens visible member source snippets from scoped source payload', async () => {
   const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-source-'));
-  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
+  const { outDir, appJs, payload, sourcePayload } = await generateTestSite({
+    rootDir,
+    prefix: 'ironglancer-static-source-',
+  });
 
   const files = await fs.readdir(outDir);
   assert.ok(files.includes('source-code.json'));
 
-  const sourcePayload = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
   const appSource = await fs.readFile(path.join(rootDir, 'src/app.jsx'), 'utf8');
   const appLines = appSource.split(/\r\n|\r|\n/).slice(12, 28).join('\n');
   assert.deepEqual(sourcePayload.declarations.map(({ moduleId, modulePath, name, startLine, endLine }) => ({
@@ -616,24 +637,15 @@ test('generated viewer opens visible member source snippets from scoped source p
   assert.ok(!sourcePayload.declarations.some((item) => item.name === 'useCreatorModule'));
   assert.ok(!sourcePayload.declarations.some((item) => item.name === 'UnusedChild'));
 
-  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
-  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
   assert.equal(sourcePayload.meta.buildId, payload.meta.buildId);
   assert.equal(sourcePayload.meta.sourceCodeHash, payload.meta.sourceCodeHash);
-  const rendered = {};
-  const { document } = await runGeneratedViewerApp({
+  const { document, rendered } = await runGeneratedViewerWithClass({
     appJs,
     payload,
     sourcePayload,
-    renderedSvgFactory: (fakeDocument) => {
-      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
-      svg.viewBox = { baseVal: { width: 640, height: 320 } };
-      Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
-        classId: 'app',
-        memberText: '+App() [lines: 16 | refs: 0 | importers: 0]',
-      }));
-      svg.appendChild(rendered.classGroup);
-      return svg;
+    classOptions: {
+      classId: 'app',
+      memberText: '+App() [lines: 16 | refs: 0 | importers: 0]',
     },
   });
 
@@ -702,12 +714,10 @@ test('generated viewer aligns counted Mermaid labels with source navigation meta
       '}',
     ].join('\n'),
   });
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-counted-source-'));
-  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
-
-  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
-  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
-  const sourcePayload = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
+  const { appJs, payload, sourcePayload } = await generateTestSite({
+    rootDir,
+    prefix: 'ironglancer-static-counted-source-',
+  });
   const alphaLabel = 'AlphaLocal [lines: 3 | refs: 2 | importers: 2]';
   const appLabel = 'App() [lines: 3 | refs: 1 | importers: 1]';
   const alphaDeclaration = sourcePayload.declarations.find((item) => item.name === 'AlphaLocal');
@@ -715,30 +725,21 @@ test('generated viewer aligns counted Mermaid labels with source navigation meta
 
   assert.ok(payload.mermaid.includes('+' + alphaLabel));
   assert.ok(payload.mermaid.includes('+' + appLabel));
-  assert.equal(alphaDeclaration.sourceDisplayName, alphaLabel);
   assert.equal(alphaDeclaration.referenceCount, 2);
   assert.equal(alphaDeclaration.importerFileCount, 2);
-  assert.equal(appDeclaration.sourceDisplayName, appLabel);
   assert.equal(appDeclaration.referenceCount, 1);
   assert.equal(appDeclaration.importerFileCount, 1);
 
-  const rendered = {};
-  const { document } = await runGeneratedViewerApp({
+  const { document, rendered } = await runGeneratedViewerWithClass({
     appJs,
     payload,
     sourcePayload,
-    renderedSvgFactory: (fakeDocument) => {
-      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
-      svg.viewBox = { baseVal: { width: 640, height: 320 } };
-      Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
-        classId: 'app',
-        memberTexts: [
-          '+' + alphaLabel,
-          '+' + appLabel,
-        ],
-      }));
-      svg.appendChild(rendered.classGroup);
-      return svg;
+    classOptions: {
+      classId: 'app',
+      memberTexts: [
+        '+' + alphaLabel,
+        '+' + appLabel,
+      ],
     },
   });
 
@@ -778,18 +779,13 @@ test('generated viewer renders source member metrics as compact badges from sour
       '}',
     ].join('\n'),
   });
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-member-metrics-'));
-  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
-
-  const html = await fs.readFile(path.join(outDir, 'index.html'), 'utf8');
-  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
-  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
-  const sourcePayload = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
+  const { html, appJs, payload, sourcePayload } = await generateTestSite({
+    rootDir,
+    prefix: 'ironglancer-static-member-metrics-',
+  });
   const alphaDeclaration = sourcePayload.declarations.find((item) => item.name === 'AlphaLocal');
   assert.ok(alphaDeclaration, 'expected AlphaLocal source declaration');
   const renderedDisplayName = 'AlphaLocal [lines: 99 | refs: 99 | importers: 99]';
-  alphaDeclaration.name = 'AlphaResolvedByDisplay';
-  alphaDeclaration.sourceDisplayName = renderedDisplayName;
   alphaDeclaration.referenceCount = 2;
   alphaDeclaration.importerFileCount = 1;
   alphaDeclaration.startLine = 1;
@@ -798,26 +794,19 @@ test('generated viewer renders source member metrics as compact badges from sour
   assert.match(html, /\.diagram-canvas \.source-member-metrics/);
   assert.match(html, /\.diagram-canvas \.source-member-metric/);
 
-  const rendered = {};
-  const { document } = await runGeneratedViewerApp({
+  const { document, rendered } = await runGeneratedViewerWithClass({
     appJs,
     payload,
     sourcePayload,
-    renderedSvgFactory: (fakeDocument) => {
-      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
-      svg.viewBox = { baseVal: { width: 640, height: 320 } };
-      Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
-        classId: 'app',
-        memberText: '+' + renderedDisplayName,
-      }));
-      svg.appendChild(rendered.classGroup);
-      return svg;
+    classOptions: {
+      classId: 'app',
+      memberText: '+' + renderedDisplayName,
     },
   });
 
   assert.equal(rendered.member.getAttribute('role'), 'button');
   assert.equal(rendered.member.getAttribute('tabindex'), '0');
-  assert.equal(rendered.member.getAttribute('aria-label'), 'Show source for AlphaResolvedByDisplay in src/shared.js');
+  assert.equal(rendered.member.getAttribute('aria-label'), 'Show source for AlphaLocal in src/shared.js');
 
   const metricsGroup = rendered.member.querySelector('span.source-member-metrics');
   assert.ok(metricsGroup, 'expected source member metric badge group');
@@ -850,7 +839,7 @@ test('generated viewer renders source member metrics as compact badges from sour
 
   rendered.member.click();
   assert.equal(document.getElementById('source-dialog').open, true);
-  assert.equal(document.getElementById('source-dialog-title').textContent, 'AlphaResolvedByDisplay');
+  assert.equal(document.getElementById('source-dialog-title').textContent, 'AlphaLocal');
   assert.equal(document.getElementById('source-dialog-path').textContent, 'src/shared.js:1-3');
 });
 
@@ -875,67 +864,53 @@ test('generated viewer navigates imported script member source within its render
       '}',
     ].join('\n'),
   });
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-import-nav-'));
-  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
-
-  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
-  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
-  const sourcePayload = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
+  const { appJs, payload, sourcePayload } = await generateTestSite({
+    rootDir,
+    prefix: 'ironglancer-static-import-nav-',
+  });
   assert.deepEqual(sourcePayload.declarations.map(({
     name,
     sourceOrigin,
-    sourceGroup,
-    sourceOrder,
-    sourceDisplayName,
+    referenceCount,
+    importerFileCount,
   }) => ({
     name,
     sourceOrigin,
-    sourceGroup,
-    sourceOrder,
-    sourceDisplayName,
+    referenceCount,
+    importerFileCount,
   })), [
     {
       name: 'AlphaScript',
       sourceOrigin: 'imported-script-member',
-      sourceGroup: 'app:imported-script-members',
-      sourceOrder: 0,
-      sourceDisplayName: 'AlphaScript [lines: 3 | refs: 1 | importers: 1]',
+      referenceCount: 1,
+      importerFileCount: 1,
     },
     {
       name: 'OmegaScript',
       sourceOrigin: 'imported-script-member',
-      sourceGroup: 'app:imported-script-members',
-      sourceOrder: 1,
-      sourceDisplayName: 'OmegaScript [lines: 3 | refs: 1 | importers: 1]',
+      referenceCount: 1,
+      importerFileCount: 1,
     },
     {
       name: 'View',
       sourceOrigin: 'current-file-declaration',
-      sourceGroup: 'app:current-file-declarations',
-      sourceOrder: 0,
-      sourceDisplayName: 'View() [lines: 3 | refs: 0 | importers: 0]',
+      referenceCount: 0,
+      importerFileCount: 0,
     },
   ]);
   assert.ok(!sourcePayload.declarations.some((item) => item.name === 'MissingScript'));
-  const rendered = {};
-  const { document } = await runGeneratedViewerApp({
+  const { document, rendered } = await runGeneratedViewerWithClass({
     appJs,
     payload,
     sourcePayload,
-    renderedSvgFactory: (fakeDocument) => {
-      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
-      svg.viewBox = { baseVal: { width: 640, height: 320 } };
-      Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
-        classId: 'app',
-        memberTexts: [
-          '+AlphaScript [lines: 3 | refs: 1 | importers: 1]',
-          '+MissingScript',
-          '+OmegaScript [lines: 3 | refs: 1 | importers: 1]',
-          '+View() [lines: 3 | refs: 0 | importers: 0]',
-        ],
-      }));
-      svg.appendChild(rendered.classGroup);
-      return svg;
+    classOptions: {
+      classId: 'app',
+      memberTexts: [
+        '+AlphaScript [lines: 3 | refs: 1 | importers: 1]',
+        '+MissingScript',
+        '+OmegaScript [lines: 3 | refs: 1 | importers: 1]',
+        '+View() [lines: 3 | refs: 0 | importers: 0]',
+      ],
     },
   });
 
@@ -984,65 +959,51 @@ test('generated viewer navigates current-file source without crossing into impor
       '}',
     ].join('\n'),
   });
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-current-nav-'));
-  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
-
-  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
-  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
-  const sourcePayload = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
+  const { appJs, payload, sourcePayload } = await generateTestSite({
+    rootDir,
+    prefix: 'ironglancer-static-current-nav-',
+  });
   assert.deepEqual(sourcePayload.declarations.map(({
     name,
     sourceOrigin,
-    sourceGroup,
-    sourceOrder,
-    sourceDisplayName,
+    referenceCount,
+    importerFileCount,
   }) => ({
     name,
     sourceOrigin,
-    sourceGroup,
-    sourceOrder,
-    sourceDisplayName,
+    referenceCount,
+    importerFileCount,
   })), [
     {
       name: 'AlphaScript',
       sourceOrigin: 'imported-script-member',
-      sourceGroup: 'app:imported-script-members',
-      sourceOrder: 0,
-      sourceDisplayName: 'AlphaScript [lines: 3 | refs: 2 | importers: 1]',
+      referenceCount: 2,
+      importerFileCount: 1,
     },
     {
       name: 'AlphaView',
       sourceOrigin: 'current-file-declaration',
-      sourceGroup: 'app:current-file-declarations',
-      sourceOrder: 0,
-      sourceDisplayName: 'AlphaView() [lines: 3 | refs: 0 | importers: 0]',
+      referenceCount: 0,
+      importerFileCount: 0,
     },
     {
       name: 'OmegaView',
       sourceOrigin: 'current-file-declaration',
-      sourceGroup: 'app:current-file-declarations',
-      sourceOrder: 1,
-      sourceDisplayName: 'OmegaView() [lines: 3 | refs: 0 | importers: 0]',
+      referenceCount: 0,
+      importerFileCount: 0,
     },
   ]);
-  const rendered = {};
-  const { document } = await runGeneratedViewerApp({
+  const { document, rendered } = await runGeneratedViewerWithClass({
     appJs,
     payload,
     sourcePayload,
-    renderedSvgFactory: (fakeDocument) => {
-      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
-      svg.viewBox = { baseVal: { width: 640, height: 320 } };
-      Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
-        classId: 'app',
-        memberTexts: [
-          '+AlphaScript [lines: 3 | refs: 1 | importers: 1]',
-          '+AlphaView() [lines: 3 | refs: 0 | importers: 0]',
-          '+OmegaView() [lines: 3 | refs: 0 | importers: 0]',
-        ],
-      }));
-      svg.appendChild(rendered.classGroup);
-      return svg;
+    classOptions: {
+      classId: 'app',
+      memberTexts: [
+        '+AlphaScript [lines: 3 | refs: 1 | importers: 1]',
+        '+AlphaView() [lines: 3 | refs: 0 | importers: 0]',
+        '+OmegaView() [lines: 3 | refs: 0 | importers: 0]',
+      ],
     },
   });
 
@@ -1088,30 +1049,21 @@ test('generated viewer supports source dialog keyboard navigation and restores t
       '}',
     ].join('\n'),
   });
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-dialog-a11y-'));
-  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
-
-  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
-  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
-  const sourcePayload = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
-  const rendered = {};
-  const { document } = await runGeneratedViewerApp({
+  const { appJs, payload, sourcePayload } = await generateTestSite({
+    rootDir,
+    prefix: 'ironglancer-static-dialog-a11y-',
+  });
+  const { document, rendered } = await runGeneratedViewerWithClass({
     appJs,
     payload,
     sourcePayload,
-    renderedSvgFactory: (fakeDocument) => {
-      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
-      svg.viewBox = { baseVal: { width: 640, height: 320 } };
-      Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
-        classId: 'app',
-        memberTexts: [
-          '+AlphaScript [lines: 3 | refs: 1 | importers: 1]',
-          '+OmegaScript [lines: 3 | refs: 1 | importers: 1]',
-          '+View() [lines: 3 | refs: 0 | importers: 0]',
-        ],
-      }));
-      svg.appendChild(rendered.classGroup);
-      return svg;
+    classOptions: {
+      classId: 'app',
+      memberTexts: [
+        '+AlphaScript [lines: 3 | refs: 1 | importers: 1]',
+        '+OmegaScript [lines: 3 | refs: 1 | importers: 1]',
+        '+View() [lines: 3 | refs: 0 | importers: 0]',
+      ],
     },
   });
 
@@ -1143,27 +1095,18 @@ test('generated viewer supports source dialog keyboard navigation and restores t
 
 test('generated viewer resolves source members from Mermaid class id variants', async () => {
   const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-source-id-'));
-  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
-
-  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
-  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
-  const sourcePayload = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
-  const rendered = {};
-  const { document } = await runGeneratedViewerApp({
+  const { appJs, payload, sourcePayload } = await generateTestSite({
+    rootDir,
+    prefix: 'ironglancer-static-source-id-',
+  });
+  const { document, rendered } = await runGeneratedViewerWithClass({
     appJs,
     payload,
     sourcePayload,
-    renderedSvgFactory: (fakeDocument) => {
-      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
-      svg.viewBox = { baseVal: { width: 640, height: 320 } };
-      Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
-        classId: 'app',
-        classGroupId: 'classId-app',
-        memberText: '+App() [lines: 16 | refs: 0 | importers: 0]',
-      }));
-      svg.appendChild(rendered.classGroup);
-      return svg;
+    classOptions: {
+      classId: 'app',
+      classGroupId: 'classId-app',
+      memberText: '+App() [lines: 16 | refs: 0 | importers: 0]',
     },
   });
 
@@ -1174,27 +1117,18 @@ test('generated viewer resolves source members from Mermaid class id variants', 
 
 test('generated viewer adds non-scaling source member hit targets without duplicate semantics', async () => {
   const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-source-hit-target-'));
-  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
-
-  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
-  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
-  const sourcePayload = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
-  const rendered = {};
-  const { document } = await runGeneratedViewerApp({
+  const { appJs, payload, sourcePayload } = await generateTestSite({
+    rootDir,
+    prefix: 'ironglancer-static-source-hit-target-',
+  });
+  const { document, rendered } = await runGeneratedViewerWithClass({
     appJs,
     payload,
     sourcePayload,
-    renderedSvgFactory: (fakeDocument) => {
-      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
-      svg.viewBox = { baseVal: { width: 640, height: 320 } };
-      Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
-        classId: 'app',
-        memberText: '+App() [lines: 16 | refs: 0 | importers: 0]',
-        memberBox: { x: 96, y: 144, width: 124, height: 18 },
-      }));
-      svg.appendChild(rendered.classGroup);
-      return svg;
+    classOptions: {
+      classId: 'app',
+      memberText: '+App() [lines: 16 | refs: 0 | importers: 0]',
+      memberBox: { x: 96, y: 144, width: 124, height: 18 },
     },
   });
 
@@ -1240,29 +1174,20 @@ test('generated viewer resolves overlapping source hit targets to the visible or
       '}',
     ].join('\n'),
   });
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-overlap-source-'));
-  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
-
-  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
-  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
-  const sourcePayload = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
-  const rendered = {};
-  const { document } = await runGeneratedViewerApp({
+  const { appJs, payload, sourcePayload } = await generateTestSite({
+    rootDir,
+    prefix: 'ironglancer-static-overlap-source-',
+  });
+  const { document, rendered } = await runGeneratedViewerWithClass({
     appJs,
     payload,
     sourcePayload,
-    renderedSvgFactory: (fakeDocument) => {
-      const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
-      svg.viewBox = { baseVal: { width: 640, height: 320 } };
-      Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
-        classId: 'app',
-        memberTexts: [
-          '+CreatorShell() [lines: 3 | refs: 0 | importers: 0]',
-          '+CreatorLogin() [lines: 3 | refs: 0 | importers: 0]',
-        ],
-      }));
-      svg.appendChild(rendered.classGroup);
-      return svg;
+    classOptions: {
+      classId: 'app',
+      memberTexts: [
+        '+CreatorShell() [lines: 3 | refs: 0 | importers: 0]',
+        '+CreatorLogin() [lines: 3 | refs: 0 | importers: 0]',
+      ],
     },
   });
 
@@ -1324,32 +1249,22 @@ test('generated viewer resolves overlapping source hit targets to the visible or
 
 test('generated viewer disables source popups for mismatched or unavailable source payloads', async () => {
   const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-source-identity-'));
-  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
-
-  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
-  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
-  const sourcePayload = JSON.parse(await fs.readFile(path.join(outDir, 'source-code.json'), 'utf8'));
+  const { appJs, payload, sourcePayload } = await generateTestSite({
+    rootDir,
+    prefix: 'ironglancer-static-source-identity-',
+  });
 
   async function renderSourceMember(sourceOptions) {
-    const rendered = {};
-    const harness = await runGeneratedViewerApp({
+    return runGeneratedViewerWithClass({
       appJs,
       payload,
       sourcePayload,
       ...sourceOptions,
-      renderedSvgFactory: (fakeDocument) => {
-        const svg = fakeDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
-        svg.viewBox = { baseVal: { width: 640, height: 320 } };
-        Object.assign(rendered, createFakeMermaidClass(fakeDocument, {
-          classId: 'app',
-          memberText: '+App() [lines: 16 | refs: 0 | importers: 0]',
-        }));
-        svg.appendChild(rendered.classGroup);
-        return svg;
+      classOptions: {
+        classId: 'app',
+        memberText: '+App() [lines: 16 | refs: 0 | importers: 0]',
       },
     });
-    return { ...harness, rendered };
   }
 
   const matching = await renderSourceMember({});
@@ -1384,17 +1299,13 @@ test('generated viewer disables source popups for mismatched or unavailable sour
 });
 
 test('generated viewer copy controls copy raw output values and report success', async () => {
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-copy-'));
-  await generateStaticSite({ rootDir: fixtureRoot, entry: 'src/app.jsx', outDir });
+  const { html, appJs, payload } = await generateTestSite({ prefix: 'ironglancer-static-copy-' });
 
-  const html = await fs.readFile(path.join(outDir, 'index.html'), 'utf8');
   assert.match(html, />Copy JSX tree</);
   assert.match(html, />Copy Mermaid source</);
   assert.match(html, /id="copy-jsx-tree-status"[^>]*role="status"[^>]*aria-live="polite"/);
   assert.match(html, /id="copy-mermaid-source-status"[^>]*role="status"[^>]*aria-live="polite"/);
 
-  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
-  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
   const copiedTexts = [];
   const { document } = await runGeneratedViewerApp({
     appJs,
@@ -1419,11 +1330,7 @@ test('generated viewer copy controls copy raw output values and report success',
 });
 
 test('generated viewer copy controls fall back and report copy failure', async () => {
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-copy-fallback-'));
-  await generateStaticSite({ rootDir: fixtureRoot, entry: 'src/app.jsx', outDir });
-
-  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
-  const payload = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
+  const { appJs, payload } = await generateTestSite({ prefix: 'ironglancer-static-copy-fallback-' });
   const fallbackTexts = [];
   const fallbackHarness = await runGeneratedViewerApp({
     appJs,
@@ -1457,12 +1364,12 @@ test('generated viewer copy controls fall back and report copy failure', async (
 
 test('generated viewer activates edge hit targets and formats counted inline labels', async () => {
   const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-edge-imports-'));
-  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
-
-  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
+  const { appJs, payload: basePayload } = await generateTestSite({
+    rootDir,
+    prefix: 'ironglancer-static-edge-imports-',
+  });
   const payload = {
-    ...JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8')),
+    ...basePayload,
     importEdges: [
       {
         source: 'app',
@@ -1577,12 +1484,12 @@ test('generated viewer activates edge hit targets and formats counted inline lab
 
 test('generated viewer keeps edge pointerdown from starting viewport drag', async () => {
   const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-static-edge-pointer-'));
-  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
-
-  const appJs = await fs.readFile(path.join(outDir, 'app.js'), 'utf8');
+  const { appJs, payload: basePayload } = await generateTestSite({
+    rootDir,
+    prefix: 'ironglancer-static-edge-pointer-',
+  });
   const payload = {
-    ...JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8')),
+    ...basePayload,
     importEdges: [
       {
         source: 'app',

@@ -44,11 +44,12 @@ let sourceDeclarationLookup = emptySourceDeclarationLookup();
 let sourceDialogState = { declaration: null, group: [], index: -1 };
 let sourceDialogRestoreFocusEl = null;
 const svgNamespace = 'http://www.w3.org/2000/svg';
+const sourceMetricsSuffixPattern = /\s+\[lines:\s*\d+\s*\|\s*refs:\s*\d+\s*\|\s*importers:\s*\d+\]\s*$/i;
 let sourceMemberTargetCounter = 0;
 let sourceMemberTargets = new Map();
 
 function emptySourceDeclarationLookup() {
-  return { byDisplay: new Map(), byName: new Map(), groups: new Map() };
+  return { byName: new Map(), groups: new Map() };
 }
 
 function statCard(label, value) {
@@ -223,61 +224,42 @@ function sourceKey(moduleId, name) {
   return moduleId + '\u0000' + name;
 }
 
-function sourceDisplayKey(moduleId, displayName) {
-  return moduleId + '\u0000display\u0000' + displayName;
-}
-
-function sourceDisplayName(labelText) {
+function sourceLabelBase(labelText) {
   return (typeof labelText === 'string' ? labelText : '')
     .replace(/\s+/g, ' ')
     .trim()
     .replace(/^\\?[+#~-]\s*/, '')
+    .replace(sourceMetricsSuffixPattern, '')
+    .replace(/^\d+\s+/, '')
+    .replace(/\s+:\s*$/, '')
     .trim();
 }
 
-function sourceMetricsSuffixPattern() {
-  return /\s+\[lines:\s*\d+\s*\|\s*refs:\s*\d+\s*\|\s*importers:\s*\d+\]\s*$/i;
-}
-
-function validSourceNavigation(declaration) {
-  return typeof declaration?.sourceGroup === 'string'
-    && declaration.sourceGroup.trim()
-    && Number.isInteger(declaration.sourceOrder);
+function sourceNavigationGroup(declaration) {
+  const moduleId = typeof declaration?.moduleId === 'string' ? declaration.moduleId : '';
+  const sourceOrigin = typeof declaration?.sourceOrigin === 'string' ? declaration.sourceOrigin : '';
+  return moduleId && sourceOrigin ? sourceKey(moduleId, sourceOrigin) : '';
 }
 
 function sourceDeclarationLookupFromPayload(sourcePayload = {}) {
-  const byDisplay = new Map();
   const byName = new Map();
-  const groupBuckets = new Map();
+  const groups = new Map();
   for (const declaration of Array.isArray(sourcePayload?.declarations) ? sourcePayload.declarations : []) {
     const moduleId = typeof declaration.moduleId === 'string' ? declaration.moduleId : '';
     const name = typeof declaration.name === 'string' ? declaration.name : '';
-    const displayName = typeof declaration.sourceDisplayName === 'string' ? declaration.sourceDisplayName.trim() : '';
-    if (moduleId && displayName) byDisplay.set(sourceDisplayKey(moduleId, displayName), declaration);
     if (moduleId && name && !byName.has(sourceKey(moduleId, name))) byName.set(sourceKey(moduleId, name), declaration);
-    if (!validSourceNavigation(declaration)) continue;
-    if (!groupBuckets.has(declaration.sourceGroup)) groupBuckets.set(declaration.sourceGroup, []);
-    groupBuckets.get(declaration.sourceGroup).push(declaration);
+    const group = sourceNavigationGroup(declaration);
+    if (!group) continue;
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group).push(declaration);
   }
-  const groups = new Map();
-  for (const [sourceGroup, declarations] of groupBuckets) {
-    groups.set(sourceGroup, declarations.sort((a, b) => a.sourceOrder - b.sourceOrder
-      || String(a.name || '').localeCompare(String(b.name || ''))));
-  }
-  return { byDisplay, byName, groups };
+  return { byName, groups };
 }
 
 function sourcePayloadMatchesOutput(payload = {}, sourcePayload = {}) {
   const outputMeta = payload && typeof payload.meta === 'object' ? payload.meta : {};
   const sourceMeta = sourcePayload && typeof sourcePayload.meta === 'object' ? sourcePayload.meta : {};
-  return Boolean(
-    outputMeta.buildId
-    && outputMeta.sourceCodeHash
-    && sourceMeta.buildId
-    && sourceMeta.sourceCodeHash
-    && outputMeta.buildId === sourceMeta.buildId
-    && outputMeta.sourceCodeHash === sourceMeta.sourceCodeHash
-  );
+  return ['buildId', 'sourceCodeHash'].every((key) => outputMeta[key] && outputMeta[key] === sourceMeta[key]);
 }
 
 async function loadSourceDeclarationMap(payload) {
@@ -295,10 +277,7 @@ async function loadSourceDeclarationMap(payload) {
 }
 
 function sourceMemberName(label) {
-  let text = (typeof label === 'string' ? label : '').replace(/\s+/g, ' ').trim();
-  text = text.replace(/^\\?[+#~-]\s*/, '');
-  text = text.replace(sourceMetricsSuffixPattern(), '');
-  text = text.replace(/^\d+\s+/, '');
+  let text = sourceLabelBase(label);
   const parametersIndex = text.indexOf('(');
   if (parametersIndex !== -1) text = text.slice(0, parametersIndex);
   return text.trim();
@@ -332,16 +311,11 @@ function sourceModuleIdCandidatesFromElement(element) {
 
 function sourceDeclarationForLabel(label) {
   const name = sourceMemberName(label.textContent);
-  const displayName = sourceDisplayName(label.textContent);
-  if (!name && !displayName) return null;
+  if (!name) return null;
   let current = label;
   let fallbackDeclaration = null;
   while (current && current !== activeSvg) {
     for (const moduleId of sourceModuleIdCandidatesFromElement(current)) {
-      if (displayName) {
-        const declaration = sourceDeclarationLookup.byDisplay.get(sourceDisplayKey(moduleId, displayName));
-        if (declaration) return declaration;
-      }
       if (name && !fallbackDeclaration) {
         fallbackDeclaration = sourceDeclarationLookup.byName.get(sourceKey(moduleId, name)) || null;
       }
@@ -368,8 +342,7 @@ function sourceMemberBaseText(labelText, declaration) {
   const raw = typeof labelText === 'string' ? labelText : '';
   const prefixMatch = raw.match(/^\s*(\\?[+#~-])\s*/);
   const prefix = prefixMatch ? prefixMatch[1] : '';
-  const displayName = String(declaration?.sourceDisplayName || '').replace(sourceMetricsSuffixPattern(), '').trim()
-    || sourceDisplayName(raw).replace(sourceMetricsSuffixPattern(), '').replace(/\s+:\s*$/, '').trim()
+  const displayName = sourceLabelBase(raw)
     || String(declaration?.name || '').trim();
   return prefix + displayName;
 }
@@ -585,9 +558,7 @@ function addSourceHitTarget(record, activate) {
 }
 
 function sourceDialogNavigationForDeclaration(declaration) {
-  const group = validSourceNavigation(declaration)
-    ? (sourceDeclarationLookup.groups.get(declaration.sourceGroup) || [])
-    : [];
+  const group = sourceDeclarationLookup.groups.get(sourceNavigationGroup(declaration)) || [];
   const index = group.indexOf(declaration);
   return { group, index };
 }
@@ -659,6 +630,15 @@ function closeSourceDialog() {
   if (restoreFocusEl && typeof restoreFocusEl.focus === 'function') restoreFocusEl.focus();
 }
 
+function addKeyboardActivation(element, callback) {
+  element.addEventListener('click', callback);
+  element.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    callback(event);
+  });
+}
+
 function addSourceActivation(element, declaration) {
   const record = {
     id: String(++sourceMemberTargetCounter),
@@ -682,12 +662,7 @@ function addSourceActivation(element, declaration) {
     const activationRecord = sourceActivationRecordForEvent(event, record) || record;
     showSourceDialog(activationRecord.declaration, activationRecord.element || element);
   };
-  element.addEventListener('click', activate);
-  element.addEventListener('keydown', (event) => {
-    if (event.key !== 'Enter' && event.key !== ' ') return;
-    event.preventDefault();
-    activate(event);
-  });
+  addKeyboardActivation(element, activate);
   addSourceHitTarget(record, activate);
 }
 
@@ -695,7 +670,7 @@ function wireSourceMembers() {
   if (
     !activeSvg
     || typeof activeSvg.querySelectorAll !== 'function'
-    || (sourceDeclarationLookup.byDisplay.size === 0 && sourceDeclarationLookup.byName.size === 0)
+    || sourceDeclarationLookup.byName.size === 0
   ) return;
   sourceMemberTargetCounter = 0;
   sourceMemberTargets = new Map();
@@ -822,12 +797,7 @@ function expandEdgeLabel(edge, path, label, labelGroup) {
 function addEdgeActivation(element, callback) {
   element.setAttribute('tabindex', '0');
   element.setAttribute('role', 'button');
-  element.addEventListener('click', callback);
-  element.addEventListener('keydown', (event) => {
-    if (event.key !== 'Enter' && event.key !== ' ') return;
-    event.preventDefault();
-    callback(event);
-  });
+  addKeyboardActivation(element, callback);
 }
 
 function isEdgePointerTarget(target) {

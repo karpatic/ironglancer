@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { extractComponents, extractDeclarationSpans, extractImportRefs } from '../src/lib/import-parser.js';
+import { extractDeclarationSpans, extractImportRefs } from '../src/lib/import-parser.js';
 
 test('extractImportRefs classifies dynamic, lazy, and require refs without dead duplicates', () => {
   const source = [
@@ -301,14 +301,4 @@ test('extractDeclarationSpans measures multiline arrow expression bodies', () =>
       lineCount: 5,
     },
   ]);
-});
-
-test('extractComponents keeps returning sorted component names', () => {
-  const source = [
-    'const Beta = () => null;',
-    'function Alpha() { return null; }',
-    'function helper() { return null; }',
-  ].join('\n');
-
-  assert.deepEqual(extractComponents(source), ['Alpha', 'Beta']);
 });

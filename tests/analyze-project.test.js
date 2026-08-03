@@ -306,10 +306,6 @@ test('analyzeProject distinguishes usage references from distinct importer files
   assert.equal(formatOne.declarationName, 'FormatThing');
   assert.equal(formatOne.referenceCount, 2);
   assert.equal(formatOne.importerFileCount, 1);
-  assert.equal(
-    formatOne.sourceDisplayName,
-    'FormatOne [lines: 3 | refs: 2 | importers: 1]',
-  );
   assert.match(result.mermaid, /\+FormatOne \[lines: 3 \| refs: 2 \| importers: 1\]/);
 });
 

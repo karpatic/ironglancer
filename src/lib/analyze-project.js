@@ -3,7 +3,6 @@ import path from 'node:path';
 
 import {
   countIdentifierReferences,
-  extractComponents,
   extractDeclarationSpans,
   extractImportRefs,
 } from './import-parser.js';
@@ -70,17 +69,8 @@ function parseRouteAliasString(value) {
 }
 
 function routeAliasEntries(routeAliases) {
-  if (!routeAliases) return [];
-  if (routeAliases instanceof Map) {
-    return Array.from(routeAliases, ([from, to]) => ({ from, to }));
-  }
-  if (Array.isArray(routeAliases)) return routeAliases;
-  if (typeof routeAliases === 'string') return [parseRouteAliasString(routeAliases)];
-  if (typeof routeAliases === 'object') {
-    if ('from' in routeAliases || 'to' in routeAliases) return [routeAliases];
-    return Object.entries(routeAliases).map(([from, to]) => ({ from, to }));
-  }
-  throw new Error('routeAliases must be an array, object, Map, or route=path string.');
+  const entries = Array.isArray(routeAliases) ? routeAliases : [routeAliases].filter(Boolean);
+  return entries.map((entry) => (typeof entry === 'string' ? parseRouteAliasString(entry) : entry));
 }
 
 function normalizeRouteAliasFrom(value) {
@@ -100,9 +90,8 @@ function normalizeRouteAliasTarget(value) {
 export function normalizeRouteAliases(routeAliases = []) {
   return routeAliasEntries(routeAliases)
     .map((entry, index) => {
-      const source = typeof entry === 'string' ? parseRouteAliasString(entry) : entry;
-      const from = normalizeRouteAliasFrom(Array.isArray(source) ? source[0] : source?.from);
-      const targetSource = Array.isArray(source) ? source[1] : source?.to;
+      const from = normalizeRouteAliasFrom(Array.isArray(entry) ? entry[0] : entry?.from);
+      const targetSource = Array.isArray(entry) ? entry[1] : entry?.to;
       const to = normalizeRouteAliasTarget(targetSource);
       if (!from || normalizeString(targetSource).trim() === '') {
         throw new Error('Route aliases must include a non-empty route and target path.');
@@ -220,6 +209,11 @@ function declarationSpansByName(record) {
   return spans;
 }
 
+function componentSpans(record) {
+  return Array.from(declarationSpansByName(record))
+    .filter(([name]) => /^[A-Z]/.test(name));
+}
+
 function declarationLineCount(record, name) {
   const span = declarationSpansByName(record).get(normalizeString(name).trim());
   return Number.isInteger(span?.lineCount) && span.lineCount > 0 ? span.lineCount : null;
@@ -253,11 +247,18 @@ function declarationSnippet(record, span) {
   return lines.slice(span.startLine - 1, span.endLine).join('\n');
 }
 
-function sourceDeclarationEntry({ moduleId, visibleName, record, span, declarationName = visibleName, sourceMetadata = {} }) {
+function sourceDeclarationEntry({
+  moduleId,
+  visibleName,
+  record,
+  span,
+  declarationName = visibleName,
+  sourceOrigin,
+  metrics = emptyDeclarationImportMetrics(),
+}) {
   const code = declarationSnippet(record, span);
   if (!moduleId || !visibleName || !record?.rel || !code) return null;
   return {
-    key: `${moduleId}\u0000${visibleName}`,
     moduleId,
     modulePath: record.rel,
     name: visibleName,
@@ -266,30 +267,10 @@ function sourceDeclarationEntry({ moduleId, visibleName, record, span, declarati
     startLine: span.startLine,
     endLine: span.endLine,
     code,
-    ...sourceMetadata,
+    sourceOrigin,
+    referenceCount: metrics.referenceCount,
+    importerFileCount: metrics.importerFileCount,
   };
-}
-
-function sourceDeclarationEntryWithMetadata(entry, sourceMetadata = {}) {
-  if (!entry) return null;
-  const sourceOrigin = typeof sourceMetadata.sourceOrigin === 'string' && sourceMetadata.sourceOrigin
-    ? sourceMetadata.sourceOrigin
-    : 'source';
-  return {
-    ...entry,
-    key: `${entry.moduleId}\u0000${sourceOrigin}\u0000${entry.name}`,
-    ...sourceMetadata,
-  };
-}
-
-function declarationEntryLineCount(entry) {
-  const startLine = Number.isInteger(entry?.startLine) ? entry.startLine : null;
-  const endLine = Number.isInteger(entry?.endLine) ? entry.endLine : null;
-  return startLine && endLine && endLine >= startLine ? endLine - startLine + 1 : null;
-}
-
-function sourceNavigationGroup(moduleId, origin) {
-  return `${moduleId}:${origin}`;
 }
 
 function emptyDeclarationImportMetrics() {
@@ -371,28 +352,6 @@ function memberMetricLabel(label, lineCount, metrics = emptyDeclarationImportMet
   return `${label} [lines: ${lineCount} | refs: ${referenceCount} | importers: ${importerFileCount}]`;
 }
 
-function importedScriptSourceMetadata(moduleId, entry, sourceOrder, metrics) {
-  return {
-    sourceOrigin: 'imported-script-member',
-    sourceGroup: sourceNavigationGroup(moduleId, 'imported-script-members'),
-    sourceOrder,
-    referenceCount: metrics.referenceCount,
-    importerFileCount: metrics.importerFileCount,
-    sourceDisplayName: memberMetricLabel(entry.name, declarationEntryLineCount(entry), metrics),
-  };
-}
-
-function currentFileSourceMetadata(moduleId, entry, sourceOrder, metrics) {
-  return {
-    sourceOrigin: 'current-file-declaration',
-    sourceGroup: sourceNavigationGroup(moduleId, 'current-file-declarations'),
-    sourceOrder,
-    referenceCount: metrics.referenceCount,
-    importerFileCount: metrics.importerFileCount,
-    sourceDisplayName: memberMetricLabel(`${entry.name}()`, declarationEntryLineCount(entry), metrics),
-  };
-}
-
 function mermaidClassLabel(record) {
   return `${record.stats.lineCount} ${path.posix.basename(record.rel)}`;
 }
@@ -426,6 +385,12 @@ function isJsxModule(rel) {
   return /\.(?:jsx)$/i.test(rel);
 }
 
+function jsxModuleRecords(graph) {
+  return Array.from(graph.modules.values())
+    .filter((record) => isJsxModule(record.rel))
+    .sort((a, b) => compareLocale(a.rel, b.rel));
+}
+
 function buildClassIds(records) {
   const baseCounts = new Map();
   const ids = new Map();
@@ -447,8 +412,8 @@ function importedScriptVariableName(ref) {
   return normalizeString(binding?.local).trim();
 }
 
-function importedScriptMembersForJsx(record, graph, declarationImportMetrics) {
-  const members = new Map();
+function importedScriptCandidatesForJsx(record, graph, declarationImportMetrics) {
+  const candidates = [];
   for (const ref of Array.isArray(record.importRefs) ? record.importRefs : []) {
     if (ref?.localRel && isJsxModule(ref.localRel)) continue;
     if (isIgnoredExternalLabel(ref?.specifier)) continue;
@@ -459,8 +424,22 @@ function importedScriptMembersForJsx(record, graph, declarationImportMetrics) {
     const binding = (Array.isArray(ref.bindings) ? ref.bindings : [])
       .find((candidate) => candidate.local === name);
     const declarationName = importBindingDeclarationName(targetRecord, binding) || name;
-    const lineCount = declarationLineCount(targetRecord, declarationName);
-    const metrics = declarationImportMetricsFor(declarationImportMetrics, targetRecord, declarationName);
+    candidates.push({
+      name,
+      targetRecord,
+      binding,
+      declarationName,
+      lineCount: declarationLineCount(targetRecord, declarationName),
+      metrics: declarationImportMetricsFor(declarationImportMetrics, targetRecord, declarationName),
+    });
+  }
+  return candidates.sort((a, b) => compareLocale(a.name, b.name));
+}
+
+function importedScriptMembersForJsx(record, graph, declarationImportMetrics) {
+  const members = new Map();
+  for (const candidate of importedScriptCandidatesForJsx(record, graph, declarationImportMetrics)) {
+    const { name, lineCount, metrics } = candidate;
     const existing = members.get(name);
     if (!existing || (!existing.lineCount && lineCount)) {
       members.set(name, { name, lineCount, metrics });
@@ -471,19 +450,10 @@ function importedScriptMembersForJsx(record, graph, declarationImportMetrics) {
 
 function importedScriptSourceDeclarationsForJsx(record, graph, moduleId, declarationImportMetrics) {
   const declarations = new Map();
-  for (const ref of Array.isArray(record.importRefs) ? record.importRefs : []) {
-    if (!ref?.localRel || isJsxModule(ref.localRel)) continue;
-    if (isIgnoredExternalLabel(ref?.specifier)) continue;
-    const name = importedScriptVariableName(ref);
-    if (name === 'React') continue;
-    if (!name) continue;
-
-    const targetRecord = graph.modules.get(ref.localRel);
-    const binding = (Array.isArray(ref.bindings) ? ref.bindings : [])
-      .find((candidate) => candidate.local === name);
+  for (const candidate of importedScriptCandidatesForJsx(record, graph, declarationImportMetrics)) {
+    const { name, targetRecord, binding, declarationName, metrics } = candidate;
     if (!targetRecord || binding?.kind === 'namespace') continue;
 
-    const declarationName = importBindingDeclarationName(targetRecord, binding) || name;
     const span = declarationSpansByName(targetRecord).get(declarationName);
     const entry = sourceDeclarationEntry({
       moduleId,
@@ -491,33 +461,13 @@ function importedScriptSourceDeclarationsForJsx(record, graph, moduleId, declara
       record: targetRecord,
       span,
       declarationName,
+      sourceOrigin: 'imported-script-member',
+      metrics,
     });
     if (entry && !declarations.has(entry.name)) declarations.set(entry.name, entry);
   }
   return Array.from(declarations.values())
-    .sort((a, b) => compareLocale(a.name, b.name))
-    .map((entry, sourceOrder) => sourceDeclarationEntryWithMetadata(
-      entry,
-      importedScriptSourceMetadata(
-        moduleId,
-        entry,
-        sourceOrder,
-        declarationImportMetricsFor(declarationImportMetrics, graph.modules.get(entry.modulePath), entry.declarationName),
-      ),
-    ));
-}
-
-function normalizeImportEdgeBinding(binding) {
-  const imported = normalizeString(binding?.imported).trim();
-  const local = normalizeString(binding?.local).trim();
-  const kind = normalizeString(binding?.kind || 'named').trim() || 'named';
-  if (!imported || !local) return null;
-  return {
-    imported,
-    local,
-    kind,
-    inferred: Boolean(binding?.inferred),
-  };
+    .sort((a, b) => compareLocale(a.name, b.name));
 }
 
 function importKindRank(kind) {
@@ -546,9 +496,7 @@ function edgeRestingLabel(loadKinds) {
 }
 
 function buildImportEdges(graph) {
-  const jsxModules = Array.from(graph.modules.values())
-    .filter((record) => isJsxModule(record.rel))
-    .sort((a, b) => compareLocale(a.rel, b.rel));
+  const jsxModules = jsxModuleRecords(graph);
   const classIds = buildClassIds(jsxModules);
   const edgeMap = new Map();
 
@@ -574,11 +522,10 @@ function buildImportEdges(graph) {
       const loadKind = normalizeString(ref.kind).trim();
       if (loadKind) edge.loadKinds.add(loadKind);
       for (const binding of Array.isArray(ref.bindings) ? ref.bindings : []) {
-        const normalized = normalizeImportEdgeBinding(binding);
-        if (!normalized) continue;
-        const lineCount = importBindingLineCount(graph, ref.localRel, normalized);
-        const enriched = lineCount ? { ...normalized, lineCount } : normalized;
-        const bindingKey = `${normalized.kind}\u0000${normalized.imported}\u0000${normalized.local}\u0000${normalized.inferred}`;
+        if (!binding?.imported || !binding?.local) continue;
+        const lineCount = importBindingLineCount(graph, ref.localRel, binding);
+        const enriched = lineCount ? { ...binding, lineCount } : binding;
+        const bindingKey = `${binding.kind}\u0000${binding.imported}\u0000${binding.local}\u0000${binding.inferred}`;
         edge.imports.set(bindingKey, enriched);
       }
     }
@@ -601,9 +548,7 @@ function buildImportEdges(graph) {
 }
 
 function buildMermaid(graph, importEdges, declarationImportMetrics) {
-  const jsxModules = Array.from(graph.modules.values())
-    .filter((record) => isJsxModule(record.rel))
-    .sort((a, b) => compareLocale(a.rel, b.rel));
+  const jsxModules = jsxModuleRecords(graph);
   const classIds = buildClassIds(jsxModules);
   const lines = ['classDiagram'];
   if (jsxModules.length === 0) {
@@ -613,7 +558,7 @@ function buildMermaid(graph, importEdges, declarationImportMetrics) {
   for (const record of jsxModules) {
     const classId = classIds.get(record.rel);
     const variables = importedScriptMembersForJsx(record, graph, declarationImportMetrics);
-    const components = extractComponents(record.source);
+    const components = componentSpans(record);
     if (variables.length === 0 && components.length === 0) {
       lines.push(`  ${mermaidClassHeader(record, classId)}`);
       continue;
@@ -622,7 +567,7 @@ function buildMermaid(graph, importEdges, declarationImportMetrics) {
     for (const variable of variables) {
       lines.push(`    +${memberMetricLabel(variable.name, variable.lineCount, variable.metrics)}`);
     }
-    for (const component of components) {
+    for (const [component] of components) {
       const lineCount = declarationLineCount(record, component);
       lines.push(`    +${memberMetricLabel(
         `${component}()`,
@@ -640,16 +585,15 @@ function buildMermaid(graph, importEdges, declarationImportMetrics) {
 }
 
 function buildSourceCode(graph, declarationImportMetrics) {
-  const jsxModules = Array.from(graph.modules.values())
-    .filter((record) => isJsxModule(record.rel))
-    .sort((a, b) => compareLocale(a.rel, b.rel));
+  const jsxModules = jsxModuleRecords(graph);
   const classIds = buildClassIds(jsxModules);
   const declarations = [];
   const seen = new Set();
 
   const pushEntry = (entry) => {
-    if (!entry || seen.has(entry.key)) return;
-    seen.add(entry.key);
+    const key = entry && `${entry.moduleId}\u0000${entry.sourceOrigin}\u0000${entry.name}`;
+    if (!entry || seen.has(key)) return;
+    seen.add(key);
     declarations.push(entry);
   };
 
@@ -658,24 +602,15 @@ function buildSourceCode(graph, declarationImportMetrics) {
     for (const entry of importedScriptSourceDeclarationsForJsx(record, graph, moduleId, declarationImportMetrics)) {
       pushEntry(entry);
     }
-    const spans = declarationSpansByName(record);
-    for (const [sourceOrder, component] of extractComponents(record.source).entries()) {
-      const entry = sourceDeclarationEntry({
+    for (const [component, span] of componentSpans(record)) {
+      pushEntry(sourceDeclarationEntry({
         moduleId,
         visibleName: component,
         record,
-        span: spans.get(component),
-      });
-      if (!entry) continue;
-      pushEntry(sourceDeclarationEntryWithMetadata(
-        entry,
-        currentFileSourceMetadata(
-          moduleId,
-          entry,
-          sourceOrder,
-          declarationImportMetricsFor(declarationImportMetrics, record, component),
-        ),
-      ));
+        span,
+        sourceOrigin: 'current-file-declaration',
+        metrics: declarationImportMetricsFor(declarationImportMetrics, record, component),
+      }));
     }
   }
 
