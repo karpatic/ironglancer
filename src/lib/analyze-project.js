@@ -855,6 +855,128 @@ function lexicalBlockRanges(record) {
   return ranges;
 }
 
+function canEndStatementAtIndex(text, index) {
+  const char = text[index];
+  if (/[A-Za-z0-9_$]/.test(char) || ')]}"\'`'.includes(char)) return true;
+  return (char === '+' || char === '-') && text[index - 1] === char;
+}
+
+function statementContinuationStarts(text, index) {
+  const char = text[index];
+  if (!char) return false;
+  return '([{.,?:+-*/%&|^<>=!~'.includes(char);
+}
+
+function expressionStatementEndIndex(masked, start, limit) {
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  let lastNonWhitespace = start;
+  for (let index = start; index < limit; index += 1) {
+    const char = masked[index];
+    if (!/\s/.test(char)) lastNonWhitespace = index;
+    if (char === '(') parenDepth += 1;
+    else if (char === ')') parenDepth = Math.max(0, parenDepth - 1);
+    else if (char === '[') bracketDepth += 1;
+    else if (char === ']') bracketDepth = Math.max(0, bracketDepth - 1);
+    else if (char === '{') braceDepth += 1;
+    else if (char === '}') {
+      if (braceDepth === 0 && parenDepth === 0 && bracketDepth === 0) return Math.max(start, lastNonWhitespace);
+      braceDepth = Math.max(0, braceDepth - 1);
+    } else if (char === ';' && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
+      return index + 1;
+    } else if (
+      (char === '\n' || char === '\r')
+      && parenDepth === 0
+      && bracketDepth === 0
+      && braceDepth === 0
+      && lastNonWhitespace >= start
+      && canEndStatementAtIndex(masked, lastNonWhitespace)
+    ) {
+      const nextIndex = findNextNonWhitespaceIndex(masked, index + 1);
+      if (!statementContinuationStarts(masked, nextIndex)) return lastNonWhitespace + 1;
+    }
+  }
+  return Math.min(limit, lastNonWhitespace + 1);
+}
+
+function conditionEndAfterKeyword(masked, keywordEnd, limit) {
+  const conditionStart = findNextNonWhitespaceIndex(masked, keywordEnd);
+  if (conditionStart >= limit || masked[conditionStart] !== '(') return -1;
+  return findMatchingDelimiter(masked, conditionStart, '(', ')');
+}
+
+function bracedBlockEndIndex(masked, blockStart, limit) {
+  const start = findNextNonWhitespaceIndex(masked, blockStart);
+  if (start >= limit || masked[start] !== '{') return -1;
+  const end = findMatchingBrace(masked, start);
+  return end === -1 ? -1 : end + 1;
+}
+
+function controlStatementWithConditionEnd(masked, keywordEnd, limit) {
+  const conditionEnd = conditionEndAfterKeyword(masked, keywordEnd, limit);
+  if (conditionEnd === -1) return expressionStatementEndIndex(masked, keywordEnd, limit);
+  return singleStatementEndIndex(masked, findNextNonWhitespaceIndex(masked, conditionEnd + 1), limit);
+}
+
+function ifStatementEndIndex(masked, start, limit) {
+  const conditionEnd = conditionEndAfterKeyword(masked, start + 'if'.length, limit);
+  if (conditionEnd === -1) return expressionStatementEndIndex(masked, start, limit);
+  let end = singleStatementEndIndex(masked, findNextNonWhitespaceIndex(masked, conditionEnd + 1), limit);
+  const elseIndex = findNextNonWhitespaceIndex(masked, end);
+  if (wordAt(masked, elseIndex, 'else')) {
+    end = singleStatementEndIndex(masked, findNextNonWhitespaceIndex(masked, elseIndex + 'else'.length), limit);
+  }
+  return end;
+}
+
+function tryStatementEndIndex(masked, start, limit) {
+  let end = bracedBlockEndIndex(masked, start + 'try'.length, limit);
+  if (end === -1) return expressionStatementEndIndex(masked, start, limit);
+  let nextIndex = findNextNonWhitespaceIndex(masked, end);
+  if (wordAt(masked, nextIndex, 'catch')) {
+    const conditionEnd = conditionEndAfterKeyword(masked, nextIndex + 'catch'.length, limit);
+    const catchBlockStart = conditionEnd === -1
+      ? findNextNonWhitespaceIndex(masked, nextIndex + 'catch'.length)
+      : findNextNonWhitespaceIndex(masked, conditionEnd + 1);
+    const catchEnd = bracedBlockEndIndex(masked, catchBlockStart, limit);
+    if (catchEnd !== -1) end = catchEnd;
+  }
+  nextIndex = findNextNonWhitespaceIndex(masked, end);
+  if (wordAt(masked, nextIndex, 'finally')) {
+    const finallyEnd = bracedBlockEndIndex(masked, nextIndex + 'finally'.length, limit);
+    if (finallyEnd !== -1) end = finallyEnd;
+  }
+  return end;
+}
+
+function doStatementEndIndex(masked, start, limit) {
+  const bodyStart = findNextNonWhitespaceIndex(masked, start + 'do'.length);
+  const bodyEnd = singleStatementEndIndex(masked, bodyStart, limit);
+  const whileIndex = findNextNonWhitespaceIndex(masked, bodyEnd);
+  if (!wordAt(masked, whileIndex, 'while')) return bodyEnd;
+  const conditionEnd = conditionEndAfterKeyword(masked, whileIndex + 'while'.length, limit);
+  if (conditionEnd === -1) return expressionStatementEndIndex(masked, whileIndex, limit);
+  const semicolonIndex = findNextNonWhitespaceIndex(masked, conditionEnd + 1);
+  return masked[semicolonIndex] === ';' ? semicolonIndex + 1 : conditionEnd + 1;
+}
+
+function loopHeaderBoundsAt(masked, forIndex, limit) {
+  if (!wordAt(masked, forIndex, 'for')) return null;
+  let headerStart = findNextNonWhitespaceIndex(masked, forIndex + 'for'.length);
+  if (wordAt(masked, headerStart, 'await')) {
+    headerStart = findNextNonWhitespaceIndex(masked, headerStart + 'await'.length);
+  }
+  if (headerStart >= limit || masked[headerStart] !== '(') return null;
+  const headerEnd = findMatchingDelimiter(masked, headerStart, '(', ')');
+  if (headerEnd === -1) return null;
+  return {
+    headerStartIndex: headerStart,
+    headerEndIndex: headerEnd + 1,
+    bodyStartIndex: findNextNonWhitespaceIndex(masked, headerEnd + 1),
+  };
+}
+
 function loopBodyEndIndex(masked, bodyStart, limit) {
   if (bodyStart >= limit) return limit;
   if (masked[bodyStart] === '{') {
@@ -862,7 +984,41 @@ function loopBodyEndIndex(masked, bodyStart, limit) {
     return closeIndex === -1 ? limit : closeIndex + 1;
   }
   if (masked[bodyStart] === ';') return bodyStart + 1;
-  return findStatementEnd(masked, bodyStart, limit);
+  return singleStatementEndIndex(masked, bodyStart, limit);
+}
+
+function loopEndIndexAt(masked, forIndex, limit) {
+  const bounds = loopHeaderBoundsAt(masked, forIndex, limit);
+  if (!bounds) return expressionStatementEndIndex(masked, forIndex, limit);
+  return loopBodyEndIndex(masked, bounds.bodyStartIndex, limit);
+}
+
+function singleStatementEndIndex(masked, start, limit) {
+  const statementStart = findNextNonWhitespaceIndex(masked, start);
+  if (statementStart >= limit) return limit;
+  if (masked[statementStart] === '{') {
+    const closeIndex = findMatchingBrace(masked, statementStart);
+    return closeIndex === -1 ? limit : closeIndex + 1;
+  }
+  if (masked[statementStart] === ';') return statementStart + 1;
+  if (wordAt(masked, statementStart, 'if')) return ifStatementEndIndex(masked, statementStart, limit);
+  if (wordAt(masked, statementStart, 'for')) return loopEndIndexAt(masked, statementStart, limit);
+  if (wordAt(masked, statementStart, 'while')) {
+    return controlStatementWithConditionEnd(masked, statementStart + 'while'.length, limit);
+  }
+  if (wordAt(masked, statementStart, 'with')) {
+    return controlStatementWithConditionEnd(masked, statementStart + 'with'.length, limit);
+  }
+  if (wordAt(masked, statementStart, 'switch')) {
+    const conditionEnd = conditionEndAfterKeyword(masked, statementStart + 'switch'.length, limit);
+    const blockEnd = conditionEnd === -1
+      ? -1
+      : bracedBlockEndIndex(masked, conditionEnd + 1, limit);
+    return blockEnd === -1 ? expressionStatementEndIndex(masked, statementStart, limit) : blockEnd;
+  }
+  if (wordAt(masked, statementStart, 'try')) return tryStatementEndIndex(masked, statementStart, limit);
+  if (wordAt(masked, statementStart, 'do')) return doStatementEndIndex(masked, statementStart, limit);
+  return expressionStatementEndIndex(masked, statementStart, limit);
 }
 
 function loopScopeRanges(record) {
@@ -873,19 +1029,13 @@ function loopScopeRanges(record) {
   const forPattern = /\bfor\b/g;
   let match;
   while ((match = forPattern.exec(masked))) {
-    let headerStart = findNextNonWhitespaceIndex(masked, forPattern.lastIndex);
-    if (wordAt(masked, headerStart, 'await')) {
-      headerStart = findNextNonWhitespaceIndex(masked, headerStart + 'await'.length);
-    }
-    if (masked[headerStart] !== '(') continue;
-    const headerEnd = findMatchingDelimiter(masked, headerStart, '(', ')');
-    if (headerEnd === -1) continue;
-    const bodyStart = findNextNonWhitespaceIndex(masked, headerEnd + 1);
-    const endIndex = loopBodyEndIndex(masked, bodyStart, masked.length);
+    const bounds = loopHeaderBoundsAt(masked, match.index, masked.length);
+    if (!bounds) continue;
+    const endIndex = loopBodyEndIndex(masked, bounds.bodyStartIndex, masked.length);
     ranges.push({
       startIndex: match.index,
-      headerStartIndex: headerStart,
-      headerEndIndex: headerEnd + 1,
+      headerStartIndex: bounds.headerStartIndex,
+      headerEndIndex: bounds.headerEndIndex,
       endIndex,
     });
   }
@@ -907,7 +1057,7 @@ function nearestLexicalBlockForLocation(record, location, ownerSpan) {
   )) || null;
 }
 
-function loopHeaderScopeForLocation(record, location, ownerSpan) {
+function loopHeaderRangeForLocation(record, location, ownerSpan) {
   const ownerEnd = declarationSpanExclusiveEnd(ownerSpan);
   return loopScopeRanges(record).find((range) => (
     location.index > range.headerStartIndex
@@ -917,6 +1067,10 @@ function loopHeaderScopeForLocation(record, location, ownerSpan) {
       && range.endIndex <= ownerEnd
     ))
   )) || null;
+}
+
+function loopHeaderScopeForLocation(record, location, ownerSpan) {
+  return loopHeaderRangeForLocation(record, location, ownerSpan);
 }
 
 function spanScope(span) {
@@ -945,6 +1099,28 @@ function functionScopedBindingScope(ownerSpan) {
   return spanScope(ownerSpan);
 }
 
+function loopHeaderDeclarationEnd(masked, declarationStart, headerEndIndex) {
+  const limit = Math.max(declarationStart, headerEndIndex - 1);
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  for (let index = declarationStart; index < limit; index += 1) {
+    const char = masked[index];
+    if (char === '(') parenDepth += 1;
+    else if (char === ')') parenDepth = Math.max(0, parenDepth - 1);
+    else if (char === '[') bracketDepth += 1;
+    else if (char === ']') bracketDepth = Math.max(0, bracketDepth - 1);
+    else if (char === '{') braceDepth += 1;
+    else if (char === '}') braceDepth = Math.max(0, braceDepth - 1);
+    else if (char === ';' && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) return index;
+  }
+  return limit;
+}
+
+function variableStatementEndIndex(masked, declarationStart, limit) {
+  return expressionStatementEndIndex(masked, declarationStart, limit);
+}
+
 function variableBindingLocations(record, span, identifier) {
   const masked = maskIgnorableSyntax(record?.source);
   const spanEnd = declarationSpanExclusiveEnd(span);
@@ -954,8 +1130,11 @@ function variableBindingLocations(record, span, identifier) {
   while ((match = declarationPattern.exec(masked))) {
     const keywordLocation = { index: match.index, endIndex: declarationPattern.lastIndex };
     if (!locationOwnedByDeclaration(record, span, keywordLocation)) continue;
-    const statementEnd = findStatementEnd(masked, match.index, spanEnd);
     const declarationStart = declarationPattern.lastIndex;
+    const loopHeader = loopHeaderRangeForLocation(record, keywordLocation, span);
+    const statementEnd = loopHeader
+      ? loopHeaderDeclarationEnd(masked, declarationStart, loopHeader.headerEndIndex)
+      : variableStatementEndIndex(masked, match.index, spanEnd);
     const declarationText = masked.slice(declarationStart, statementEnd);
     for (const part of splitTopLevel(declarationText)) {
       const declaratorStart = declarationStart + part.startIndex;
