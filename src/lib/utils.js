@@ -33,9 +33,11 @@ export function extensionCandidates(relativePath) {
     `${normalized}.js`,
     `${normalized}.jsx`,
     `${normalized}.mjs`,
+    `${normalized}.cjs`,
     path.posix.join(normalized, 'index.js'),
     path.posix.join(normalized, 'index.jsx'),
     path.posix.join(normalized, 'index.mjs'),
+    path.posix.join(normalized, 'index.cjs'),
   ];
 }
 

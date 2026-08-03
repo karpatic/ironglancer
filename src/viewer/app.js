@@ -13,6 +13,7 @@ const statsEl = document.getElementById('stats');
 const selectedImportEl = document.getElementById('selected-import');
 const deadFunctionsCountsEl = document.getElementById('dead-functions-counts');
 const deadFunctionsFilterEl = document.getElementById('dead-functions-filter');
+const deadFunctionsScopeFilterEl = document.getElementById('dead-functions-scope-filter');
 const deadFunctionsSearchEl = document.getElementById('dead-functions-search');
 const deadFunctionsListEl = document.getElementById('dead-functions-list');
 const downloadBtn = document.getElementById('download-svg-btn');
@@ -760,6 +761,10 @@ function deadConfidenceLabel(confidence) {
   return confidence === 'high-confidence' ? 'High confidence' : 'Manual review';
 }
 
+function deadScopeLabel(candidate = {}) {
+  return candidate.reachable ? 'Reachable' : 'Unreachable';
+}
+
 function appendDeadCountPill(parent, label, value) {
   const pill = document.createElement('span');
   pill.className = 'dead-count-pill';
@@ -772,8 +777,12 @@ function renderDeadFunctionCounts(candidates) {
   const total = Array.isArray(candidates) ? candidates.length : 0;
   const highConfidence = candidates.filter((candidate) => candidate.confidence === 'high-confidence').length;
   const manualReview = candidates.filter((candidate) => candidate.confidence === 'manual-review').length;
+  const reachable = candidates.filter((candidate) => candidate.reachable).length;
+  const unreachable = total - reachable;
   deadFunctionsCountsEl.textContent = '';
   appendDeadCountPill(deadFunctionsCountsEl, 'total', total);
+  appendDeadCountPill(deadFunctionsCountsEl, 'reachable', reachable);
+  appendDeadCountPill(deadFunctionsCountsEl, 'unreachable', unreachable);
   appendDeadCountPill(deadFunctionsCountsEl, 'high', highConfidence);
   appendDeadCountPill(deadFunctionsCountsEl, 'review', manualReview);
 }
@@ -784,6 +793,7 @@ function deadFunctionSearchText(candidate = {}) {
     candidate.modulePath,
     candidate.kind,
     candidate.confidence,
+    candidate.reachable ? 'reachable' : 'unreachable',
     candidate.reason,
     ...(Array.isArray(candidate.exportKinds) ? candidate.exportKinds : []),
     ...(Array.isArray(candidate.moduleImportKinds) ? candidate.moduleImportKinds : []),
@@ -792,9 +802,12 @@ function deadFunctionSearchText(candidate = {}) {
 
 function filteredDeadFunctionCandidates() {
   const filter = deadFunctionsFilterEl?.value || 'all';
+  const scopeFilter = deadFunctionsScopeFilterEl?.value || 'all';
   const query = String(deadFunctionsSearchEl?.value || '').trim().toLowerCase();
   return deadFunctionCandidates.filter((candidate) => {
     if (filter !== 'all' && candidate.confidence !== filter) return false;
+    if (scopeFilter === 'reachable' && !candidate.reachable) return false;
+    if (scopeFilter === 'unreachable' && candidate.reachable) return false;
     if (query && !deadFunctionSearchText(candidate).includes(query)) return false;
     return true;
   });
@@ -840,7 +853,13 @@ function renderDeadFunctionCandidate(candidate) {
   const status = document.createElement('span');
   status.className = 'dead-function-status is-' + (candidate.confidence || 'manual-review');
   status.textContent = deadConfidenceLabel(candidate.confidence);
-  header.append(titleGroup, status);
+  const scope = document.createElement('span');
+  scope.className = 'dead-function-status is-scope';
+  scope.textContent = deadScopeLabel(candidate);
+  const statusGroup = document.createElement('div');
+  statusGroup.className = 'dead-function-status-group';
+  statusGroup.append(status, scope);
+  header.append(titleGroup, statusGroup);
 
   const reason = document.createElement('p');
   reason.className = 'dead-function-reason';
@@ -850,6 +869,7 @@ function renderDeadFunctionCandidate(candidate) {
   counts.className = 'dead-function-counts';
   appendDeadFunctionCount(counts, 'refs', candidate.counts?.directIdentifierReferences);
   appendDeadFunctionCount(counts, 'same-file', candidate.counts?.sameFileReferences);
+  appendDeadFunctionCount(counts, 'own-span', candidate.counts?.ownDeclarationReferences);
   appendDeadFunctionCount(counts, 'import refs', candidate.counts?.incomingImportReferences);
   appendDeadFunctionCount(counts, 'importers', candidate.counts?.directImportingFiles);
   appendDeadFunctionCount(counts, 'name hits', candidate.counts?.nameOccurrences);
@@ -1225,6 +1245,7 @@ copyMermaidSourceBtn.addEventListener('click', () => {
 });
 
 if (deadFunctionsFilterEl) deadFunctionsFilterEl.addEventListener('change', renderDeadFunctions);
+if (deadFunctionsScopeFilterEl) deadFunctionsScopeFilterEl.addEventListener('change', renderDeadFunctions);
 if (deadFunctionsSearchEl) deadFunctionsSearchEl.addEventListener('input', renderDeadFunctions);
 
 bindInteraction();

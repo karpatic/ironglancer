@@ -30,6 +30,26 @@ const DEFAULT_ROUTE_ALIASES = [
   { from: '/', to: 'public' },
 ];
 
+const ANALYZABLE_MODULE_EXTENSIONS = new Set(['.js', '.jsx', '.mjs', '.cjs']);
+const EXCLUDED_DISCOVERY_DIRS = new Set([
+  '.git',
+  '.hg',
+  '.svn',
+  'node_modules',
+  'bower_components',
+  'dist',
+  'build',
+  'coverage',
+  'out',
+  'site',
+  'docs',
+  '.next',
+  '.nuxt',
+  '.svelte-kit',
+  '.parcel-cache',
+  '.vite',
+]);
+
 async function loadImportAliases(rootDir, entryRel = '') {
   const aliases = new Map();
   const htmlCandidates = [
@@ -131,6 +151,39 @@ async function resolveEntry(rootDir, entry) {
     if (resolved) return resolved;
   }
   throw new Error(`Unable to resolve entry inside ${rootDir}`);
+}
+
+function isAnalyzableModulePath(relativePath) {
+  return ANALYZABLE_MODULE_EXTENSIONS.has(path.posix.extname(toPosixPath(relativePath)).toLowerCase());
+}
+
+function isExcludedDiscoveryDir(name) {
+  return EXCLUDED_DISCOVERY_DIRS.has(normalizeString(name).trim());
+}
+
+async function discoverAnalyzableModules(rootDir, moduleLimit) {
+  const discovered = [];
+
+  const visit = async (dirPath) => {
+    const entries = (await fs.readdir(dirPath, { withFileTypes: true }))
+      .sort((a, b) => compareLocale(a.name, b.name));
+    for (const entry of entries) {
+      const filePath = path.join(dirPath, entry.name);
+      const rel = toPosixPath(path.relative(rootDir, filePath));
+      if (entry.isDirectory()) {
+        if (isExcludedDiscoveryDir(entry.name)) continue;
+        await visit(filePath);
+      } else if (entry.isFile() && isAnalyzableModulePath(rel)) {
+        discovered.push({ rel, filePath });
+        if (discovered.length > moduleLimit) {
+          throw new Error(`Module limit exceeded (${moduleLimit}).`);
+        }
+      }
+    }
+  };
+
+  await visit(rootDir);
+  return discovered.sort((a, b) => compareLocale(a.rel, b.rel));
 }
 
 function localPathFromRouteAlias(specifier, alias) {
@@ -464,6 +517,15 @@ function locationInRanges(location, ranges) {
   ));
 }
 
+function locationInsideDeclarationSpan(span, location) {
+  return Number.isInteger(span?.startIndex)
+    && Number.isInteger(span?.endIndex)
+    && Number.isInteger(span?.nameEndIndex)
+    && location?.index > span.nameEndIndex
+    && location.index >= span.startIndex
+    && location.endIndex <= span.endIndex;
+}
+
 function declarationIdentifierMetrics(record, span, publicApiInfo) {
   const locations = identifierReferenceLocations(record?.source, span?.name);
   const declarationLocations = locations.filter((location) => isDeclarationNameLocation(span, location));
@@ -471,13 +533,20 @@ function declarationIdentifierMetrics(record, span, publicApiInfo) {
   const publicApiLocations = nonDeclarationLocations
     .filter((location) => locationInRanges(location, publicApiInfo.ranges));
   const publicApiIndexes = new Set(publicApiLocations.map((location) => `${location.index}:${location.endIndex}`));
+  const ownDeclarationLocations = nonDeclarationLocations
+    .filter((location) => locationInsideDeclarationSpan(span, location));
+  const ownDeclarationIndexes = new Set(ownDeclarationLocations.map((location) => `${location.index}:${location.endIndex}`));
   const sameFileLocations = nonDeclarationLocations
-    .filter((location) => !publicApiIndexes.has(`${location.index}:${location.endIndex}`));
+    .filter((location) => {
+      const key = `${location.index}:${location.endIndex}`;
+      return !publicApiIndexes.has(key) && !ownDeclarationIndexes.has(key);
+    });
 
   return {
     identifierOccurrenceCount: locations.length,
     declarationNameOccurrenceCount: declarationLocations.length,
-    declarationOnlyNameOccurrence: locations.length === declarationLocations.length,
+    ownDeclarationReferenceCount: ownDeclarationLocations.length,
+    declarationOnlyNameOccurrence: locations.length === declarationLocations.length + ownDeclarationLocations.length,
     sameFileReferenceCount: sameFileLocations.length,
     publicApiReferenceCount: publicApiLocations.length,
   };
@@ -534,6 +603,7 @@ function emptyDeclarationImportMetrics() {
     referenceCount: 0,
     directIdentifierReferenceCount: 0,
     sameFileReferenceCount: 0,
+    ownDeclarationReferenceCount: 0,
     sameFileNameOccurrenceCount: 0,
     incomingReferenceCount: 0,
     identifierOccurrenceCount: 0,
@@ -643,6 +713,7 @@ function buildDeclarationImportMetrics(graph) {
             declarationNameOccurrenceCount: 0,
             declarationOnlyNameOccurrence: false,
             sameFileReferenceCount: 0,
+            ownDeclarationReferenceCount: 0,
             publicApiReferenceCount: 0,
             incomingReferenceCount: 0,
             importerFiles: new Set(),
@@ -678,7 +749,11 @@ function buildDeclarationImportMetrics(graph) {
     referenceCount: bucket.sameFileReferenceCount + bucket.incomingReferenceCount,
     directIdentifierReferenceCount: bucket.sameFileReferenceCount + bucket.incomingReferenceCount,
     sameFileReferenceCount: bucket.sameFileReferenceCount,
-    sameFileNameOccurrenceCount: Math.max(0, bucket.identifierOccurrenceCount - bucket.declarationNameOccurrenceCount),
+    ownDeclarationReferenceCount: bucket.ownDeclarationReferenceCount,
+    sameFileNameOccurrenceCount: Math.max(
+      0,
+      bucket.identifierOccurrenceCount - bucket.declarationNameOccurrenceCount - bucket.ownDeclarationReferenceCount,
+    ),
     incomingReferenceCount: bucket.incomingReferenceCount,
     identifierOccurrenceCount: bucket.identifierOccurrenceCount,
     declarationNameOccurrenceCount: bucket.declarationNameOccurrenceCount,
@@ -737,8 +812,14 @@ function isJsxModule(rel) {
   return /\.(?:jsx)$/i.test(rel);
 }
 
-function jsxModuleRecords(graph) {
+function moduleRecords(graph, { reachableOnly = false } = {}) {
   return Array.from(graph.modules.values())
+    .filter((record) => !reachableOnly || record.reachable)
+    .sort((a, b) => compareLocale(a.rel, b.rel));
+}
+
+function jsxModuleRecords(graph, options = {}) {
+  return moduleRecords(graph, options)
     .filter((record) => isJsxModule(record.rel))
     .sort((a, b) => compareLocale(a.rel, b.rel));
 }
@@ -849,8 +930,8 @@ function edgeRestingLabel(loadKinds) {
   return isLazyOnly ? 'lazy' : 'import';
 }
 
-function buildImportEdges(graph) {
-  const jsxModules = jsxModuleRecords(graph);
+function buildImportEdges(graph, { reachableOnly = false } = {}) {
+  const jsxModules = jsxModuleRecords(graph, { reachableOnly });
   const classIds = buildClassIds(jsxModules);
   const edgeMap = new Map();
 
@@ -1013,6 +1094,7 @@ function buildDeadFunctionCandidate({
   const loadKinds = Array.isArray(moduleEvidence.loadKinds) ? moduleEvidence.loadKinds : [];
   const dynamicLoadKinds = loadKinds.filter((kind) => kind === 'dynamic' || kind === 'lazy');
   const isEntrypointModule = record.rel === graph.entryRel;
+  const isReachableModule = Boolean(record.reachable);
   const isComponentConvention = /^[A-Z]/.test(span.name);
   const isHookConvention = /^use[A-Z0-9]/.test(span.name);
   const hasNamespaceImport = Number(moduleEvidence.namespaceImportFileCount) > 0;
@@ -1033,18 +1115,32 @@ function buildDeadFunctionCandidate({
       `${metrics.importerFileCount} files import this declaration by name or default binding.`,
       'good',
     ),
+    candidateEvidence(
+      isReachableModule ? 'Reachable scope' : 'Unreachable scope',
+      isReachableModule
+        ? 'The module is reachable from the configured entry walk.'
+        : 'The module is outside the configured entry walk but was discovered under the project root.',
+      'neutral',
+    ),
   ];
 
   if (metrics.declarationOnlyNameOccurrence) {
     evidence.push(candidateEvidence(
-      'Declaration-only name',
-      `The name occurs ${metrics.identifierOccurrenceCount} time in code, at the declaration.`,
+      'No outside-declaration name hits',
+      [
+        `${metrics.identifierOccurrenceCount} total code occurrences`,
+        `${metrics.ownDeclarationReferenceCount || 0} inside the declaration span`,
+      ].join('; ') + '.',
       'good',
     ));
   } else {
     evidence.push(candidateEvidence(
       'Extra name occurrences',
-      `${metrics.sameFileNameOccurrenceCount} non-declaration name occurrences; ${metrics.publicApiReferenceCount} are public API/export exposures.`,
+      [
+        `${metrics.sameFileNameOccurrenceCount} outside-declaration name occurrences`,
+        `${metrics.ownDeclarationReferenceCount || 0} inside the declaration span`,
+        `${metrics.publicApiReferenceCount} are public API/export exposures`,
+      ].join('; ') + '.',
       'review',
     ));
     manualSignals.push('extra name occurrences');
@@ -1098,6 +1194,7 @@ function buildDeadFunctionCandidate({
     counts: {
       directIdentifierReferences: metrics.directIdentifierReferenceCount,
       sameFileReferences: metrics.sameFileReferenceCount,
+      ownDeclarationReferences: metrics.ownDeclarationReferenceCount,
       incomingImportReferences: metrics.incomingReferenceCount,
       directImportingFiles: metrics.importerFileCount,
       nameOccurrences: metrics.identifierOccurrenceCount,
@@ -1108,6 +1205,7 @@ function buildDeadFunctionCandidate({
     },
     signals: {
       declarationOnlyNameOccurrence: metrics.declarationOnlyNameOccurrence,
+      reachableModule: isReachableModule,
       exported: Boolean(publicApi.exported),
       entrypointModule: isEntrypointModule,
       componentConvention: isComponentConvention,
@@ -1122,6 +1220,7 @@ function buildDeadFunctionCandidate({
     exportKinds: Array.isArray(publicApi.exportKinds) ? publicApi.exportKinds : [],
     exportedNames: Array.isArray(publicApi.exportedNames) ? publicApi.exportedNames : [],
     moduleImportKinds: loadKinds,
+    reachable: isReachableModule,
     evidence,
   };
 }
@@ -1154,8 +1253,8 @@ function buildDeadFunctionCandidates(graph, declarationImportMetrics) {
   return candidates.sort(compareDeadFunctionCandidates);
 }
 
-function buildMermaid(graph, importEdges, declarationImportMetrics) {
-  const jsxModules = jsxModuleRecords(graph);
+function buildMermaid(graph, importEdges, declarationImportMetrics, { reachableOnly = false } = {}) {
+  const jsxModules = jsxModuleRecords(graph, { reachableOnly });
   const classIds = buildClassIds(jsxModules);
   const lines = ['classDiagram'];
   if (jsxModules.length === 0) {
@@ -1191,8 +1290,13 @@ function buildMermaid(graph, importEdges, declarationImportMetrics) {
   return lines.join('\n');
 }
 
-function buildSourceCode(graph, declarationImportMetrics, deadFunctionCandidates = []) {
-  const jsxModules = jsxModuleRecords(graph);
+function buildSourceCode(
+  graph,
+  declarationImportMetrics,
+  deadFunctionCandidates = [],
+  candidateDeclarationImportMetrics = declarationImportMetrics,
+) {
+  const jsxModules = jsxModuleRecords(graph, { reachableOnly: true });
   const classIds = buildClassIds(jsxModules);
   const declarations = [];
   const seen = new Set();
@@ -1251,7 +1355,7 @@ function buildSourceCode(graph, declarationImportMetrics, deadFunctionCandidates
       span,
       sourceOrigin: 'dead-function-candidate',
       candidateId: candidate.id,
-      metrics: declarationImportMetricsFor(declarationImportMetrics, record, candidate.name),
+      metrics: declarationImportMetricsFor(candidateDeclarationImportMetrics, record, candidate.name),
     }));
   }
 
@@ -1331,6 +1435,28 @@ function buildJsxTreeText(jsxScripts) {
   return lines.join('\n');
 }
 
+function buildReachableModuleSet(modules, entryRel) {
+  const reachable = new Set();
+  const queue = [entryRel];
+  while (queue.length > 0) {
+    const rel = queue.shift();
+    if (!rel || reachable.has(rel) || !modules.has(rel)) continue;
+    reachable.add(rel);
+    const record = modules.get(rel);
+    for (const dep of Array.isArray(record.localDeps) ? record.localDeps : []) {
+      if (!reachable.has(dep)) queue.push(dep);
+    }
+  }
+  return reachable;
+}
+
+function reachableGraphView(graph) {
+  return {
+    ...graph,
+    modules: new Map(moduleRecords(graph, { reachableOnly: true }).map((record) => [record.rel, record])),
+  };
+}
+
 export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeAliases = [] } = {}) {
   const resolvedRoot = path.resolve(normalizeString(rootDir).trim() || '.');
   const resolvedEntry = await resolveEntry(resolvedRoot, entry);
@@ -1339,19 +1465,19 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
     ...normalizeRouteAliases(routeAliases),
     ...DEFAULT_ROUTE_ALIASES,
   ];
-  const modules = new Map();
-  const externals = new Set();
-  const queue = [resolvedEntry];
-  const visited = new Set();
-
-  while (queue.length > 0) {
-    const current = queue.shift();
-    if (!current || visited.has(current.rel)) continue;
-    visited.add(current.rel);
-    if (visited.size > moduleLimit) {
+  const discoveredModules = await discoverAnalyzableModules(resolvedRoot, moduleLimit);
+  const discoveredByRel = new Map(discoveredModules.map((module) => [module.rel, module]));
+  if (!discoveredByRel.has(resolvedEntry.rel)) {
+    discoveredByRel.set(resolvedEntry.rel, resolvedEntry);
+    if (discoveredByRel.size > moduleLimit) {
       throw new Error(`Module limit exceeded (${moduleLimit}).`);
     }
+  }
+  const discoveredRelSet = new Set(discoveredByRel.keys());
+  const modules = new Map();
+  const externals = new Set();
 
+  for (const current of Array.from(discoveredByRel.values()).sort((a, b) => compareLocale(a.rel, b.rel))) {
     const source = await fs.readFile(current.filePath, 'utf8');
     const importRefs = extractImportRefs(source);
     const localDeps = [];
@@ -1366,10 +1492,9 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
         aliases,
         routeAliases: resolvedRouteAliases,
       });
-      if (local) {
+      if (local && discoveredRelSet.has(local.rel)) {
         localDeps.push(local.rel);
         normalizedImportRefs.push({ ...ref, localRel: local.rel });
-        if (!visited.has(local.rel)) queue.push(local);
       } else {
         const label = externalLabel(ref.specifier);
         if (label && !isIgnoredExternalLabel(label)) {
@@ -1391,31 +1516,53 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
     });
   }
 
+  const reachableModules = buildReachableModuleSet(modules, resolvedEntry.rel);
+  for (const record of modules.values()) {
+    record.reachable = reachableModules.has(record.rel);
+  }
+
   const graph = {
     rootDir: resolvedRoot,
     entryRel: resolvedEntry.rel,
     modules,
+    reachableModules,
     externals,
   };
 
-  const jsScripts = Array.from(modules.values())
-    .map((record) => record.stats)
+  const jsScripts = moduleRecords(graph)
+    .map((record) => ({ ...record.stats, reachable: Boolean(record.reachable) }))
     .sort((a, b) => compareLocale(a.path, b.path));
   const jsxScripts = jsScripts
     .filter((script) => isJsxModule(script.path))
     .sort((a, b) => compareLocale(a.path, b.path));
-  const jsxClassCount = jsxScripts.length;
-  const importEdges = buildImportEdges(graph);
+  const reachableJsScripts = jsScripts
+    .filter((script) => script.reachable)
+    .sort((a, b) => compareLocale(a.path, b.path));
+  const reachableJsxScripts = reachableJsScripts
+    .filter((script) => isJsxModule(script.path))
+    .sort((a, b) => compareLocale(a.path, b.path));
+  const jsxClassCount = reachableJsxScripts.length;
+  const reachableGraph = reachableGraphView(graph);
+  const importEdges = buildImportEdges(graph, { reachableOnly: true });
   const declarationImportMetrics = buildDeclarationImportMetrics(graph);
+  const reachableDeclarationImportMetrics = buildDeclarationImportMetrics(reachableGraph);
   const deadFunctionCandidates = buildDeadFunctionCandidates(graph, declarationImportMetrics);
-  const mermaid = buildMermaid(graph, importEdges, declarationImportMetrics);
-  const sourceCode = buildSourceCode(graph, declarationImportMetrics, deadFunctionCandidates);
+  const mermaid = buildMermaid(graph, importEdges, reachableDeclarationImportMetrics, { reachableOnly: true });
+  const sourceCode = buildSourceCode(
+    graph,
+    reachableDeclarationImportMetrics,
+    deadFunctionCandidates,
+    declarationImportMetrics,
+  );
   const treeText = buildTreeText(graph);
-  const jsxTreeText = buildJsxTreeText(jsxScripts);
+  const jsxTreeText = buildJsxTreeText(reachableJsxScripts);
   const deadFunctionHighConfidenceCount = deadFunctionCandidates
     .filter((candidate) => candidate.confidence === 'high-confidence').length;
   const deadFunctionManualReviewCount = deadFunctionCandidates
     .filter((candidate) => candidate.confidence === 'manual-review').length;
+  const deadFunctionReachableCount = deadFunctionCandidates
+    .filter((candidate) => candidate.reachable).length;
+  const deadFunctionUnreachableCount = deadFunctionCandidates.length - deadFunctionReachableCount;
 
   return {
     rootDir: resolvedRoot,
@@ -1431,13 +1578,19 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
     sourceCode,
     summary: {
       moduleCount: modules.size,
+      reachableModuleCount: reachableModules.size,
+      unreachableModuleCount: modules.size - reachableModules.size,
       jsxClassCount,
       jsxFileCount: jsxScripts.length,
+      reachableJsxFileCount: reachableJsxScripts.length,
       jsScriptCount: jsScripts.length,
+      reachableJsScriptCount: reachableJsScripts.length,
       externalCount: externals.size,
       deadFunctionCandidateCount: deadFunctionCandidates.length,
       deadFunctionHighConfidenceCount,
       deadFunctionManualReviewCount,
+      deadFunctionReachableCount,
+      deadFunctionUnreachableCount,
     },
   };
 }

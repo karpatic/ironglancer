@@ -115,18 +115,23 @@ test('analyzeProject resolves lazy-loaded module specifier constants', async () 
   });
 
   assert.equal(result.entryRel, 'src/app.jsx');
-  assert.equal(result.summary.moduleCount, 4);
+  assert.equal(result.summary.moduleCount, 5);
+  assert.equal(result.summary.reachableModuleCount, 4);
+  assert.equal(result.summary.unreachableModuleCount, 1);
   assert.deepEqual(result.jsScripts.map((item) => item.path), [
     'src/app.jsx',
     'src/creator/components/creator-lazy-widget.jsx',
     'src/creator/components/creator-panel.jsx',
     'src/creator/components/creator-startup-cache.js',
+    'src/creator/components/unused-editor.jsx',
   ]);
   assert.ok(result.treeText.includes('src/creator/components/creator-panel.jsx'));
   assert.ok(result.treeText.includes('src/creator/components/creator-lazy-widget.jsx'));
   assert.ok(!result.treeText.includes('src/creator/components/unused-editor.jsx'));
+  assert.ok(!result.jsxTreeText.includes('unused-editor.jsx'));
   assert.ok(result.mermaid.includes('app --> creator_lazy_widget : lazy'));
   assert.ok(result.mermaid.includes('app --> creator_panel : lazy'));
+  assert.ok(!result.mermaid.includes('unused_editor'));
   assert.ok(!result.mermaid.includes(': imports'));
 });
 
@@ -144,6 +149,7 @@ test('analyzeProject exposes JSX import edge metadata', async () => {
     'src/faculty-body-child.jsx',
     'src/faculty-editor-child.jsx',
     'src/static-child.jsx',
+    'src/unused-child.jsx',
   ]);
   assert.match(result.mermaid, /class app\["28 app\.jsx"\] \{/);
   assert.match(result.mermaid, /\+App\(\) \[lines: 16 \| refs: 0 \| importers: 0\]/);
@@ -151,6 +157,7 @@ test('analyzeProject exposes JSX import edge metadata', async () => {
   assert.match(result.mermaid, /\+StaticNamed\(\) \[lines: 3 \| refs: 1 \| importers: 1\]/);
   assert.ok(result.mermaid.includes('app --> static_child : import'));
   assert.ok(result.mermaid.includes('app --> dynamic_child : lazy'));
+  assert.ok(!result.mermaid.includes('unused_child'));
   assert.ok(!result.mermaid.includes(': imports'));
 
   assert.deepEqual(result.importEdges, [
@@ -470,6 +477,103 @@ test('analyzeProject classifies zero-reference dead function candidates with sta
   const abandonedSource = result.sourceCode.declarations.find((item) => item.name === 'abandonedTool');
   assert.ok(abandonedSource.candidateId);
   assert.equal(abandonedSource.sourceOrigin, 'dead-function-candidate');
+});
+
+test('analyzeProject finds dead candidates in orphan modules while resolving orphan imports', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      'export function App() {',
+      '  return <main />;',
+      '}',
+    ].join('\n'),
+    'src/orphan.jsx': [
+      "import { orphanHelper } from './orphan-helper.js';",
+      '',
+      'export function OrphanEntry() {',
+      '  return orphanHelper();',
+      '}',
+      '',
+      'function orphanUnused() {',
+      "  return 'unused';",
+      '}',
+    ].join('\n'),
+    'src/orphan-helper.js': [
+      'export function orphanHelper() {',
+      '  return helperPrivate();',
+      '}',
+      '',
+      'function helperPrivate() {',
+      "  return 'helper';",
+      '}',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
+  const orphanUnused = candidatesByName.get('orphanUnused');
+  const orphanEntry = candidatesByName.get('OrphanEntry');
+
+  assert.equal(result.summary.moduleCount, 3);
+  assert.equal(result.summary.reachableModuleCount, 1);
+  assert.equal(result.summary.unreachableModuleCount, 2);
+  assert.deepEqual(
+    result.jsScripts.map((item) => ({ path: item.path, reachable: item.reachable })),
+    [
+      { path: 'src/app.jsx', reachable: true },
+      { path: 'src/orphan-helper.js', reachable: false },
+      { path: 'src/orphan.jsx', reachable: false },
+    ],
+  );
+  assert.ok(!result.treeText.includes('src/orphan.jsx'));
+  assert.ok(!result.mermaid.includes('OrphanEntry'));
+
+  assert.equal(orphanUnused.confidence, 'high-confidence');
+  assert.equal(orphanUnused.reachable, false);
+  assert.equal(orphanUnused.signals.reachableModule, false);
+  assert.ok(orphanUnused.evidence.some((item) => item.label === 'Unreachable scope'));
+  assert.equal(orphanEntry.confidence, 'manual-review');
+  assert.equal(orphanEntry.reachable, false);
+  assert.ok(!candidatesByName.has('orphanHelper'));
+  assert.ok(!candidatesByName.has('helperPrivate'));
+});
+
+test('analyzeProject ignores self-recursive references inside a declaration but keeps outside callers', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import { run } from './feature.js';",
+      '',
+      'export function App() {',
+      '  return <main>{run()}</main>;',
+      '}',
+    ].join('\n'),
+    'src/feature.js': [
+      'export function run() {',
+      '  return externallyCalled(2);',
+      '}',
+      '',
+      'function selfOnly(count) {',
+      '  if (count <= 0) return 0;',
+      '  return selfOnly(count - 1);',
+      '}',
+      '',
+      'function externallyCalled(count) {',
+      '  if (count <= 0) return 1;',
+      '  return externallyCalled(count - 1);',
+      '}',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
+  const selfOnly = candidatesByName.get('selfOnly');
+
+  assert.equal(selfOnly.confidence, 'high-confidence');
+  assert.equal(selfOnly.counts.directIdentifierReferences, 0);
+  assert.equal(selfOnly.counts.sameFileReferences, 0);
+  assert.equal(selfOnly.counts.ownDeclarationReferences, 1);
+  assert.equal(selfOnly.counts.nameOccurrences, 2);
+  assert.equal(selfOnly.signals.declarationOnlyNameOccurrence, true);
+  assert.ok(!candidatesByName.has('externallyCalled'));
 });
 
 test('analyzeProject keeps semicolonless export-list ranges from hiding later same-file uses', async () => {

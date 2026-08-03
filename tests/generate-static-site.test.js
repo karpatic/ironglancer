@@ -463,6 +463,7 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.match(html, />Selected import</);
   assert.match(html, /id="dead-functions-list"/);
   assert.match(html, />Potential dead functions</);
+  assert.match(html, /id="dead-functions-scope-filter"/);
   assert.doesNotMatch(html, /id="jsx-line-counts-panel"/);
   assert.doesNotMatch(html, />JSX line counts</);
   assert.doesNotMatch(html, />Open JSON</);
@@ -612,6 +613,11 @@ test('generated viewer renders and filters potential dead function candidates', 
       '  return true;',
       '}',
     ].join('\n'),
+    'src/orphan.js': [
+      'export function orphanPublic() {',
+      "  return 'manual';",
+      '}',
+    ].join('\n'),
   });
   const { appJs, payload, sourcePayload } = await generateTestSite({
     rootDir,
@@ -628,19 +634,37 @@ test('generated viewer renders and filters potential dead function candidates', 
   const counts = document.getElementById('dead-functions-counts');
   const list = document.getElementById('dead-functions-list');
 
-  assert.match(counts.textContent, /total: 7/);
+  assert.match(counts.textContent, /total: 8/);
+  assert.match(counts.textContent, /reachable: 7/);
+  assert.match(counts.textContent, /unreachable: 1/);
   assert.match(counts.textContent, /high: 1/);
-  assert.match(counts.textContent, /review: 6/);
+  assert.match(counts.textContent, /review: 7/);
   assert.match(list.textContent, /abandonedTool/);
   assert.match(list.textContent, /High confidence/);
   assert.match(list.textContent, /exportedUtility/);
   assert.match(list.textContent, /Manual review/);
+  assert.match(list.textContent, /orphanPublic/);
+  assert.match(list.textContent, /Unreachable/);
 
   const firstSourceButton = list.querySelector('article.dead-function-item').querySelector('button');
   firstSourceButton.click();
   assert.equal(document.getElementById('source-dialog').open, true);
   assert.equal(document.getElementById('source-dialog-title').textContent, 'abandonedTool');
   assert.equal(document.getElementById('source-dialog-path').textContent, 'src/tools.js:5-7');
+
+  const scopeFilter = document.getElementById('dead-functions-scope-filter');
+  scopeFilter.value = 'unreachable';
+  scopeFilter.dispatchEvent({ type: 'change' });
+  assert.match(list.textContent, /orphanPublic/);
+  assert.doesNotMatch(list.textContent, /abandonedTool/);
+
+  scopeFilter.value = 'reachable';
+  scopeFilter.dispatchEvent({ type: 'change' });
+  assert.match(list.textContent, /abandonedTool/);
+  assert.doesNotMatch(list.textContent, /orphanPublic/);
+
+  scopeFilter.value = 'all';
+  scopeFilter.dispatchEvent({ type: 'change' });
 
   const filter = document.getElementById('dead-functions-filter');
   filter.value = 'manual-review';
@@ -728,10 +752,20 @@ test('generated viewer opens visible member source snippets from scoped source p
       startLine: 9,
       endLine: 11,
     },
+    {
+      moduleId: 'dead_src_unused_child',
+      modulePath: 'src/unused-child.jsx',
+      name: 'UnusedChild',
+      startLine: 1,
+      endLine: 3,
+    },
   ]);
   assert.equal(sourcePayload.declarations.find((item) => item.name === 'App').code, appLines);
   assert.ok(!sourcePayload.declarations.some((item) => item.name === 'useCreatorModule'));
-  assert.ok(!sourcePayload.declarations.some((item) => item.name === 'UnusedChild'));
+  assert.equal(
+    sourcePayload.declarations.find((item) => item.name === 'UnusedChild').sourceOrigin,
+    'dead-function-candidate',
+  );
 
   assert.equal(sourcePayload.meta.buildId, payload.meta.buildId);
   assert.equal(sourcePayload.meta.sourceCodeHash, payload.meta.sourceCodeHash);

@@ -200,6 +200,7 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
       .dead-function-header { display:flex; gap:10px; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; }
       .dead-function-title { margin:0; font-size:.98rem; overflow-wrap:anywhere; }
       .dead-function-location { color:var(--muted); font-size:.84rem; overflow-wrap:anywhere; }
+      .dead-function-status-group { display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
       .dead-function-status {
         border:1px solid var(--border);
         border-radius:999px;
@@ -210,6 +211,7 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
       }
       .dead-function-status.is-high-confidence { border-color:#abefc6; background:#ecfdf3; color:#16703d; }
       .dead-function-status.is-manual-review { border-color:#fedf89; background:#fffaeb; color:#93370d; }
+      .dead-function-status.is-scope { border-color:#d7e3f7; background:#f7faff; color:#22407d; }
       .dead-function-reason { margin:0; color:var(--muted); }
       .dead-function-counts { display:flex; gap:6px; flex-wrap:wrap; }
       .dead-function-count {
@@ -306,6 +308,11 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
                     <option value="all">All</option>
                     <option value="high-confidence">High confidence</option>
                     <option value="manual-review">Manual review</option>
+                  </select>
+                  <select id="dead-functions-scope-filter" class="dead-functions-filter" aria-label="Filter potential dead functions by reachability">
+                    <option value="all">All scopes</option>
+                    <option value="reachable">Reachable</option>
+                    <option value="unreachable">Unreachable</option>
                   </select>
                   <input id="dead-functions-search" class="dead-functions-search" type="search" placeholder="Filter by name or path" aria-label="Filter potential dead functions by name or path">
                 </div>
