@@ -274,6 +274,47 @@ test('extractDeclarationSpans measures semicolonless literal arrow expression bo
   ]);
 });
 
+test('extractDeclarationSpans treats ASI-separated functions as declarations only in statement context', () => {
+  const source = [
+    'setup()',
+    'function afterExpression() {',
+    '  return true;',
+    '}',
+    '',
+    'const value = 1',
+    'function afterVariable() {',
+    '  return value;',
+    '}',
+    '',
+    'function outer() {',
+    '  setup()',
+    '  function innerAfterExpression() {',
+    '    return true;',
+    '  }',
+    '  const innerValue = 1',
+    '  function innerAfterVariable() {',
+    '    return innerValue;',
+    '  }',
+    '}',
+    '',
+    'const assigned = function assignedHelper() {',
+    '  return true;',
+    '}',
+    'setTimeout(function callbackHelper() {',
+    '  return true;',
+    '}, 1)',
+  ].join('\n');
+
+  const spansByName = new Map(extractDeclarationSpans(source).map((span) => [span.name, span]));
+
+  assert.equal(spansByName.get('afterExpression').declarationType, 'function-declaration');
+  assert.equal(spansByName.get('afterVariable').declarationType, 'function-declaration');
+  assert.equal(spansByName.get('innerAfterExpression').declarationType, 'function-declaration');
+  assert.equal(spansByName.get('innerAfterVariable').declarationType, 'function-declaration');
+  assert.equal(spansByName.get('assignedHelper').declarationType, 'function-expression-name');
+  assert.equal(spansByName.get('callbackHelper').declarationType, 'function-expression-name');
+});
+
 test('extractDeclarationSpans measures multiline arrow block bodies while ignoring templates', () => {
   const source = [
     'export const BlockArrow = () => {',

@@ -263,6 +263,64 @@ function parseCommonJsObjectSpecifier(part) {
   return local ? { exported: local, local } : null;
 }
 
+function findNextNonWhitespaceIndex(text, start) {
+  let index = start;
+  while (index < text.length && /\s/.test(text[index])) index += 1;
+  return index;
+}
+
+function findMatchingBrace(text, startIndex) {
+  let depth = 0;
+  for (let index = startIndex; index < text.length; index += 1) {
+    if (text[index] === '{') {
+      depth += 1;
+    } else if (text[index] === '}') {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+function wordAt(text, start, word) {
+  if (text.slice(start, start + word.length) !== word) return false;
+  const before = text[start - 1] || '';
+  const after = text[start + word.length] || '';
+  return !/[A-Za-z0-9_$]/.test(before) && !/[A-Za-z0-9_$]/.test(after);
+}
+
+function namedExportListFromClauseStart(text, closeBraceIndex) {
+  const fromIndex = findNextNonWhitespaceIndex(text, closeBraceIndex + 1);
+  if (!wordAt(text, fromIndex, 'from')) return -1;
+  const specifierIndex = findNextNonWhitespaceIndex(text, fromIndex + 'from'.length);
+  return text[specifierIndex] === '"' || text[specifierIndex] === "'" ? fromIndex : -1;
+}
+
+function namedExportListEntries(masked) {
+  const entries = [];
+  const exportListPattern = /\bexport\s*\{/g;
+  let match;
+  while ((match = exportListPattern.exec(masked))) {
+    const openBraceIndex = masked.indexOf('{', match.index);
+    const closeBraceIndex = findMatchingBrace(masked, openBraceIndex);
+    if (closeBraceIndex === -1) {
+      exportListPattern.lastIndex = match.index + match[0].length;
+      continue;
+    }
+    const fromIndex = namedExportListFromClauseStart(masked, closeBraceIndex);
+    if (fromIndex === -1) {
+      const semicolonIndex = findNextNonWhitespaceIndex(masked, closeBraceIndex + 1);
+      entries.push({
+        specifiersText: masked.slice(openBraceIndex + 1, closeBraceIndex),
+        startIndex: match.index,
+        endIndex: masked[semicolonIndex] === ';' ? semicolonIndex + 1 : closeBraceIndex + 1,
+      });
+    }
+    exportListPattern.lastIndex = closeBraceIndex + 1;
+  }
+  return entries;
+}
+
 function defaultExportDeclarationName(record) {
   const source = normalizeString(record?.source);
   if (!source) return '';
@@ -302,7 +360,6 @@ function declarationPublicApiInfo(record, declarationName) {
   const directFunctionExportPattern = new RegExp(`\\bexport\\s+(default\\s+)?(?:async\\s+)?function\\s*\\*?\\s+${escaped}\\s*\\(`, 'g');
   const directArrowExportPattern = new RegExp(`\\bexport\\s+(?:const|let|var)\\s+${escaped}\\s*=`, 'g');
   const defaultIdentifierExportPattern = new RegExp(`\\bexport\\s+default\\s+${escaped}\\b`, 'g');
-  const namedExportListPattern = /\bexport\s*\{([\s\S]*?)\}\s*([^;]*)/g;
   const commonJsPropertyPattern = new RegExp(`\\b(?:module\\.)?exports\\s*\\.\\s*([A-Za-z_$][A-Za-z0-9_$]*)\\s*=\\s*${escaped}\\b`, 'g');
   const commonJsDefaultPattern = new RegExp(`\\bmodule\\s*\\.\\s*exports\\s*=\\s*${escaped}\\b`, 'g');
   const commonJsObjectPattern = /\bmodule\s*\.\s*exports\s*=\s*\{([\s\S]*?)\}/g;
@@ -336,18 +393,16 @@ function declarationPublicApiInfo(record, declarationName) {
       endIndex: defaultIdentifierExportPattern.lastIndex,
     });
   }
-  while ((match = namedExportListPattern.exec(masked))) {
-    const trailing = normalizeString(match[2]);
-    if (/\bfrom\b/.test(trailing)) continue;
-    for (const part of identifierListParts(match[1])) {
+  for (const entry of namedExportListEntries(masked)) {
+    for (const part of identifierListParts(entry.specifiersText)) {
       const specifier = parseNamedExportSpecifier(part);
       if (!specifier || specifier.local !== name) continue;
       info.exported = true;
       addPublicApiSignal(info, {
         kind: specifier.exported === 'default' ? 'default-export' : 'named-export',
         exportedName: specifier.exported,
-        startIndex: match.index,
-        endIndex: namedExportListPattern.lastIndex,
+        startIndex: entry.startIndex,
+        endIndex: entry.endIndex,
       });
     }
   }

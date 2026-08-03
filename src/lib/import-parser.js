@@ -439,6 +439,32 @@ function previousSignificantIndex(chars, start) {
   return -1;
 }
 
+function hasLineTerminatorBetween(text, start, end) {
+  for (let index = start; index < end; index += 1) {
+    if (text[index] === '\n' || text[index] === '\r') return true;
+  }
+  return false;
+}
+
+function delimiterDepthBefore(text, end) {
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  for (let index = 0; index < end; index += 1) {
+    const char = text[index];
+    if (char === '(') parenDepth += 1;
+    else if (char === ')') parenDepth = Math.max(0, parenDepth - 1);
+    else if (char === '[') bracketDepth += 1;
+    else if (char === ']') bracketDepth = Math.max(0, bracketDepth - 1);
+  }
+  return { parenDepth, bracketDepth };
+}
+
+function canEndStatementAt(text, index) {
+  const char = text[index];
+  if (isIdentifierPart(char) || ')]}"\'`'.includes(char)) return true;
+  return (char === '+' || char === '-') && text[index - 1] === char;
+}
+
 function isJsxClosingTagNamePart(char) {
   return typeof char === 'string' && /[A-Za-z0-9_$.:-]/.test(char);
 }
@@ -689,6 +715,13 @@ function compareDeclarationSpan(a, b) {
 function functionDeclarationTypeAt(masked, startIndex) {
   const previousIndex = previousSignificantIndex(masked, startIndex);
   if (previousIndex === -1 || ';{}'.includes(masked[previousIndex])) return 'function-declaration';
+  if (
+    hasLineTerminatorBetween(masked, previousIndex + 1, startIndex)
+    && canEndStatementAt(masked, previousIndex)
+  ) {
+    const { parenDepth, bracketDepth } = delimiterDepthBefore(masked, startIndex);
+    if (parenDepth === 0 && bracketDepth === 0) return 'function-declaration';
+  }
   return 'function-expression-name';
 }
 
