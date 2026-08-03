@@ -50,6 +50,7 @@ const EXCLUDED_DISCOVERY_DIRS = new Set([
   '.parcel-cache',
   '.vite',
 ]);
+const lexicalBlockRangeCache = new WeakMap();
 
 async function loadImportAliases(rootDir, entryRel = '') {
   const aliases = new Map();
@@ -473,6 +474,7 @@ function declarationPublicApiInfo(record, declarationName) {
   const directArrowExportPattern = new RegExp(`\\bexport\\s+(?:const|let|var)\\s+${escaped}\\s*=`, 'g');
   const defaultIdentifierExportPattern = new RegExp(`\\bexport\\s+default\\s+${escaped}\\b`, 'g');
   const commonJsPropertyPattern = new RegExp(`\\b(?:module\\.)?exports\\s*\\.\\s*([A-Za-z_$][A-Za-z0-9_$]*)\\s*=\\s*${escaped}\\b`, 'g');
+  const commonJsFunctionExpressionPattern = new RegExp(`\\b(?:module\\.)?exports\\s*\\.\\s*([A-Za-z_$][A-Za-z0-9_$]*)\\s*=\\s*(?:async\\s+)?function\\s*\\*?\\s+${escaped}\\s*\\(`, 'g');
   const commonJsDefaultPattern = new RegExp(`\\bmodule\\s*\\.\\s*exports\\s*=\\s*${escaped}\\b`, 'g');
   const commonJsObjectPattern = /\bmodule\s*\.\s*exports\s*=\s*\{([\s\S]*?)\}/g;
 
@@ -525,6 +527,15 @@ function declarationPublicApiInfo(record, declarationName) {
       exportedName: match[1],
       startIndex: match.index,
       endIndex: commonJsPropertyPattern.lastIndex,
+    });
+  }
+  while ((match = commonJsFunctionExpressionPattern.exec(masked))) {
+    info.exported = true;
+    addPublicApiSignal(info, {
+      kind: 'commonjs-export',
+      exportedName: match[1],
+      startIndex: match.index,
+      endIndex: commonJsFunctionExpressionPattern.lastIndex,
     });
   }
   while ((match = commonJsDefaultPattern.exec(masked))) {
@@ -801,6 +812,78 @@ function findStatementEnd(masked, start, limit) {
   return limit;
 }
 
+function wordBeforeIndex(masked, index) {
+  const endIndex = previousNonWhitespaceIndex(masked, index);
+  if (endIndex === -1 || !/[A-Za-z_$]/.test(masked[endIndex])) return '';
+  let startIndex = endIndex;
+  while (startIndex > 0 && /[A-Za-z0-9_$]/.test(masked[startIndex - 1])) startIndex -= 1;
+  return masked.slice(startIndex, endIndex + 1);
+}
+
+function shouldTreatBraceAsLexicalBlock(masked, openIndex) {
+  const previousIndex = previousNonWhitespaceIndex(masked, openIndex);
+  if (previousIndex === -1) return true;
+  if (')>;{'.includes(masked[previousIndex])) return true;
+  return ['do', 'else', 'finally', 'try'].includes(wordBeforeIndex(masked, openIndex));
+}
+
+function lexicalBlockRanges(record) {
+  if (!record || typeof record !== 'object') return [];
+  if (lexicalBlockRangeCache.has(record)) return lexicalBlockRangeCache.get(record);
+  const masked = maskIgnorableSyntax(record?.source);
+  const ranges = [];
+  const seen = new Set();
+  const add = (startIndex, endIndex) => {
+    if (!Number.isInteger(startIndex) || !Number.isInteger(endIndex) || endIndex <= startIndex) return;
+    const key = `${startIndex}:${endIndex}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    ranges.push({ startIndex, endIndex });
+  };
+
+  for (let index = 0; index < masked.length; index += 1) {
+    if (masked[index] !== '{' || !shouldTreatBraceAsLexicalBlock(masked, index)) continue;
+    const closeIndex = findMatchingBrace(masked, index);
+    if (closeIndex !== -1) add(index, closeIndex + 1);
+  }
+
+  ranges.sort((a, b) => (a.endIndex - a.startIndex) - (b.endIndex - b.startIndex)
+    || b.startIndex - a.startIndex);
+  lexicalBlockRangeCache.set(record, ranges);
+  return ranges;
+}
+
+function nearestLexicalBlockForLocation(record, location, ownerSpan) {
+  const ownerEnd = declarationSpanExclusiveEnd(ownerSpan);
+  return lexicalBlockRanges(record).find((range) => (
+    location.index >= range.startIndex
+    && location.endIndex <= range.endIndex
+    && (!ownerSpan || (
+      range.startIndex >= ownerSpan.startIndex
+      && range.endIndex <= ownerEnd
+    ))
+  )) || null;
+}
+
+function spanScope(span) {
+  return {
+    scopeStart: span?.startIndex,
+    scopeEnd: declarationSpanExclusiveEnd(span),
+  };
+}
+
+function blockScopedBindingScope(record, ownerSpan, location) {
+  const block = nearestLexicalBlockForLocation(record, location, ownerSpan);
+  return block ? {
+    scopeStart: block.startIndex,
+    scopeEnd: block.endIndex,
+  } : spanScope(ownerSpan);
+}
+
+function functionScopedBindingScope(ownerSpan) {
+  return spanScope(ownerSpan);
+}
+
 function variableBindingLocations(record, span, identifier) {
   const masked = maskIgnorableSyntax(record?.source);
   const spanEnd = declarationSpanExclusiveEnd(span);
@@ -822,6 +905,10 @@ function variableBindingLocations(record, span, identifier) {
         .map((location) => ({
           ...location,
           kind: 'variable',
+          declarationKind: match[1],
+          ...(match[1] === 'var'
+            ? functionScopedBindingScope(span)
+            : blockScopedBindingScope(record, span, location)),
           statementStart: match.index,
           statementEnd,
         })));
@@ -844,6 +931,10 @@ function functionBindingLocations(record, span, identifier) {
       index: candidate.nameStartIndex,
       endIndex: candidate.nameEndIndex,
       kind: 'function',
+      ...blockScopedBindingScope(record, span, {
+        index: candidate.nameStartIndex,
+        endIndex: candidate.nameEndIndex,
+      }),
     }));
 }
 
@@ -859,7 +950,11 @@ function classBindingLocations(record, span, identifier) {
     const index = match.index + match[0].lastIndexOf(match[1]);
     const location = { name, index, endIndex: index + match[1].length };
     if (locationOwnedByDeclaration(record, span, location)) {
-      locations.push({ ...location, kind: 'class' });
+      locations.push({
+        ...location,
+        kind: 'class',
+        ...blockScopedBindingScope(record, span, location),
+      });
     }
   }
   return locations;
@@ -867,11 +962,38 @@ function classBindingLocations(record, span, identifier) {
 
 function localBindingLocations(record, span, identifier) {
   return [
-    ...parameterBindingLocations(record, span, identifier),
+    ...parameterBindingLocations(record, span, identifier)
+      .map((location) => ({ ...location, ...functionScopedBindingScope(span) })),
     ...variableBindingLocations(record, span, identifier),
     ...functionBindingLocations(record, span, identifier),
     ...classBindingLocations(record, span, identifier),
   ].sort((a, b) => a.index - b.index || a.endIndex - b.endIndex);
+}
+
+function declarationScopeChain(record, span) {
+  const chain = [];
+  let current = span;
+  while (current) {
+    chain.push(current);
+    current = parentDeclarationSpanForSpan(record, current);
+  }
+  return chain;
+}
+
+function visibleLocalBindingLocations(record, span, identifier) {
+  const bindings = [];
+  const seen = new Set();
+  for (const scopeSpan of declarationScopeChain(record, span)) {
+    for (const binding of localBindingLocations(record, scopeSpan, identifier)) {
+      const key = `${binding.kind}:${binding.index}:${binding.endIndex}:${binding.scopeStart}:${binding.scopeEnd}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      bindings.push(binding);
+    }
+  }
+  return bindings.sort((a, b) => (a.scopeEnd - a.scopeStart) - (b.scopeEnd - b.scopeStart)
+    || b.scopeStart - a.scopeStart
+    || a.index - b.index);
 }
 
 function sameLocation(a, b) {
@@ -899,10 +1021,17 @@ function localBindingIsImportDeclaration(record, localBinding, binding, ref) {
 }
 
 function isShadowedReferenceLocation(record, span, identifier, location, { binding, ref } = {}) {
-  for (const localBinding of localBindingLocations(record, span, identifier)) {
+  for (const localBinding of visibleLocalBindingLocations(record, span, identifier)) {
     if (sameLocation(localBinding, location)) return true;
     if (localBindingIsImportDeclaration(record, localBinding, binding, ref)) continue;
-    if (localBinding.index <= location.index) return true;
+    if (
+      Number.isInteger(localBinding.scopeStart)
+      && Number.isInteger(localBinding.scopeEnd)
+      && location.index >= localBinding.scopeStart
+      && location.endIndex <= localBinding.scopeEnd
+    ) {
+      return true;
+    }
   }
   return false;
 }
@@ -1004,11 +1133,13 @@ function namedExportDeclarationMap(record) {
 
   const directFunctionExportPattern = /\bexport\s+(?:async\s+)?function\s*\*?\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g;
   const directArrowExportPattern = /\bexport\s+(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=/g;
+  const commonJsFunctionExpressionPattern = /\b(?:module\.)?exports\s*\.\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s+)?function\s*\*?\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g;
   const commonJsPropertyPattern = /\b(?:module\.)?exports\s*\.\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\b/g;
   const commonJsObjectPattern = /\bmodule\s*\.\s*exports\s*=\s*\{([\s\S]*?)\}/g;
   let match;
   while ((match = directFunctionExportPattern.exec(masked))) add(match[1], match[1]);
   while ((match = directArrowExportPattern.exec(masked))) add(match[1], match[1]);
+  while ((match = commonJsFunctionExpressionPattern.exec(masked))) add(match[1], match[2]);
   while ((match = commonJsPropertyPattern.exec(masked))) add(match[1], match[2]);
   while ((match = commonJsObjectPattern.exec(masked))) {
     for (const part of identifierListParts(match[1])) {
@@ -1078,6 +1209,39 @@ function isDirectCallableIdentifierReference(source, location) {
   return text[nextIndex] === '(' || isJsxOpeningIdentifierReference(text, location);
 }
 
+function namespaceReferenceMaskedSource(source) {
+  return maskIgnorableSyntax(source)
+    .replace(/<\/\s*[A-Za-z_$][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_$][A-Za-z0-9_$]*)*/g, (closingTag) => (
+      ' '.repeat(closingTag.length)
+    ));
+}
+
+function isNamespaceBaseReference(masked, location) {
+  const previousIndex = previousNonWhitespaceIndex(masked, location.index);
+  if (previousIndex === -1) return true;
+  return masked[previousIndex] !== '.' && masked[previousIndex] !== '#';
+}
+
+function namespaceMemberAfter(masked, endIndex) {
+  let operatorIndex = findNextNonWhitespaceIndex(masked, endIndex);
+  if (masked[operatorIndex] === '?') {
+    if (masked[operatorIndex + 1] !== '.') return null;
+    operatorIndex += 2;
+  } else if (masked[operatorIndex] === '.') {
+    operatorIndex += 1;
+  } else {
+    return null;
+  }
+  const memberStart = findNextNonWhitespaceIndex(masked, operatorIndex);
+  const match = masked.slice(memberStart).match(/^([A-Za-z_$][A-Za-z0-9_$]*)/);
+  if (!match) return null;
+  return {
+    name: match[1],
+    index: memberStart,
+    endIndex: memberStart + match[1].length,
+  };
+}
+
 function declarationReferenceLocations(record, span, identifier, {
   directCallableOnly = false,
   binding,
@@ -1095,23 +1259,23 @@ function declarationReferenceLocations(record, span, identifier, {
 function namespaceMemberReferenceLocations(record, span, namespaceName, { binding, ref } = {}) {
   const namespace = normalizeIdentifier(namespaceName);
   if (!namespace) return new Map();
-  const text = normalizeString(record?.source);
-  const masked = maskIgnorableSyntax(text);
+  const masked = namespaceReferenceMaskedSource(record?.source);
   const escaped = escapeRegExp(namespace);
-  const pattern = new RegExp(`(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])\\s*(?:\\?\\.|\\.)\\s*([A-Za-z_$][A-Za-z0-9_$]*)\\s*(?:\\?\\.)?\\s*\\(`, 'g');
+  const pattern = new RegExp(`(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])`, 'g');
   const locationsByMember = new Map();
   let match;
   while ((match = pattern.exec(masked))) {
-    const memberName = normalizeIdentifier(match[1]);
-    if (!memberName) continue;
     const namespaceLocation = {
       index: match.index,
       endIndex: match.index + namespace.length,
     };
-    const memberOffset = match[0].lastIndexOf(match[1]);
+    if (!isNamespaceBaseReference(masked, namespaceLocation)) continue;
+    const member = namespaceMemberAfter(masked, namespaceLocation.endIndex);
+    const memberName = normalizeIdentifier(member?.name);
+    if (!memberName) continue;
     const memberLocation = {
-      index: match.index + memberOffset,
-      endIndex: match.index + memberOffset + memberName.length,
+      index: member.index,
+      endIndex: member.endIndex,
     };
     if (span && !locationOwnedByDeclaration(record, span, namespaceLocation)) continue;
     if (span && isShadowedReferenceLocation(record, span, namespace, namespaceLocation, { binding, ref })) continue;
