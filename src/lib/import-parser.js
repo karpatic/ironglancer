@@ -555,26 +555,35 @@ export function maskIgnorableSyntax(text) {
   return chars.join('');
 }
 
-export function countIdentifierReferences(source, identifier) {
-  const name = normalizeJsIdentifier(identifier);
-  if (!name) return 0;
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const pattern = new RegExp(`(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])`, 'g');
-  const masked = maskIgnorableSyntax(normalizeString(source))
-    .replace(/<\/\s*[A-Za-z_$][A-Za-z0-9_$]*/g, (closingTag) => ' '.repeat(closingTag.length));
-  return Array.from(masked.matchAll(pattern)).length;
+function isNonReferenceIdentifierLocation(masked, startIndex, endIndex) {
+  const previousIndex = previousSignificantIndex(masked, startIndex);
+  if (previousIndex !== -1 && (masked[previousIndex] === '.' || masked[previousIndex] === '#')) return true;
+
+  const nextIndex = findNextNonWhitespace(masked, endIndex);
+  return masked[nextIndex] === ':' && ['{', ','].includes(masked[previousIndex]);
 }
 
-export function identifierReferenceLocations(source, identifier) {
+function identifierReferenceMatches(source, identifier) {
   const name = normalizeJsIdentifier(identifier);
-  if (!name) return [];
+  if (!name) return { text: normalizeString(source), matches: [] };
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const pattern = new RegExp(`(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])`, 'g');
   const text = normalizeString(source);
-  const lineStarts = lineStartIndexes(text);
   const masked = maskIgnorableSyntax(text)
     .replace(/<\/\s*[A-Za-z_$][A-Za-z0-9_$]*/g, (closingTag) => ' '.repeat(closingTag.length));
-  return Array.from(masked.matchAll(pattern)).map((match) => ({
+  const matches = Array.from(masked.matchAll(pattern))
+    .filter((match) => !isNonReferenceIdentifierLocation(masked, match.index, match.index + match[0].length));
+  return { text, matches };
+}
+
+export function countIdentifierReferences(source, identifier) {
+  return identifierReferenceMatches(source, identifier).matches.length;
+}
+
+export function identifierReferenceLocations(source, identifier) {
+  const { text, matches } = identifierReferenceMatches(source, identifier);
+  const lineStarts = lineStartIndexes(text);
+  return matches.map((match) => ({
     index: match.index,
     endIndex: match.index + match[0].length,
     line: lineNumberAt(match.index, lineStarts),

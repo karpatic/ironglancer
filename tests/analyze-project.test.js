@@ -584,6 +584,131 @@ test('analyzeProject maps named export aliases back to local declarations for im
   assert.match(result.mermaid, /\+bar \[lines: 1 \| refs: 1 \| importers: 1\]/);
 });
 
+test('analyzeProject does not resolve anonymous default imports through importer local names', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import unused from './feature.js';",
+      '',
+      'export function App() {',
+      '  return <main />;',
+      '}',
+    ].join('\n'),
+    'src/feature.js': [
+      'function unused() {',
+      "  return 'private';",
+      '}',
+      '',
+      'export default function () {',
+      "  return 'anonymous';",
+      '}',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
+  const unusedCandidate = candidatesByName.get('unused');
+
+  assert.equal(unusedCandidate.confidence, 'high-confidence');
+  assert.equal(unusedCandidate.counts.directImportingFiles, 0);
+  assert.equal(unusedCandidate.counts.incomingImportReferences, 0);
+  assert.ok(!result.sourceCode.declarations.some((item) => (
+    item.name === 'unused' && item.sourceOrigin === 'imported-script-member'
+  )));
+  assert.ok(result.sourceCode.declarations.some((item) => (
+    item.name === 'unused' && item.sourceOrigin === 'dead-function-candidate'
+  )));
+  assert.ok(!result.mermaid.includes('+unused [lines:'));
+});
+
+test('analyzeProject resolves default exports from mixed local export lists', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import Widget from './feature.js';",
+      '',
+      'export function App() {',
+      '  return <main>{Widget()}</main>;',
+      '}',
+    ].join('\n'),
+    'src/feature.js': [
+      "function other() { return 'other'; }",
+      "function foo() { return 'foo'; }",
+      'export { other, foo as default };',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
+  const widgetDeclaration = result.sourceCode.declarations.find((item) => item.name === 'Widget');
+
+  assert.ok(!candidatesByName.has('foo'));
+  assert.ok(widgetDeclaration);
+  assert.equal(widgetDeclaration.declarationName, 'foo');
+  assert.equal(widgetDeclaration.incomingReferenceCount, 1);
+  assert.equal(widgetDeclaration.importerFileCount, 1);
+  assert.equal(widgetDeclaration.referenceCount, 1);
+  assert.match(result.mermaid, /\+Widget \[lines: 1 \| refs: 1 \| importers: 1\]/);
+});
+
+test('analyzeProject ignores property names when classifying direct identifier references', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import { entry } from './feature.js';",
+      '',
+      'export function App() {',
+      '  return <main>{entry()}</main>;',
+      '}',
+    ].join('\n'),
+    'src/feature.js': [
+      'export function entry() {',
+      '  return liveFromCall();',
+      '}',
+      '',
+      'function unused() {',
+      "  return 'dead';",
+      '}',
+      '',
+      'function liveFromCall() {',
+      "  return 'call';",
+      '}',
+      '',
+      'function liveFromValue() {',
+      "  return 'value';",
+      '}',
+      '',
+      'function liveFromShorthand() {',
+      "  return 'shorthand';",
+      '}',
+      '',
+      'function liveFromComputedMember() {',
+      "  return 'computed';",
+      '}',
+      '',
+      'const registry = {',
+      '  unused: true,',
+      '  liveFromShorthand,',
+      '  value: liveFromValue,',
+      '};',
+      'registry.unused = true;',
+      'registry?.unused;',
+      'const valueReference = liveFromValue;',
+      'const computedReference = registry[liveFromComputedMember];',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
+  const unusedCandidate = candidatesByName.get('unused');
+
+  assert.equal(unusedCandidate.confidence, 'high-confidence');
+  assert.equal(unusedCandidate.counts.directIdentifierReferences, 0);
+  assert.equal(unusedCandidate.counts.nameOccurrences, 1);
+  assert.equal(unusedCandidate.signals.declarationOnlyNameOccurrence, true);
+  assert.ok(!candidatesByName.has('liveFromCall'));
+  assert.ok(!candidatesByName.has('liveFromValue'));
+  assert.ok(!candidatesByName.has('liveFromShorthand'));
+  assert.ok(!candidatesByName.has('liveFromComputedMember'));
+});
+
 test('analyzeProject keeps ASI-separated function declarations as dead candidates without named expression noise', async () => {
   const rootDir = await writeTempProject({
     'src/app.jsx': [

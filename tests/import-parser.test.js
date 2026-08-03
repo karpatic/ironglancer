@@ -87,6 +87,25 @@ test('countIdentifierReferences preserves template interpolation code and ignore
   assert.equal(countIdentifierReferences(source, 'helperTwo'), 1);
 });
 
+test('countIdentifierReferences ignores property names while preserving value references', () => {
+  const source = [
+    'const references = {',
+    '  unused: true,',
+    '  liveValue: liveValue,',
+    '  liveShorthand,',
+    '};',
+    'registry.unused = true;',
+    'registry?.unused;',
+    'unused();',
+    'const value = unused;',
+    'const computed = registry[unused];',
+  ].join('\n');
+
+  assert.equal(countIdentifierReferences(source, 'unused'), 3);
+  assert.equal(countIdentifierReferences(source, 'liveValue'), 1);
+  assert.equal(countIdentifierReferences(source, 'liveShorthand'), 1);
+});
+
 test('extractDeclarationSpans measures one-line function and arrow declarations', () => {
   const source = [
     'export function OneLine() { return "{ not a block }"; }',

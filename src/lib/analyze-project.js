@@ -324,12 +324,17 @@ function namedExportListEntries(masked) {
 function defaultExportDeclarationName(record) {
   const source = normalizeString(record?.source);
   if (!source) return '';
+  const masked = maskIgnorableSyntax(source);
   const spans = declarationSpansByName(record);
-  const directMatch = source.match(/\bexport\s+default\s+(?:async\s+)?function\s*\*?\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/);
+  const directMatch = masked.match(/\bexport\s+default\s+(?:async\s+)?function\s*\*?\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/);
   if (directMatch && spans.has(directMatch[1])) return directMatch[1];
-  const reexportMatch = source.match(/\bexport\s*\{\s*([A-Za-z_$][A-Za-z0-9_$]*)\s+as\s+default\s*\}/);
-  if (reexportMatch && spans.has(reexportMatch[1])) return reexportMatch[1];
-  const identifierMatch = source.match(/\bexport\s+default\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/);
+  for (const entry of namedExportListEntries(masked)) {
+    for (const part of identifierListParts(entry.specifiersText)) {
+      const specifier = parseNamedExportSpecifier(part);
+      if (specifier?.exported === 'default' && spans.has(specifier.local)) return specifier.local;
+    }
+  }
+  const identifierMatch = masked.match(/\bexport\s+default\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/);
   if (identifierMatch && spans.has(identifierMatch[1])) return identifierMatch[1];
   return '';
 }
@@ -590,7 +595,7 @@ function importBindingDeclarationName(targetRecord, binding) {
     const imported = normalizeIdentifier(binding?.imported);
     return namedExportDeclarationName(targetRecord, imported) || imported;
   }
-  if (kind === 'default') return defaultExportDeclarationName(targetRecord) || normalizeString(binding?.local).trim();
+  if (kind === 'default') return defaultExportDeclarationName(targetRecord);
   return '';
 }
 
@@ -770,7 +775,8 @@ function importedScriptCandidatesForJsx(record, graph, declarationImportMetrics)
     const targetRecord = ref.localRel ? graph.modules.get(ref.localRel) : null;
     const binding = (Array.isArray(ref.bindings) ? ref.bindings : [])
       .find((candidate) => candidate.local === name);
-    const declarationName = importBindingDeclarationName(targetRecord, binding) || name;
+    const resolvedDeclarationName = importBindingDeclarationName(targetRecord, binding);
+    const declarationName = resolvedDeclarationName || (targetRecord ? '' : name);
     candidates.push({
       name,
       targetRecord,
