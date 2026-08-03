@@ -2,13 +2,19 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import crypto from 'node:crypto';
+import { execFile as execFileCallback } from 'node:child_process';
+import { promisify } from 'node:util';
 
 import { analyzeProject } from './analyze-project.js';
 import { viewerHtml } from '../viewer/html.js';
 
 const require = createRequire(import.meta.url);
+const execFile = promisify(execFileCallback);
 const packageMeta = require('../../package.json');
 const viewerAppUrl = new URL('../viewer/app.js', import.meta.url);
+const API_VERSION = 'v1';
+const SCHEMA_VERSION = '1.0.0';
+const API_DATA_DIR = '.ironglancer-api';
 
 const CREDENTIAL_VALUE_PATTERNS = [
   /\bAKIA[0-9A-Z]{16}\b/,
@@ -93,6 +99,16 @@ function hasCredentialLiteral(code) {
 }
 
 function assertNoCredentialLiterals(sourceCode = {}) {
+  for (const moduleSource of Array.isArray(sourceCode.modules) ? sourceCode.modules : []) {
+    const code = typeof moduleSource.code === 'string' ? moduleSource.code : '';
+    if (!code) continue;
+    if (!hasCredentialLiteral(code)) continue;
+    const sourcePath = moduleSource.path || 'unknown source';
+    const endLine = moduleSource.lineCount || '?';
+    throw new Error(
+      `Refusing to write source module data: credential-looking literal in ${sourcePath}:1-${endLine}.`,
+    );
+  }
   for (const declaration of Array.isArray(sourceCode.declarations) ? sourceCode.declarations : []) {
     const code = typeof declaration.code === 'string' ? declaration.code : '';
     if (!code) continue;
@@ -132,10 +148,21 @@ function contentHash(value) {
   return sha256(stableJson(value));
 }
 
+async function gitCommitForRoot(rootDir) {
+  try {
+    const { stdout } = await execFile('git', ['-C', rootDir, 'rev-parse', 'HEAD']);
+    const commit = stdout.trim();
+    return /^[a-f0-9]{40}$/i.test(commit) ? commit : null;
+  } catch {
+    return null;
+  }
+}
+
 function analysisPayload(analysis) {
   return {
     rootDir: analysis.rootDir,
     entry: analysis.entryRel,
+    modules: analysisModulesPayload(analysis),
     treeText: analysis.treeText,
     jsxTreeText: analysis.jsxTreeText,
     jsScripts: analysis.jsScripts,
@@ -144,6 +171,56 @@ function analysisPayload(analysis) {
     importEdges: analysis.importEdges,
     summary: analysis.summary,
   };
+}
+
+function declarationSourcePayload(sourceCode = {}) {
+  return {
+    declarations: Array.isArray(sourceCode.declarations) ? sourceCode.declarations : [],
+  };
+}
+
+function moduleSourcePayload(sourceCode = {}) {
+  return {
+    modules: Array.isArray(sourceCode.modules) ? sourceCode.modules : [],
+  };
+}
+
+function isJsxModulePath(modulePath) {
+  return /\.jsx$/i.test(modulePath);
+}
+
+function sanitizedImportRef(ref = {}) {
+  return {
+    specifier: typeof ref.specifier === 'string' ? ref.specifier : '',
+    kind: typeof ref.kind === 'string' ? ref.kind : '',
+    localRel: typeof ref.localRel === 'string' ? ref.localRel : null,
+    bindings: Array.isArray(ref.bindings)
+      ? ref.bindings.map((binding) => ({
+        imported: typeof binding.imported === 'string' ? binding.imported : '',
+        local: typeof binding.local === 'string' ? binding.local : '',
+        kind: typeof binding.kind === 'string' ? binding.kind : '',
+        inferred: Boolean(binding.inferred),
+      }))
+      : [],
+  };
+}
+
+function analysisModulesPayload(analysis = {}) {
+  const modules = analysis?.graph?.modules instanceof Map
+    ? Array.from(analysis.graph.modules.values())
+    : [];
+  return modules
+    .map((record) => ({
+      path: record.rel,
+      lineCount: record.stats?.lineCount || 0,
+      maxLineLength: record.stats?.maxLineLength || 0,
+      reachable: Boolean(record.reachable),
+      isJsx: isJsxModulePath(record.rel),
+      localDependencies: Array.isArray(record.localDeps) ? record.localDeps : [],
+      externalDependencies: Array.isArray(record.externalDeps) ? record.externalDeps : [],
+      importRefs: Array.isArray(record.importRefs) ? record.importRefs.map(sanitizedImportRef) : [],
+    }))
+    .sort((a, b) => a.path.localeCompare(b.path));
 }
 
 export async function generateStaticSite({ rootDir, entry, outDir, routeAliases } = {}) {
@@ -155,6 +232,7 @@ export async function generateStaticSite({ rootDir, entry, outDir, routeAliases 
   const output = analysisPayload(analysis);
   const appJs = await fs.readFile(viewerAppUrl, 'utf8');
   const appScriptSrc = `./app.js?v=${sha256(appJs)}`;
+  const gitCommit = await gitCommitForRoot(analysis.rootDir);
   const buildId = contentHash({
     packageName: packageMeta.name,
     version: packageMeta.version,
@@ -162,9 +240,14 @@ export async function generateStaticSite({ rootDir, entry, outDir, routeAliases 
     sourceCodeHash,
   });
   const meta = {
+    apiVersion: API_VERSION,
+    schemaVersion: SCHEMA_VERSION,
     packageName: packageMeta.name,
     version: packageMeta.version,
     generatedAt,
+    rootDir: analysis.rootDir,
+    entry: analysis.entryRel,
+    gitCommit,
     buildId,
     sourceCodeHash,
   };
@@ -174,7 +257,12 @@ export async function generateStaticSite({ rootDir, entry, outDir, routeAliases 
   await fs.writeFile(path.join(resolvedOutDir, 'app.js'), appJs, 'utf8');
   await fs.writeFile(path.join(resolvedOutDir, 'diagram.mmd'), analysis.mermaid + '\n', 'utf8');
   await writeJson(path.join(resolvedOutDir, 'source-code.json'), {
-    ...analysis.sourceCode,
+    ...declarationSourcePayload(analysis.sourceCode),
+    meta,
+  });
+  await fs.mkdir(path.join(resolvedOutDir, API_DATA_DIR), { recursive: true });
+  await writeJson(path.join(resolvedOutDir, API_DATA_DIR, 'source-modules.json'), {
+    ...moduleSourcePayload(analysis.sourceCode),
     meta,
   });
   await writeJson(path.join(resolvedOutDir, 'output.json'), { ...output, meta });

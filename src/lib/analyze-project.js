@@ -2262,6 +2262,13 @@ function buildMermaid(graph, importEdges, declarationImportMetrics, { reachableO
 function buildSourceCode(graph, declarationImportMetrics, declarationRelationships) {
   const jsxModules = jsxModuleRecords(graph, { reachableOnly: true });
   const classIds = buildClassIds(jsxModules);
+  const modules = moduleRecords(graph)
+    .map((record) => ({
+      path: record.rel,
+      lineCount: record.stats.lineCount,
+      maxLineLength: record.stats.maxLineLength,
+      code: record.source,
+    }));
   const declarations = [];
   const seen = new Set();
 
@@ -2296,7 +2303,7 @@ function buildSourceCode(graph, declarationImportMetrics, declarationRelationshi
     }
   }
 
-  return { declarations };
+  return { modules, declarations };
 }
 
 function buildTreeText(graph) {

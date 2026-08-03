@@ -1,35 +1,147 @@
 #!/usr/bin/env node
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 
-import { generateStaticSite } from './lib/generate-static-site.js';
+import { generateStaticSite as defaultGenerateStaticSite } from './lib/generate-static-site.js';
+import { startStaticAnalysisServer as defaultStartStaticAnalysisServer } from './lib/serve-static-site.js';
 
-const { values, positionals } = parseArgs({
-  options: {
-    entry: { type: 'string' },
-    out: { type: 'string' },
-    'route-alias': { type: 'string', multiple: true },
-    help: { type: 'boolean', short: 'h' },
-  },
-  allowPositionals: true,
-});
+const DEFAULT_HOST = '127.0.0.1';
+const DEFAULT_PORT = 4173;
 
-if (values.help) {
-  console.log('Usage: ironglancer <folder> [--entry src/app.jsx] [--out ./ironglancer-site] [--route-alias /app/=src/app/]');
-  process.exit(0);
+function usage() {
+  return [
+    'Usage: ironglancer <folder> [--entry src/app.jsx] [--out ./ironglancer-site] [--route-alias /app/=src/app/]',
+    '',
+    'Options:',
+    '  --entry <path>              Entry module inside the project root.',
+    '  --out <path>                Output directory for the generated viewer.',
+    '  --route-alias <route=path>  Map a URL-rooted import prefix onto a source folder. Repeatable.',
+    '  --serve                     Generate once, then serve the immutable viewer and /api/v1 JSON API.',
+    `  --host ${DEFAULT_HOST}          Host to bind in serve mode.`,
+    `  --port ${DEFAULT_PORT}              Port to bind in serve mode. Use 0 to pick an available port.`,
+    '  -h, --help                 Show this help.',
+    '',
+  ].join('\n');
 }
 
-const rootDir = positionals[0] || '.';
-const result = await generateStaticSite({
-  rootDir,
-  entry: values.entry,
-  outDir: values.out,
-  routeAliases: values['route-alias'] || [],
-});
+function parsePort(value) {
+  if (value == null || value === '') return DEFAULT_PORT;
+  if (!/^\d+$/.test(String(value))) throw new Error('--port must be an integer between 0 and 65535.');
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error('--port must be an integer between 0 and 65535.');
+  }
+  return port;
+}
 
-console.log(JSON.stringify({
-  ok: true,
-  rootDir: result.rootDir,
-  entry: result.entryRel,
-  outDir: result.outDir,
-  summary: result.summary,
-}, null, 2));
+function resultPayload(result, service) {
+  return {
+    ok: true,
+    rootDir: result.rootDir,
+    entry: result.entryRel,
+    outDir: result.outDir,
+    summary: result.summary,
+    ...(service ? {
+      serving: true,
+      host: service.host,
+      port: service.port,
+      url: service.url,
+      apiBaseUrl: service.apiBaseUrl,
+    } : {}),
+  };
+}
+
+async function writeStream(stream, text) {
+  await new Promise((resolve, reject) => {
+    stream.write(text, (error) => (error ? reject(error) : resolve()));
+  });
+}
+
+async function waitForShutdown(service) {
+  await new Promise((resolve) => {
+    let closed = false;
+    const close = async () => {
+      if (closed) return;
+      closed = true;
+      process.off('SIGINT', close);
+      process.off('SIGTERM', close);
+      try {
+        await service.close();
+      } catch {
+        // Continue shutdown even if the server was already closing.
+      } finally {
+        resolve();
+      }
+    };
+    process.once('SIGINT', close);
+    process.once('SIGTERM', close);
+  });
+}
+
+export async function runCli(args = process.argv.slice(2), {
+  generateStaticSite = defaultGenerateStaticSite,
+  startStaticAnalysisServer = defaultStartStaticAnalysisServer,
+  stdout = process.stdout,
+  stderr = process.stderr,
+  waitForClose = true,
+} = {}) {
+  const { values, positionals } = parseArgs({
+    args,
+    options: {
+      entry: { type: 'string' },
+      out: { type: 'string' },
+      'route-alias': { type: 'string', multiple: true },
+      serve: { type: 'boolean' },
+      host: { type: 'string' },
+      port: { type: 'string' },
+      help: { type: 'boolean', short: 'h' },
+    },
+    allowPositionals: true,
+  });
+
+  if (values.help) {
+    await writeStream(stdout, usage());
+    return 0;
+  }
+
+  const rootDir = positionals[0] || '.';
+  const result = await generateStaticSite({
+    rootDir,
+    entry: values.entry,
+    outDir: values.out,
+    routeAliases: values['route-alias'] || [],
+  });
+
+  if (!values.serve) {
+    await writeStream(stdout, JSON.stringify(resultPayload(result), null, 2) + '\n');
+    return 0;
+  }
+
+  const service = await startStaticAnalysisServer({
+    outDir: result.outDir,
+    host: values.host || DEFAULT_HOST,
+    port: parsePort(values.port),
+  });
+  try {
+    await writeStream(stdout, JSON.stringify(resultPayload(result, service), null, 2) + '\n');
+    await writeStream(stderr, `IronGlancer serving ${service.url} with API at ${service.apiBaseUrl}\n`);
+    if (waitForClose) await waitForShutdown(service);
+    return 0;
+  } catch (error) {
+    await service.close().catch(() => {});
+    throw error;
+  }
+}
+
+const isMain = process.argv[1]
+  && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
+
+if (isMain) {
+  runCli().then((exitCode) => {
+    process.exitCode = exitCode;
+  }).catch((error) => {
+    console.error(error?.message || error);
+    process.exitCode = 1;
+  });
+}

@@ -5,9 +5,12 @@ import os from 'node:os';
 import fs from 'node:fs/promises';
 import vm from 'node:vm';
 import crypto from 'node:crypto';
+import { execFile as execFileCallback } from 'node:child_process';
+import { promisify } from 'node:util';
 
 import { generateStaticSite } from '../src/lib/generate-static-site.js';
 
+const execFile = promisify(execFileCallback);
 const fixtureRoot = path.resolve('tests/fixtures/sample-app');
 
 class FakeElement {
@@ -353,13 +356,14 @@ async function generateTestSite({ rootDir = fixtureRoot, entry = 'src/app.jsx', 
   const outDir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
   const result = await generateStaticSite({ rootDir, entry, outDir });
   const readJson = async (fileName) => JSON.parse(await fs.readFile(path.join(outDir, fileName), 'utf8'));
-  const [html, appJs, payload, sourcePayload] = await Promise.all([
+  const [html, appJs, payload, sourcePayload, moduleSourcePayload] = await Promise.all([
     fs.readFile(path.join(outDir, 'index.html'), 'utf8'),
     fs.readFile(path.join(outDir, 'app.js'), 'utf8'),
     readJson('output.json'),
     readJson('source-code.json'),
+    readJson(path.join('.ironglancer-api', 'source-modules.json')),
   ]);
-  return { outDir, html, appJs, payload, sourcePayload, result };
+  return { outDir, html, appJs, payload, sourcePayload, moduleSourcePayload, result };
 }
 
 function createFakeMermaidEdge(document, { source, target, labelText = 'import' }) {
@@ -446,6 +450,7 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.ok(files.includes('app.js'));
   assert.ok(files.includes('output.json'));
   assert.ok(files.includes('source-code.json'));
+  assert.ok(files.includes('.ironglancer-api'));
   assert.ok(files.includes('vendor'));
 
   const expectedAppHash = crypto.createHash('sha256').update(appJs).digest('hex');
@@ -485,11 +490,18 @@ test('generateStaticSite writes a static viewer bundle', async () => {
 
   assert.match(output.meta.buildId, /^[a-f0-9]{64}$/);
   assert.match(output.meta.sourceCodeHash, /^[a-f0-9]{64}$/);
+  assert.equal(output.meta.apiVersion, 'v1');
+  assert.equal(output.meta.schemaVersion, '1.0.0');
+  assert.equal(output.meta.rootDir, fixtureRoot);
+  assert.equal(output.meta.entry, 'src/app.jsx');
+  const { stdout: expectedGitCommit } = await execFile('git', ['-C', fixtureRoot, 'rev-parse', 'HEAD']);
+  assert.equal(output.meta.gitCommit, expectedGitCommit.trim());
   assert.equal(sourceOutput.meta.buildId, output.meta.buildId);
   assert.equal(sourceOutput.meta.sourceCodeHash, output.meta.sourceCodeHash);
   assert.equal(sourceOutput.meta.packageName, output.meta.packageName);
   assert.equal(sourceOutput.meta.version, output.meta.version);
   assert.equal(sourceOutput.meta.generatedAt, output.meta.generatedAt);
+  assert.equal(sourceOutput.modules, undefined);
   const helperSource = sourceOutput.declarations.find((item) => item.name === 'helper');
   assert.equal(helperSource.moduleId, 'app');
   assert.equal(helperSource.modulePath, 'src/lib/util.js');
@@ -501,6 +513,25 @@ test('generateStaticSite writes a static viewer bundle', async () => {
 
   const vendorFiles = await fs.readdir(path.join(outDir, 'vendor'));
   assert.ok(vendorFiles.some((name) => name.includes('mermaid')));
+});
+
+test('generateStaticSite keeps full module source in API-only data', async () => {
+  const { payload, sourcePayload, moduleSourcePayload } = await generateTestSite({
+    prefix: 'ironglancer-static-api-source-',
+  });
+
+  assert.equal(sourcePayload.modules, undefined);
+  assert.equal(moduleSourcePayload.meta.buildId, payload.meta.buildId);
+  assert.equal(moduleSourcePayload.meta.sourceCodeHash, payload.meta.sourceCodeHash);
+  assert.deepEqual(moduleSourcePayload.modules.map((item) => item.path), [
+    'shared/theme.js',
+    'src/app.jsx',
+    'src/components/App.jsx',
+    'src/lib/util.js',
+    'src/panes/Inspector.jsx',
+  ]);
+  const appModule = moduleSourcePayload.modules.find((item) => item.path === 'src/app.jsx');
+  assert.match(appModule.code, /export default function RootApp/);
 });
 
 test('generateStaticSite refuses credential-looking source snippets without rejecting validation copy', async () => {
