@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 import { countIdentifierReferences, extractDeclarationSpans, extractImportRefs } from '../src/lib/import-parser.js';
 
-test('extractImportRefs classifies dynamic, lazy, and require refs without dead duplicates', () => {
+test('extractImportRefs classifies dynamic, lazy, and require refs without duplicate refs', () => {
   const source = [
     "import DefaultThing, { NamedThing as namedAlias } from './static.js';",
     "import './side-effect.js';",
@@ -339,7 +339,7 @@ test('extractDeclarationSpans treats template interpolation function names as ex
     'const label = `${function helper() {}}`;',
     '',
     'function afterTemplate() {',
-    "  return 'dead';",
+    "  return 'unused';",
     '}',
   ].join('\n');
 

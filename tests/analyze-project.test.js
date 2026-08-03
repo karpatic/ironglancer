@@ -213,7 +213,6 @@ test('analyzeProject exposes JSX import edge metadata', async () => {
     'src/faculty-body-child.jsx',
     'src/faculty-editor-child.jsx',
     'src/static-child.jsx',
-    'src/unused-child.jsx',
   ]);
   assert.match(result.mermaid, /class app\["28 app\.jsx"\] \{/);
   assert.match(result.mermaid, /\+App\(\) \[lines: 16 \| refs: 0 \| importers: 0\]/);
@@ -221,7 +220,6 @@ test('analyzeProject exposes JSX import edge metadata', async () => {
   assert.match(result.mermaid, /\+StaticNamed\(\) \[lines: 3 \| refs: 1 \| importers: 1\]/);
   assert.ok(result.mermaid.includes('app --> static_child : import'));
   assert.ok(result.mermaid.includes('app --> dynamic_child : lazy'));
-  assert.ok(!result.mermaid.includes('unused_child'));
   assert.ok(!result.mermaid.includes(': imports'));
 
   assert.deepEqual(result.importEdges, [
@@ -459,271 +457,6 @@ test('analyzeProject resolves local require forms and preserves require edge met
   ]);
 });
 
-test('analyzeProject classifies zero-reference dead function candidates with static evidence', async () => {
-  const rootDir = await writeTempProject({
-    'src/app.jsx': [
-      "import { usedTool } from './tools.js';",
-      "import * as Shared from './shared.js';",
-      "require('./register.js');",
-      '',
-      'export function App() {',
-      '  return <main>{usedTool()}{Shared.usedShared()}</main>;',
-      '}',
-      '',
-      'function entryHelper() {',
-      "  return 'entry';",
-      '}',
-    ].join('\n'),
-    'src/tools.js': [
-      'export function usedTool() {',
-      "  return 'used';",
-      '}',
-      '',
-      'function abandonedTool() {',
-      "  return 'dead';",
-      '}',
-      '',
-      'function exportedUtility() {',
-      "  return 'public';",
-      '}',
-      '',
-      'export { exportedUtility };',
-    ].join('\n'),
-    'src/shared.js': [
-      'export function usedShared() {',
-      "  return 'namespace';",
-      '}',
-      '',
-      'function namespaceOnly() {',
-      "  return 'maybe';",
-      '}',
-    ].join('\n'),
-    'src/register.js': [
-      'function registerSideEffect() {',
-      '  return true;',
-      '}',
-    ].join('\n'),
-  });
-
-  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
-  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
-
-  assert.ok(!candidatesByName.has('usedTool'));
-  assert.equal(candidatesByName.get('abandonedTool').confidence, 'high-confidence');
-  assert.equal(candidatesByName.get('abandonedTool').counts.directIdentifierReferences, 0);
-  assert.equal(candidatesByName.get('abandonedTool').counts.directImportingFiles, 0);
-  assert.equal(candidatesByName.get('abandonedTool').signals.declarationOnlyNameOccurrence, true);
-
-  assert.equal(candidatesByName.get('App').confidence, 'manual-review');
-  assert.equal(candidatesByName.get('App').signals.exported, true);
-  assert.equal(candidatesByName.get('App').signals.entrypointModule, true);
-  assert.equal(candidatesByName.get('App').signals.componentConvention, true);
-
-  assert.equal(candidatesByName.get('exportedUtility').confidence, 'manual-review');
-  assert.equal(candidatesByName.get('exportedUtility').counts.directIdentifierReferences, 0);
-  assert.equal(candidatesByName.get('exportedUtility').counts.publicApiReferences, 1);
-  assert.equal(candidatesByName.get('exportedUtility').signals.exported, true);
-
-  assert.equal(candidatesByName.get('usedShared').confidence, 'manual-review');
-  assert.equal(candidatesByName.get('usedShared').signals.namespaceModuleReference, true);
-  assert.equal(candidatesByName.get('namespaceOnly').signals.namespaceModuleReference, true);
-
-  assert.equal(candidatesByName.get('registerSideEffect').confidence, 'manual-review');
-  assert.equal(candidatesByName.get('registerSideEffect').signals.moduleOnlyReference, true);
-  assert.equal(candidatesByName.get('registerSideEffect').signals.commonJsModuleReference, true);
-
-  assert.equal(result.summary.deadFunctionCandidateCount, result.deadFunctionCandidates.length);
-  assert.equal(result.summary.deadFunctionHighConfidenceCount, 1);
-  assert.equal(
-    result.summary.deadFunctionManualReviewCount,
-    result.deadFunctionCandidates.length - result.summary.deadFunctionHighConfidenceCount,
-  );
-  const abandonedSource = result.sourceCode.declarations.find((item) => item.name === 'abandonedTool');
-  assert.ok(abandonedSource.candidateId);
-  assert.equal(abandonedSource.sourceOrigin, 'dead-function-candidate');
-});
-
-test('analyzeProject finds dead candidates in orphan modules while resolving orphan imports', async () => {
-  const rootDir = await writeTempProject({
-    'src/app.jsx': [
-      'export function App() {',
-      '  return <main />;',
-      '}',
-    ].join('\n'),
-    'src/orphan.jsx': [
-      "import { orphanHelper } from './orphan-helper.js';",
-      '',
-      'export function OrphanEntry() {',
-      '  return orphanHelper();',
-      '}',
-      '',
-      'function orphanUnused() {',
-      "  return 'unused';",
-      '}',
-    ].join('\n'),
-    'src/orphan-helper.js': [
-      'export function orphanHelper() {',
-      '  return helperPrivate();',
-      '}',
-      '',
-      'function helperPrivate() {',
-      "  return 'helper';",
-      '}',
-    ].join('\n'),
-  });
-
-  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
-  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
-  const orphanUnused = candidatesByName.get('orphanUnused');
-  const orphanEntry = candidatesByName.get('OrphanEntry');
-
-  assert.equal(result.summary.moduleCount, 3);
-  assert.equal(result.summary.reachableModuleCount, 1);
-  assert.equal(result.summary.unreachableModuleCount, 2);
-  assert.deepEqual(
-    result.jsScripts.map((item) => ({ path: item.path, reachable: item.reachable })),
-    [
-      { path: 'src/app.jsx', reachable: true },
-      { path: 'src/orphan-helper.js', reachable: false },
-      { path: 'src/orphan.jsx', reachable: false },
-    ],
-  );
-  assert.ok(!result.treeText.includes('src/orphan.jsx'));
-  assert.ok(!result.mermaid.includes('OrphanEntry'));
-
-  assert.equal(orphanUnused.confidence, 'high-confidence');
-  assert.equal(orphanUnused.reachable, false);
-  assert.equal(orphanUnused.signals.reachableModule, false);
-  assert.ok(orphanUnused.evidence.some((item) => item.label === 'Unreachable scope'));
-  assert.equal(orphanEntry.confidence, 'manual-review');
-  assert.equal(orphanEntry.reachable, false);
-  assert.ok(!candidatesByName.has('orphanHelper'));
-  assert.ok(!candidatesByName.has('helperPrivate'));
-});
-
-test('analyzeProject ignores self-recursive references inside a declaration but keeps outside callers', async () => {
-  const rootDir = await writeTempProject({
-    'src/app.jsx': [
-      "import { run } from './feature.js';",
-      '',
-      'export function App() {',
-      '  return <main>{run()}</main>;',
-      '}',
-    ].join('\n'),
-    'src/feature.js': [
-      'export function run() {',
-      '  return externallyCalled(2);',
-      '}',
-      '',
-      'function selfOnly(count) {',
-      '  if (count <= 0) return 0;',
-      '  return selfOnly(count - 1);',
-      '}',
-      '',
-      'function externallyCalled(count) {',
-      '  if (count <= 0) return 1;',
-      '  return externallyCalled(count - 1);',
-      '}',
-    ].join('\n'),
-  });
-
-  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
-  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
-  const selfOnly = candidatesByName.get('selfOnly');
-
-  assert.equal(selfOnly.confidence, 'high-confidence');
-  assert.equal(selfOnly.counts.directIdentifierReferences, 0);
-  assert.equal(selfOnly.counts.sameFileReferences, 0);
-  assert.equal(selfOnly.counts.ownDeclarationReferences, 1);
-  assert.equal(selfOnly.counts.nameOccurrences, 2);
-  assert.equal(selfOnly.signals.declarationOnlyNameOccurrence, true);
-  assert.ok(!candidatesByName.has('externallyCalled'));
-});
-
-test('analyzeProject keeps semicolonless export-list ranges from hiding later same-file uses', async () => {
-  const rootDir = await writeTempProject({
-    'src/app.jsx': [
-      "import './feature.js';",
-      '',
-      'export function App() {',
-      '  return null;',
-      '}',
-    ].join('\n'),
-    'src/feature.js': [
-      'function foo() {',
-      "  return 'live';",
-      '}',
-      '',
-      'export { foo }',
-      'foo()',
-    ].join('\n'),
-  });
-
-  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
-  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
-
-  assert.ok(!candidatesByName.has('foo'));
-});
-
-test('analyzeProject excludes named function expression internal names from dead candidates', async () => {
-  const rootDir = await writeTempProject({
-    'src/app.jsx': [
-      "import { run } from './tasks.js';",
-      '',
-      'export function App() {',
-      '  return <main>{run()}</main>;',
-      '}',
-    ].join('\n'),
-    'src/tasks.js': [
-      'export const run = function helper() {',
-      "  return 'running';",
-      '};',
-      '',
-      'setTimeout(function tick() {',
-      "  return 'later';",
-      '}, 1);',
-      '',
-      'function abandonedTask() {',
-      "  return 'dead';",
-      '}',
-    ].join('\n'),
-  });
-
-  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
-  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
-
-  assert.ok(!candidatesByName.has('helper'));
-  assert.ok(!candidatesByName.has('tick'));
-  assert.equal(candidatesByName.get('abandonedTask').confidence, 'high-confidence');
-});
-
-test('analyzeProject excludes named function expressions inside template interpolation from dead candidates', async () => {
-  const rootDir = await writeTempProject({
-    'src/app.jsx': [
-      "import { renderMessage } from './feature.js';",
-      '',
-      'export function App() {',
-      '  return <main>{renderMessage()}</main>;',
-      '}',
-    ].join('\n'),
-    'src/feature.js': [
-      'export function renderMessage() {',
-      '  return `${function helper() {}}`;',
-      '}',
-      '',
-      'function abandonedTask() {',
-      "  return 'dead';",
-      '}',
-    ].join('\n'),
-  });
-
-  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
-  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
-
-  assert.ok(!candidatesByName.has('helper'));
-  assert.equal(candidatesByName.get('abandonedTask').confidence, 'high-confidence');
-});
-
 test('analyzeProject maps named export aliases back to local declarations for import metrics', async () => {
   const rootDir = await writeTempProject({
     'src/app.jsx': [
@@ -740,10 +473,8 @@ test('analyzeProject maps named export aliases back to local declarations for im
   });
 
   const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
-  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
   const importedDeclaration = result.sourceCode.declarations.find((item) => item.declarationName === 'foo');
 
-  assert.ok(!candidatesByName.has('foo'));
   assert.ok(importedDeclaration);
   assert.equal(importedDeclaration.name, 'bar');
   assert.equal(importedDeclaration.incomingReferenceCount, 1);
@@ -773,17 +504,9 @@ test('analyzeProject does not resolve anonymous default imports through importer
   });
 
   const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
-  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
-  const unusedCandidate = candidatesByName.get('unused');
 
-  assert.equal(unusedCandidate.confidence, 'high-confidence');
-  assert.equal(unusedCandidate.counts.directImportingFiles, 0);
-  assert.equal(unusedCandidate.counts.incomingImportReferences, 0);
   assert.ok(!result.sourceCode.declarations.some((item) => (
     item.name === 'unused' && item.sourceOrigin === 'imported-script-member'
-  )));
-  assert.ok(result.sourceCode.declarations.some((item) => (
-    item.name === 'unused' && item.sourceOrigin === 'dead-function-candidate'
   )));
   assert.ok(!result.mermaid.includes('+unused [lines:'));
 });
@@ -805,158 +528,12 @@ test('analyzeProject resolves default exports from mixed local export lists', as
   });
 
   const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
-  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
   const widgetDeclaration = result.sourceCode.declarations.find((item) => item.name === 'Widget');
 
-  assert.ok(!candidatesByName.has('foo'));
   assert.ok(widgetDeclaration);
   assert.equal(widgetDeclaration.declarationName, 'foo');
   assert.equal(widgetDeclaration.incomingReferenceCount, 1);
   assert.equal(widgetDeclaration.importerFileCount, 1);
   assert.equal(widgetDeclaration.referenceCount, 1);
   assert.match(result.mermaid, /\+Widget \[lines: 1 \| refs: 1 \| importers: 1\]/);
-});
-
-test('analyzeProject ignores property names when classifying direct identifier references', async () => {
-  const rootDir = await writeTempProject({
-    'src/app.jsx': [
-      "import { entry } from './feature.js';",
-      '',
-      'export function App() {',
-      '  return <main>{entry()}</main>;',
-      '}',
-    ].join('\n'),
-    'src/feature.js': [
-      'export function entry() {',
-      '  return liveFromCall();',
-      '}',
-      '',
-      'function unused() {',
-      "  return 'dead';",
-      '}',
-      '',
-      'function liveFromCall() {',
-      "  return 'call';",
-      '}',
-      '',
-      'function liveFromValue() {',
-      "  return 'value';",
-      '}',
-      '',
-      'function liveFromShorthand() {',
-      "  return 'shorthand';",
-      '}',
-      '',
-      'function liveFromComputedMember() {',
-      "  return 'computed';",
-      '}',
-      '',
-      'const registry = {',
-      '  unused: true,',
-      '  liveFromShorthand,',
-      '  value: liveFromValue,',
-      '};',
-      'registry.unused = true;',
-      'registry?.unused;',
-      'const valueReference = liveFromValue;',
-      'const computedReference = registry[liveFromComputedMember];',
-    ].join('\n'),
-  });
-
-  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
-  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
-  const unusedCandidate = candidatesByName.get('unused');
-
-  assert.equal(unusedCandidate.confidence, 'high-confidence');
-  assert.equal(unusedCandidate.counts.directIdentifierReferences, 0);
-  assert.equal(unusedCandidate.counts.nameOccurrences, 1);
-  assert.equal(unusedCandidate.signals.declarationOnlyNameOccurrence, true);
-  assert.ok(!candidatesByName.has('liveFromCall'));
-  assert.ok(!candidatesByName.has('liveFromValue'));
-  assert.ok(!candidatesByName.has('liveFromShorthand'));
-  assert.ok(!candidatesByName.has('liveFromComputedMember'));
-});
-
-test('analyzeProject keeps ASI-separated function declarations as dead candidates without named expression noise', async () => {
-  const rootDir = await writeTempProject({
-    'src/app.jsx': [
-      "import { run } from './tasks.js';",
-      '',
-      'export function App() {',
-      '  return <main>{run()}</main>;',
-      '}',
-    ].join('\n'),
-    'src/tasks.js': [
-      'void 0',
-      'function afterExpression() {',
-      "  return 'dead';",
-      '}',
-      '',
-      'const enabled = true',
-      'function afterVariable() {',
-      '  return enabled;',
-      '}',
-      '',
-      'function wrapper() {',
-      '  void 0',
-      '  function innerAfterExpression() {',
-      "    return 'nested';",
-      '  }',
-      '  const innerEnabled = true',
-      '  function innerAfterVariable() {',
-      '    return innerEnabled;',
-      '  }',
-      '}',
-      '',
-      'export const run = function helper() {',
-      "  return 'running';",
-      '};',
-      '',
-      'setTimeout(function tick() {',
-      "  return 'later';",
-      '}, 1);',
-    ].join('\n'),
-  });
-
-  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
-  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
-
-  assert.equal(candidatesByName.get('afterExpression').confidence, 'high-confidence');
-  assert.equal(candidatesByName.get('afterVariable').confidence, 'high-confidence');
-  assert.equal(candidatesByName.get('innerAfterExpression').confidence, 'high-confidence');
-  assert.equal(candidatesByName.get('innerAfterVariable').confidence, 'high-confidence');
-  assert.ok(!candidatesByName.has('helper'));
-  assert.ok(!candidatesByName.has('tick'));
-});
-
-test('analyzeProject keeps template interpolation references live while ignoring template text', async () => {
-  const rootDir = await writeTempProject({
-    'src/app.jsx': [
-      "import { renderMessage } from './feature.js';",
-      '',
-      'export function App() {',
-      '  return <main>{renderMessage()}</main>;',
-      '}',
-    ].join('\n'),
-    'src/feature.js': [
-      'export function renderMessage() {',
-      '  return `literalOnly appears only as text ${helper()}`;',
-      '}',
-      '',
-      'function helper() {',
-      "  return 'live';",
-      '}',
-      '',
-      'function literalOnly() {',
-      "  return 'dead';",
-      '}',
-    ].join('\n'),
-  });
-
-  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
-  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
-
-  assert.ok(!candidatesByName.has('helper'));
-  assert.equal(candidatesByName.get('literalOnly').confidence, 'high-confidence');
-  assert.equal(candidatesByName.get('literalOnly').counts.directIdentifierReferences, 0);
 });

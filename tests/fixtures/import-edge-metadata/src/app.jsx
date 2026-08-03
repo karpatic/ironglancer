@@ -4,7 +4,7 @@ const { DynamicExport: DynamicLocal } = await window.import('./dynamic-child.jsx
 
 const FACULTY_BODY_SPECIFIER = './faculty-body-child.jsx';
 const FACULTY_EDITOR_SPECIFIER = './faculty-editor-child.jsx';
-const UNUSED_SPECIFIER = './unused-child.jsx';
+
 
 function useCreatorModule(specifier) {
   return { module: {}, specifier };

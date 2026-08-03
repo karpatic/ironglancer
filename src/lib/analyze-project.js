@@ -2,7 +2,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 import {
-  countIdentifierReferences,
   extractDeclarationSpans,
   extractImportRefs,
   identifierReferenceLocations,
@@ -337,6 +336,59 @@ function findMatchingBrace(text, startIndex) {
   return -1;
 }
 
+function findMatchingDelimiter(text, startIndex, openChar, closeChar) {
+  let depth = 0;
+  for (let index = startIndex; index < text.length; index += 1) {
+    if (text[index] === openChar) {
+      depth += 1;
+    } else if (text[index] === closeChar) {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+function splitTopLevel(text, separator = ',') {
+  const parts = [];
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  let start = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (char === '(') parenDepth += 1;
+    else if (char === ')') parenDepth = Math.max(0, parenDepth - 1);
+    else if (char === '[') bracketDepth += 1;
+    else if (char === ']') bracketDepth = Math.max(0, bracketDepth - 1);
+    else if (char === '{') braceDepth += 1;
+    else if (char === '}') braceDepth = Math.max(0, braceDepth - 1);
+    else if (char === separator && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
+      parts.push({ text: text.slice(start, index), startIndex: start });
+      start = index + 1;
+    }
+  }
+  parts.push({ text: text.slice(start), startIndex: start });
+  return parts;
+}
+
+function topLevelCharacterIndex(text, target) {
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (char === '(') parenDepth += 1;
+    else if (char === ')') parenDepth = Math.max(0, parenDepth - 1);
+    else if (char === '[') bracketDepth += 1;
+    else if (char === ']') bracketDepth = Math.max(0, bracketDepth - 1);
+    else if (char === '{') braceDepth += 1;
+    else if (char === '}') braceDepth = Math.max(0, braceDepth - 1);
+    else if (char === target && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) return index;
+  }
+  return -1;
+}
+
 function wordAt(text, start, word) {
   if (text.slice(start, start + word.length) !== word) return false;
   const before = text[start - 1] || '';
@@ -519,13 +571,63 @@ function locationInRanges(location, ranges) {
   ));
 }
 
+function declarationSpanExclusiveEnd(span) {
+  return Number.isInteger(span?.endIndex) ? span.endIndex + 1 : null;
+}
+
 function locationInsideDeclarationSpan(span, location) {
+  const spanEnd = declarationSpanExclusiveEnd(span);
   return Number.isInteger(span?.startIndex)
-    && Number.isInteger(span?.endIndex)
+    && Number.isInteger(spanEnd)
     && Number.isInteger(span?.nameEndIndex)
     && location?.index > span.nameEndIndex
     && location.index >= span.startIndex
-    && location.endIndex <= span.endIndex;
+    && location.endIndex <= spanEnd;
+}
+
+function locationWithinDeclarationBounds(span, location) {
+  const spanEnd = declarationSpanExclusiveEnd(span);
+  return Number.isInteger(span?.startIndex)
+    && Number.isInteger(spanEnd)
+    && Number.isInteger(location?.index)
+    && Number.isInteger(location?.endIndex)
+    && location.index >= span.startIndex
+    && location.endIndex <= spanEnd;
+}
+
+function declarationSpanLength(span) {
+  const spanEnd = declarationSpanExclusiveEnd(span);
+  return Number.isInteger(span?.startIndex) && Number.isInteger(spanEnd)
+    ? spanEnd - span.startIndex
+    : Number.MAX_SAFE_INTEGER;
+}
+
+function innermostDeclarationSpanForLocation(record, location) {
+  return (Array.isArray(record?.declarationSpans) ? record.declarationSpans : [])
+    .filter((span) => locationInsideDeclarationSpan(span, location))
+    .sort((a, b) => declarationSpanLength(a) - declarationSpanLength(b)
+      || b.startIndex - a.startIndex
+      || compareLocale(a.name, b.name))[0] || null;
+}
+
+function parentDeclarationSpanForSpan(record, childSpan) {
+  return (Array.isArray(record?.declarationSpans) ? record.declarationSpans : [])
+    .filter((span) => span !== childSpan && locationWithinDeclarationBounds(span, {
+      index: childSpan.startIndex,
+      endIndex: declarationSpanExclusiveEnd(childSpan),
+    }))
+    .sort((a, b) => declarationSpanLength(a) - declarationSpanLength(b)
+      || b.startIndex - a.startIndex
+      || compareLocale(a.name, b.name))[0] || null;
+}
+
+function locationOwnedByDeclaration(record, span, location) {
+  return innermostDeclarationSpanForLocation(record, location) === span;
+}
+
+function isAnyDeclarationNameLocation(record, location) {
+  return (Array.isArray(record?.declarationSpans) ? record.declarationSpans : [])
+    .some((span) => isDeclarationNameLocation(span, location));
 }
 
 function declarationIdentifierMetrics(record, span, publicApiInfo) {
@@ -552,6 +654,257 @@ function declarationIdentifierMetrics(record, span, publicApiInfo) {
     sameFileReferenceCount: sameFileLocations.length,
     publicApiReferenceCount: publicApiLocations.length,
   };
+}
+
+function topLevelWordIndex(text, word) {
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  for (let index = 0; index <= text.length - word.length; index += 1) {
+    const char = text[index];
+    if (char === '(') parenDepth += 1;
+    else if (char === ')') parenDepth = Math.max(0, parenDepth - 1);
+    else if (char === '[') bracketDepth += 1;
+    else if (char === ']') bracketDepth = Math.max(0, bracketDepth - 1);
+    else if (char === '{') braceDepth += 1;
+    else if (char === '}') braceDepth = Math.max(0, braceDepth - 1);
+    if (parenDepth !== 0 || bracketDepth !== 0 || braceDepth !== 0) continue;
+    if (text.slice(index, index + word.length) !== word) continue;
+    const before = text[index - 1] || '';
+    const after = text[index + word.length] || '';
+    if (!/[A-Za-z0-9_$]/.test(before) && !/[A-Za-z0-9_$]/.test(after)) return index;
+  }
+  return -1;
+}
+
+function topLevelBindingPatternText(text) {
+  const cutIndexes = [
+    topLevelCharacterIndex(text, '='),
+    topLevelWordIndex(text, 'of'),
+    topLevelWordIndex(text, 'in'),
+  ].filter((index) => index >= 0);
+  const endIndex = cutIndexes.length > 0 ? Math.min(...cutIndexes) : text.length;
+  return text.slice(0, endIndex).replace(/^\s*\.\.\./, '');
+}
+
+function bindingIdentifierLocations(pattern, absoluteStart, identifier) {
+  const bindingPattern = topLevelBindingPatternText(normalizeString(pattern));
+  const name = normalizeIdentifier(identifier);
+  if (!name) return [];
+  const escaped = escapeRegExp(name);
+  const namePattern = new RegExp(`(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])`, 'g');
+  const locations = [];
+  let match;
+  while ((match = namePattern.exec(bindingPattern))) {
+    const nextIndex = findNextNonWhitespaceIndex(bindingPattern, match.index + match[0].length);
+    if (bindingPattern[nextIndex] === ':') continue;
+    locations.push({
+      name,
+      index: absoluteStart + match.index,
+      endIndex: absoluteStart + match.index + match[0].length,
+    });
+  }
+  return locations;
+}
+
+function findTopLevelArrowIndex(text, start, end) {
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  for (let index = start; index < end - 1; index += 1) {
+    const char = text[index];
+    if (char === '(') parenDepth += 1;
+    else if (char === ')') parenDepth = Math.max(0, parenDepth - 1);
+    else if (char === '[') bracketDepth += 1;
+    else if (char === ']') bracketDepth = Math.max(0, bracketDepth - 1);
+    else if (char === '{') braceDepth += 1;
+    else if (char === '}') braceDepth = Math.max(0, braceDepth - 1);
+    if (
+      char === '='
+      && text[index + 1] === '>'
+      && parenDepth === 0
+      && bracketDepth === 0
+      && braceDepth === 0
+    ) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function declarationParameterRange(record, span) {
+  const masked = maskIgnorableSyntax(record?.source);
+  if (span?.kind === 'function') {
+    const parametersStart = masked.indexOf('(', span.nameEndIndex);
+    if (parametersStart === -1) return null;
+    const parametersEnd = findMatchingDelimiter(masked, parametersStart, '(', ')');
+    return parametersEnd === -1 ? null : {
+      startIndex: parametersStart + 1,
+      endIndex: parametersEnd,
+    };
+  }
+  if (span?.kind !== 'arrow') return null;
+  const spanEnd = declarationSpanExclusiveEnd(span);
+  const equalsIndex = masked.indexOf('=', span.nameEndIndex);
+  if (equalsIndex === -1 || equalsIndex >= spanEnd) return null;
+  const arrowIndex = findTopLevelArrowIndex(masked, equalsIndex + 1, spanEnd);
+  if (arrowIndex === -1) return null;
+  let parametersStart = findNextNonWhitespaceIndex(masked, equalsIndex + 1);
+  if (wordAt(masked, parametersStart, 'async')) {
+    parametersStart = findNextNonWhitespaceIndex(masked, parametersStart + 'async'.length);
+  }
+  if (masked[parametersStart] === '(') {
+    const parametersEnd = findMatchingDelimiter(masked, parametersStart, '(', ')');
+    if (parametersEnd !== -1 && parametersEnd <= arrowIndex) {
+      return {
+        startIndex: parametersStart + 1,
+        endIndex: parametersEnd,
+      };
+    }
+  }
+  return {
+    startIndex: parametersStart,
+    endIndex: arrowIndex,
+  };
+}
+
+function parameterBindingLocations(record, span, identifier) {
+  const range = declarationParameterRange(record, span);
+  if (!range) return [];
+  const masked = maskIgnorableSyntax(record?.source);
+  const parameters = masked.slice(range.startIndex, range.endIndex);
+  const locations = [];
+  for (const part of splitTopLevel(parameters)) {
+    locations.push(...bindingIdentifierLocations(
+      part.text,
+      range.startIndex + part.startIndex,
+      identifier,
+    ).map((location) => ({ ...location, kind: 'parameter' })));
+  }
+  return locations;
+}
+
+function findStatementEnd(masked, start, limit) {
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  for (let index = start; index < limit; index += 1) {
+    const char = masked[index];
+    if (char === '(') parenDepth += 1;
+    else if (char === ')') parenDepth = Math.max(0, parenDepth - 1);
+    else if (char === '[') bracketDepth += 1;
+    else if (char === ']') bracketDepth = Math.max(0, bracketDepth - 1);
+    else if (char === '{') braceDepth += 1;
+    else if (char === '}') braceDepth = Math.max(0, braceDepth - 1);
+    else if (char === ';' && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) return index + 1;
+  }
+  return limit;
+}
+
+function variableBindingLocations(record, span, identifier) {
+  const masked = maskIgnorableSyntax(record?.source);
+  const spanEnd = declarationSpanExclusiveEnd(span);
+  const declarationPattern = /\b(const|let|var)\s+/g;
+  const locations = [];
+  let match;
+  while ((match = declarationPattern.exec(masked))) {
+    const keywordLocation = { index: match.index, endIndex: declarationPattern.lastIndex };
+    if (!locationOwnedByDeclaration(record, span, keywordLocation)) continue;
+    const statementEnd = findStatementEnd(masked, match.index, spanEnd);
+    const declarationStart = declarationPattern.lastIndex;
+    const declarationText = masked.slice(declarationStart, statementEnd);
+    for (const part of splitTopLevel(declarationText)) {
+      locations.push(...bindingIdentifierLocations(
+        part.text,
+        declarationStart + part.startIndex,
+        identifier,
+      ).filter((location) => locationOwnedByDeclaration(record, span, location))
+        .map((location) => ({
+          ...location,
+          kind: 'variable',
+          statementStart: match.index,
+          statementEnd,
+        })));
+    }
+  }
+  return locations;
+}
+
+function functionBindingLocations(record, span, identifier) {
+  const name = normalizeIdentifier(identifier);
+  if (!name) return [];
+  return (Array.isArray(record?.declarationSpans) ? record.declarationSpans : [])
+    .filter((candidate) => candidate !== span
+      && candidate.kind === 'function'
+      && candidate.name === name
+      && candidate.declarationType === 'function-declaration'
+      && parentDeclarationSpanForSpan(record, candidate) === span)
+    .map((candidate) => ({
+      name,
+      index: candidate.nameStartIndex,
+      endIndex: candidate.nameEndIndex,
+      kind: 'function',
+    }));
+}
+
+function classBindingLocations(record, span, identifier) {
+  const masked = maskIgnorableSyntax(record?.source);
+  const name = normalizeIdentifier(identifier);
+  if (!name) return [];
+  const classPattern = /\bclass\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/g;
+  const locations = [];
+  let match;
+  while ((match = classPattern.exec(masked))) {
+    if (match[1] !== name) continue;
+    const index = match.index + match[0].lastIndexOf(match[1]);
+    const location = { name, index, endIndex: index + match[1].length };
+    if (locationOwnedByDeclaration(record, span, location)) {
+      locations.push({ ...location, kind: 'class' });
+    }
+  }
+  return locations;
+}
+
+function localBindingLocations(record, span, identifier) {
+  return [
+    ...parameterBindingLocations(record, span, identifier),
+    ...variableBindingLocations(record, span, identifier),
+    ...functionBindingLocations(record, span, identifier),
+    ...classBindingLocations(record, span, identifier),
+  ].sort((a, b) => a.index - b.index || a.endIndex - b.endIndex);
+}
+
+function sameLocation(a, b) {
+  return a?.index === b?.index && a?.endIndex === b?.endIndex;
+}
+
+function localBindingIsImportDeclaration(record, localBinding, binding, ref) {
+  if (
+    localBinding?.kind !== 'variable'
+    || normalizeIdentifier(binding?.local) !== normalizeIdentifier(localBinding.name)
+  ) {
+    return false;
+  }
+  const statement = normalizeString(record?.source)
+    .slice(localBinding.statementStart, localBinding.statementEnd);
+  const refKind = normalizeString(ref?.kind).trim();
+  if ((refKind === 'dynamic' || refKind === 'require') && /\b(?:import|window\.import|require)\s*\(/.test(statement)) {
+    return true;
+  }
+  if (refKind === 'lazy' && binding?.inferred) {
+    const imported = escapeRegExp(normalizeIdentifier(binding.imported));
+    return imported ? new RegExp(`\\.\\s*${imported}\\b`).test(statement) : false;
+  }
+  return false;
+}
+
+function isShadowedReferenceLocation(record, span, identifier, location, { binding, ref } = {}) {
+  for (const localBinding of localBindingLocations(record, span, identifier)) {
+    if (sameLocation(localBinding, location)) return true;
+    if (localBindingIsImportDeclaration(record, localBinding, binding, ref)) continue;
+    if (localBinding.index <= location.index) return true;
+  }
+  return false;
 }
 
 function declarationSnippet(record, span) {
@@ -651,9 +1004,18 @@ function namedExportDeclarationMap(record) {
 
   const directFunctionExportPattern = /\bexport\s+(?:async\s+)?function\s*\*?\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g;
   const directArrowExportPattern = /\bexport\s+(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=/g;
+  const commonJsPropertyPattern = /\b(?:module\.)?exports\s*\.\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\b/g;
+  const commonJsObjectPattern = /\bmodule\s*\.\s*exports\s*=\s*\{([\s\S]*?)\}/g;
   let match;
   while ((match = directFunctionExportPattern.exec(masked))) add(match[1], match[1]);
   while ((match = directArrowExportPattern.exec(masked))) add(match[1], match[1]);
+  while ((match = commonJsPropertyPattern.exec(masked))) add(match[1], match[2]);
+  while ((match = commonJsObjectPattern.exec(masked))) {
+    for (const part of identifierListParts(match[1])) {
+      const specifier = parseCommonJsObjectSpecifier(part);
+      if (specifier) add(specifier.exported, specifier.local);
+    }
+  }
   for (const entry of namedExportListEntries(masked)) {
     for (const part of identifierListParts(entry.specifiersText)) {
       const specifier = parseNamedExportSpecifier(part);
@@ -668,14 +1030,14 @@ function namedExportDeclarationName(record, exportedName) {
   if (!imported) return '';
   const exportedDeclarations = namedExportDeclarationMap(record);
   if (exportedDeclarations.has(imported)) return exportedDeclarations.get(imported);
-  return declarationSpansByName(record).has(imported) ? imported : '';
+  return '';
 }
 
 function importBindingDeclarationName(targetRecord, binding) {
   const kind = normalizeString(binding?.kind || 'named').trim() || 'named';
   if (kind === 'named') {
     const imported = normalizeIdentifier(binding?.imported);
-    return namedExportDeclarationName(targetRecord, imported) || imported;
+    return namedExportDeclarationName(targetRecord, imported);
   }
   if (kind === 'default') return defaultExportDeclarationName(targetRecord);
   return '';
@@ -716,27 +1078,53 @@ function isDirectCallableIdentifierReference(source, location) {
   return text[nextIndex] === '(' || isJsxOpeningIdentifierReference(text, location);
 }
 
-function declarationReferenceLocations(record, span, identifier, { directCallableOnly = false } = {}) {
+function declarationReferenceLocations(record, span, identifier, {
+  directCallableOnly = false,
+  binding,
+  ref,
+} = {}) {
   const locations = identifierReferenceLocations(record?.source, identifier)
-    .filter((location) => locationInsideDeclarationSpan(span, location));
+    .filter((location) => !isAnyDeclarationNameLocation(record, location))
+    .filter((location) => locationOwnedByDeclaration(record, span, location))
+    .filter((location) => !isShadowedReferenceLocation(record, span, identifier, location, { binding, ref }));
   return directCallableOnly
     ? locations.filter((location) => isDirectCallableIdentifierReference(record?.source, location))
     : locations;
 }
 
+function namespaceMemberReferenceLocations(record, span, namespaceName, { binding, ref } = {}) {
+  const namespace = normalizeIdentifier(namespaceName);
+  if (!namespace) return new Map();
+  const text = normalizeString(record?.source);
+  const masked = maskIgnorableSyntax(text);
+  const escaped = escapeRegExp(namespace);
+  const pattern = new RegExp(`(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])\\s*(?:\\?\\.|\\.)\\s*([A-Za-z_$][A-Za-z0-9_$]*)\\s*(?:\\?\\.)?\\s*\\(`, 'g');
+  const locationsByMember = new Map();
+  let match;
+  while ((match = pattern.exec(masked))) {
+    const memberName = normalizeIdentifier(match[1]);
+    if (!memberName) continue;
+    const namespaceLocation = {
+      index: match.index,
+      endIndex: match.index + namespace.length,
+    };
+    const memberOffset = match[0].lastIndexOf(match[1]);
+    const memberLocation = {
+      index: match.index + memberOffset,
+      endIndex: match.index + memberOffset + memberName.length,
+    };
+    if (span && !locationOwnedByDeclaration(record, span, namespaceLocation)) continue;
+    if (span && isShadowedReferenceLocation(record, span, namespace, namespaceLocation, { binding, ref })) continue;
+    if (!locationsByMember.has(memberName)) locationsByMember.set(memberName, []);
+    locationsByMember.get(memberName).push(memberLocation);
+  }
+  return locationsByMember;
+}
+
 function importBindingRelationshipTarget(targetRecord, binding) {
   const targetSpans = declarationSpansByName(targetRecord);
   const bindingKind = normalizeString(binding?.kind || 'named').trim() || 'named';
-  if (bindingKind === 'namespace') {
-    const defaultDeclarationName = defaultExportDeclarationName(targetRecord);
-    const defaultSpan = targetSpans.get(defaultDeclarationName);
-    return defaultSpan ? {
-      declarationName: defaultDeclarationName,
-      span: defaultSpan,
-      importedName: 'default',
-      directCallableOnly: true,
-    } : null;
-  }
+  if (bindingKind === 'namespace') return null;
 
   const declarationName = importBindingDeclarationName(targetRecord, binding);
   const span = targetSpans.get(declarationName);
@@ -748,6 +1136,56 @@ function importBindingRelationshipTarget(targetRecord, binding) {
   } : null;
 }
 
+function namespaceImportRelationshipTarget(targetRecord, binding, memberName) {
+  const targetSpans = declarationSpansByName(targetRecord);
+  const importedName = normalizeIdentifier(memberName);
+  const declarationName = namedExportDeclarationName(targetRecord, importedName);
+  const span = targetSpans.get(declarationName);
+  const namespaceName = normalizeIdentifier(binding?.local);
+  return span ? {
+    declarationName,
+    span,
+    importedName,
+    localName: namespaceName ? `${namespaceName}.${importedName}` : importedName,
+    directCallableOnly: false,
+  } : null;
+}
+
+function bindingReferenceGroups({
+  importerRecord,
+  importerSpan,
+  targetRecord,
+  binding,
+  ref,
+}) {
+  const bindingKind = normalizeString(binding?.kind || 'named').trim() || 'named';
+  if (bindingKind === 'namespace') {
+    return Array.from(namespaceMemberReferenceLocations(
+      importerRecord,
+      importerSpan,
+      binding.local,
+      { binding, ref },
+    ), ([memberName, referenceLocations]) => ({
+      target: namespaceImportRelationshipTarget(targetRecord, binding, memberName),
+      referenceLocations,
+    })).filter((group) => group.target && group.referenceLocations.length > 0);
+  }
+
+  const target = importBindingRelationshipTarget(targetRecord, binding);
+  if (!target) return [];
+  const referenceLocations = declarationReferenceLocations(
+    importerRecord,
+    importerSpan,
+    binding.local,
+    {
+      directCallableOnly: Boolean(target.directCallableOnly),
+      binding,
+      ref,
+    },
+  );
+  return referenceLocations.length > 0 ? [{ target, referenceLocations }] : [];
+}
+
 function compactUseRelationship({
   targetRecord,
   target,
@@ -755,11 +1193,12 @@ function compactUseRelationship({
   ref,
   referenceCount,
 }) {
+  const localName = normalizeString(target.localName || binding?.local).trim();
   return {
-    name: normalizeString(binding?.local).trim() || target.declarationName,
+    name: localName || target.declarationName,
     declarationName: target.declarationName,
     importedName: normalizeString(target.importedName).trim(),
-    localName: normalizeString(binding?.local).trim(),
+    localName,
     bindingKind: normalizeString(binding?.kind || 'named').trim() || 'named',
     loadKind: normalizeString(ref?.kind).trim() || 'import',
     specifier: normalizeString(ref?.specifier).trim(),
@@ -779,10 +1218,11 @@ function compactImportedByRelationship({
   ref,
   referenceCount,
 }) {
+  const localName = normalizeString(target?.localName || binding?.local).trim();
   return {
     name: importerName,
     declarationName: importerName,
-    localName: normalizeString(binding?.local).trim(),
+    localName,
     importedName: normalizeString(target?.importedName || binding?.imported).trim(),
     bindingKind: normalizeString(binding?.kind || 'named').trim() || 'named',
     loadKind: normalizeString(ref?.kind).trim() || 'import',
@@ -828,49 +1268,48 @@ function buildDeclarationRelationships(graph) {
       if (!targetRecord) continue;
       for (const binding of Array.isArray(ref.bindings) ? ref.bindings : []) {
         if (!binding?.local) continue;
-        const target = importBindingRelationshipTarget(targetRecord, binding);
-        if (!target) continue;
-        const targetKey = declarationImportMetricKey(targetRecord.rel, target.declarationName);
-        if (!targetKey) continue;
 
         for (const [importerName, importerSpan] of importerSpans) {
-          const referenceLocations = declarationReferenceLocations(
+          for (const { target, referenceLocations } of bindingReferenceGroups({
             importerRecord,
             importerSpan,
-            binding.local,
-            { directCallableOnly: Boolean(target.directCallableOnly) },
-          );
-          if (referenceLocations.length === 0) continue;
+            targetRecord,
+            binding,
+            ref,
+          })) {
+            const targetKey = declarationImportMetricKey(targetRecord.rel, target.declarationName);
+            if (!targetKey) continue;
 
-          const importerKey = declarationImportMetricKey(importerRecord.rel, importerName);
-          const useBucket = ensure(importerRecord, importerName);
-          const importedByBucket = ensure(targetRecord, target.declarationName);
-          if (!importerKey || !useBucket || !importedByBucket) continue;
+            const importerKey = declarationImportMetricKey(importerRecord.rel, importerName);
+            const useBucket = ensure(importerRecord, importerName);
+            const importedByBucket = ensure(targetRecord, target.declarationName);
+            if (!importerKey || !useBucket || !importedByBucket) continue;
 
-          const relationshipKey = [
-            importerKey,
-            targetKey,
-            binding.local,
-            binding.imported,
-            binding.kind,
-            ref.kind,
-            ref.specifier,
-          ].join('\u0000');
-          const referenceCount = referenceLocations.length;
-          addDeclarationRelationship(
-            useBucket,
-            'importedFunctionUses',
-            seenUses,
-            relationshipKey,
-            compactUseRelationship({ targetRecord, target, binding, ref, referenceCount }),
-          );
-          addDeclarationRelationship(
-            importedByBucket,
-            'importedBy',
-            seenImportedBy,
-            relationshipKey,
-            compactImportedByRelationship({ importerRecord, importerName, importerSpan, target, binding, ref, referenceCount }),
-          );
+            const relationshipKey = [
+              importerKey,
+              targetKey,
+              target.localName || binding.local,
+              target.importedName || binding.imported,
+              binding.kind,
+              ref.kind,
+              ref.specifier,
+            ].join('\u0000');
+            const referenceCount = referenceLocations.length;
+            addDeclarationRelationship(
+              useBucket,
+              'importedFunctionUses',
+              seenUses,
+              relationshipKey,
+              compactUseRelationship({ targetRecord, target, binding, ref, referenceCount }),
+            );
+            addDeclarationRelationship(
+              importedByBucket,
+              'importedBy',
+              seenImportedBy,
+              relationshipKey,
+              compactImportedByRelationship({ importerRecord, importerName, importerSpan, target, binding, ref, referenceCount }),
+            );
+          }
         }
       }
     }
@@ -908,45 +1347,57 @@ function buildDeclarationImportMetrics(graph) {
     for (const ref of Array.isArray(importerRecord.importRefs) ? importerRecord.importRefs : []) {
       const targetRecord = ref?.localRel ? graph.modules.get(ref.localRel) : null;
       if (!targetRecord) continue;
-      const targetSpans = declarationSpansByName(targetRecord);
       for (const binding of Array.isArray(ref.bindings) ? ref.bindings : []) {
-        const declarationName = importBindingDeclarationName(targetRecord, binding);
-        if (!declarationName || !targetSpans.has(declarationName)) continue;
-        const key = declarationImportMetricKey(targetRecord.rel, declarationName);
-        if (!key) continue;
-        if (!buckets.has(key)) {
-          buckets.set(key, {
-            identifierOccurrenceCount: 0,
-            declarationNameOccurrenceCount: 0,
-            declarationOnlyNameOccurrence: false,
-            sameFileReferenceCount: 0,
-            ownDeclarationReferenceCount: 0,
-            publicApiReferenceCount: 0,
-            incomingReferenceCount: 0,
-            importerFiles: new Set(),
-            incomingImports: [],
-            publicApi: {
-              exported: false,
-              exportedNames: [],
-              exportKinds: [],
-            },
-          });
+        if (!binding?.local) continue;
+        const importGroups = new Map();
+        for (const [, importerSpan] of declarationSpansByName(importerRecord)) {
+          for (const { target, referenceLocations } of bindingReferenceGroups({
+            importerRecord,
+            importerSpan,
+            targetRecord,
+            binding,
+            ref,
+          })) {
+            const groupKey = declarationImportMetricKey(targetRecord.rel, target.declarationName);
+            if (!groupKey) continue;
+            if (!importGroups.has(groupKey)) importGroups.set(groupKey, { target, referenceCount: 0 });
+            importGroups.get(groupKey).referenceCount += referenceLocations.length;
+          }
         }
-        const bucket = buckets.get(key);
-        const referenceCount = Math.max(0, countIdentifierReferences(importerRecord.source, binding.local) - 1);
-        bucket.incomingReferenceCount += referenceCount;
-        if (importerRecord.rel !== targetRecord.rel) {
-          bucket.importerFiles.add(importerRecord.rel);
-          bucket.incomingImports.push({
-            importerPath: importerRecord.rel,
-            specifier: ref.specifier,
-            loadKind: normalizeString(ref.kind).trim() || 'import',
-            imported: binding.imported,
-            local: binding.local,
-            bindingKind: binding.kind,
-            inferred: Boolean(binding.inferred),
-            referenceCount,
-          });
+        for (const [key, { target, referenceCount }] of importGroups) {
+          if (!buckets.has(key)) {
+            buckets.set(key, {
+              identifierOccurrenceCount: 0,
+              declarationNameOccurrenceCount: 0,
+              declarationOnlyNameOccurrence: false,
+              sameFileReferenceCount: 0,
+              ownDeclarationReferenceCount: 0,
+              publicApiReferenceCount: 0,
+              incomingReferenceCount: 0,
+              importerFiles: new Set(),
+              incomingImports: [],
+              publicApi: {
+                exported: false,
+                exportedNames: [],
+                exportKinds: [],
+              },
+            });
+          }
+          const bucket = buckets.get(key);
+          bucket.incomingReferenceCount += referenceCount;
+          if (importerRecord.rel !== targetRecord.rel) {
+            bucket.importerFiles.add(importerRecord.rel);
+            bucket.incomingImports.push({
+              importerPath: importerRecord.rel,
+              specifier: ref.specifier,
+              loadKind: normalizeString(ref.kind).trim() || 'import',
+              imported: target.importedName || binding.imported,
+              local: target.localName || binding.local,
+              bindingKind: binding.kind,
+              inferred: Boolean(binding.inferred),
+              referenceCount,
+            });
+          }
         }
       }
     }
@@ -1052,6 +1503,16 @@ function importedScriptVariableName(ref) {
   return normalizeString(binding?.local).trim();
 }
 
+function namespaceMemberNamesForRecord(record, binding, ref) {
+  const names = new Set();
+  for (const [, span] of declarationSpansByName(record)) {
+    for (const memberName of namespaceMemberReferenceLocations(record, span, binding.local, { binding, ref }).keys()) {
+      names.add(memberName);
+    }
+  }
+  return Array.from(names).sort(compareLocale);
+}
+
 function importedScriptCandidatesForJsx(record, graph, declarationImportMetrics) {
   const candidates = [];
   for (const ref of Array.isArray(record.importRefs) ? record.importRefs : []) {
@@ -1063,6 +1524,21 @@ function importedScriptCandidatesForJsx(record, graph, declarationImportMetrics)
     const targetRecord = ref.localRel ? graph.modules.get(ref.localRel) : null;
     const binding = (Array.isArray(ref.bindings) ? ref.bindings : [])
       .find((candidate) => candidate.local === name);
+    if (targetRecord && binding?.kind === 'namespace') {
+      for (const memberName of namespaceMemberNamesForRecord(record, binding, ref)) {
+        const declarationName = namedExportDeclarationName(targetRecord, memberName);
+        const visibleName = `${name}.${memberName}`;
+        candidates.push({
+          name: visibleName,
+          targetRecord,
+          binding,
+          declarationName,
+          lineCount: declarationLineCount(targetRecord, declarationName),
+          metrics: declarationImportMetricsFor(declarationImportMetrics, targetRecord, declarationName),
+        });
+      }
+      continue;
+    }
     const resolvedDeclarationName = importBindingDeclarationName(targetRecord, binding);
     const declarationName = resolvedDeclarationName || (targetRecord ? '' : name);
     candidates.push({
@@ -1093,7 +1569,7 @@ function importedScriptSourceDeclarationsForJsx(record, graph, moduleId, declara
   const declarations = new Map();
   for (const candidate of importedScriptCandidatesForJsx(record, graph, declarationImportMetrics)) {
     const { name, targetRecord, binding, declarationName, metrics } = candidate;
-    if (!targetRecord || binding?.kind === 'namespace') continue;
+    if (!targetRecord) continue;
 
     const span = declarationSpansByName(targetRecord).get(declarationName);
     const entry = sourceDeclarationEntry({
