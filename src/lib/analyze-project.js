@@ -576,8 +576,8 @@ function sourceDeclarationEntry({
   span,
   declarationName = visibleName,
   sourceOrigin,
-  candidateId = '',
   metrics = emptyDeclarationImportMetrics(),
+  relationships = emptyDeclarationRelationships(),
 }) {
   const code = declarationSnippet(record, span);
   if (!moduleId || !visibleName || !record?.rel || !code) return null;
@@ -591,12 +591,22 @@ function sourceDeclarationEntry({
     endLine: span.endLine,
     code,
     sourceOrigin,
-    candidateId,
     referenceCount: metrics.referenceCount,
     sameFileReferenceCount: metrics.sameFileReferenceCount,
     incomingReferenceCount: metrics.incomingReferenceCount,
     directIdentifierReferenceCount: metrics.directIdentifierReferenceCount,
     importerFileCount: metrics.importerFileCount,
+    importedFunctionUses: Array.isArray(relationships.importedFunctionUses)
+      ? relationships.importedFunctionUses
+      : [],
+    importedBy: Array.isArray(relationships.importedBy) ? relationships.importedBy : [],
+  };
+}
+
+function emptyDeclarationRelationships() {
+  return {
+    importedFunctionUses: [],
+    importedBy: [],
   };
 }
 
@@ -676,6 +686,201 @@ function declarationImportMetricsFor(metrics, record, declarationName) {
   return key && metrics instanceof Map
     ? (metrics.get(key) || emptyDeclarationImportMetrics())
     : emptyDeclarationImportMetrics();
+}
+
+function declarationRelationshipsFor(relationships, record, declarationName) {
+  const key = declarationImportMetricKey(record?.rel, declarationName);
+  return key && relationships instanceof Map
+    ? (relationships.get(key) || emptyDeclarationRelationships())
+    : emptyDeclarationRelationships();
+}
+
+function previousNonWhitespaceIndex(text, start) {
+  for (let index = start - 1; index >= 0; index -= 1) {
+    if (!/\s/.test(text[index])) return index;
+  }
+  return -1;
+}
+
+function isJsxOpeningIdentifierReference(source, location) {
+  const text = normalizeString(source);
+  const previousIndex = previousNonWhitespaceIndex(text, location?.index);
+  if (text[previousIndex] !== '<') return false;
+  const nextIndex = findNextNonWhitespaceIndex(text, location.endIndex);
+  return ['/', '>'].includes(text[nextIndex]) || /\s/.test(text[nextIndex] || '');
+}
+
+function isDirectCallableIdentifierReference(source, location) {
+  const text = normalizeString(source);
+  const nextIndex = findNextNonWhitespaceIndex(text, location?.endIndex);
+  return text[nextIndex] === '(' || isJsxOpeningIdentifierReference(text, location);
+}
+
+function declarationReferenceLocations(record, span, identifier, { directCallableOnly = false } = {}) {
+  const locations = identifierReferenceLocations(record?.source, identifier)
+    .filter((location) => locationInsideDeclarationSpan(span, location));
+  return directCallableOnly
+    ? locations.filter((location) => isDirectCallableIdentifierReference(record?.source, location))
+    : locations;
+}
+
+function importBindingRelationshipTarget(targetRecord, binding) {
+  const targetSpans = declarationSpansByName(targetRecord);
+  const bindingKind = normalizeString(binding?.kind || 'named').trim() || 'named';
+  if (bindingKind === 'namespace') {
+    const defaultDeclarationName = defaultExportDeclarationName(targetRecord);
+    const defaultSpan = targetSpans.get(defaultDeclarationName);
+    return defaultSpan ? {
+      declarationName: defaultDeclarationName,
+      span: defaultSpan,
+      importedName: 'default',
+      directCallableOnly: true,
+    } : null;
+  }
+
+  const declarationName = importBindingDeclarationName(targetRecord, binding);
+  const span = targetSpans.get(declarationName);
+  return span ? {
+    declarationName,
+    span,
+    importedName: bindingKind === 'default' ? 'default' : binding.imported,
+    directCallableOnly: false,
+  } : null;
+}
+
+function compactUseRelationship({
+  targetRecord,
+  target,
+  binding,
+  ref,
+  referenceCount,
+}) {
+  return {
+    name: normalizeString(binding?.local).trim() || target.declarationName,
+    declarationName: target.declarationName,
+    importedName: normalizeString(target.importedName).trim(),
+    localName: normalizeString(binding?.local).trim(),
+    bindingKind: normalizeString(binding?.kind || 'named').trim() || 'named',
+    loadKind: normalizeString(ref?.kind).trim() || 'import',
+    specifier: normalizeString(ref?.specifier).trim(),
+    modulePath: targetRecord.rel,
+    startLine: target.span.startLine,
+    endLine: target.span.endLine,
+    referenceCount,
+  };
+}
+
+function compactImportedByRelationship({
+  importerRecord,
+  importerName,
+  importerSpan,
+  target,
+  binding,
+  ref,
+  referenceCount,
+}) {
+  return {
+    name: importerName,
+    declarationName: importerName,
+    localName: normalizeString(binding?.local).trim(),
+    importedName: normalizeString(target?.importedName || binding?.imported).trim(),
+    bindingKind: normalizeString(binding?.kind || 'named').trim() || 'named',
+    loadKind: normalizeString(ref?.kind).trim() || 'import',
+    specifier: normalizeString(ref?.specifier).trim(),
+    modulePath: importerRecord.rel,
+    startLine: importerSpan.startLine,
+    endLine: importerSpan.endLine,
+    referenceCount,
+  };
+}
+
+function compareDeclarationRelationship(a, b) {
+  return compareLocale(a.modulePath, b.modulePath)
+    || a.startLine - b.startLine
+    || a.endLine - b.endLine
+    || compareLocale(a.name, b.name)
+    || compareLocale(a.localName, b.localName)
+    || compareLocale(a.importedName, b.importedName);
+}
+
+function addDeclarationRelationship(bucket, listName, seen, seenKey, relationship) {
+  if (seen.has(seenKey)) return;
+  seen.add(seenKey);
+  bucket[listName].push(relationship);
+}
+
+function buildDeclarationRelationships(graph) {
+  const relationships = new Map();
+  const seenUses = new Set();
+  const seenImportedBy = new Set();
+  const ensure = (record, declarationName) => {
+    const key = declarationImportMetricKey(record?.rel, declarationName);
+    if (!key) return null;
+    if (!relationships.has(key)) relationships.set(key, emptyDeclarationRelationships());
+    return relationships.get(key);
+  };
+
+  for (const importerRecord of graph.modules.values()) {
+    const importerSpans = Array.from(declarationSpansByName(importerRecord));
+    if (importerSpans.length === 0) continue;
+    for (const ref of Array.isArray(importerRecord.importRefs) ? importerRecord.importRefs : []) {
+      const targetRecord = ref?.localRel ? graph.modules.get(ref.localRel) : null;
+      if (!targetRecord) continue;
+      for (const binding of Array.isArray(ref.bindings) ? ref.bindings : []) {
+        if (!binding?.local) continue;
+        const target = importBindingRelationshipTarget(targetRecord, binding);
+        if (!target) continue;
+        const targetKey = declarationImportMetricKey(targetRecord.rel, target.declarationName);
+        if (!targetKey) continue;
+
+        for (const [importerName, importerSpan] of importerSpans) {
+          const referenceLocations = declarationReferenceLocations(
+            importerRecord,
+            importerSpan,
+            binding.local,
+            { directCallableOnly: Boolean(target.directCallableOnly) },
+          );
+          if (referenceLocations.length === 0) continue;
+
+          const importerKey = declarationImportMetricKey(importerRecord.rel, importerName);
+          const useBucket = ensure(importerRecord, importerName);
+          const importedByBucket = ensure(targetRecord, target.declarationName);
+          if (!importerKey || !useBucket || !importedByBucket) continue;
+
+          const relationshipKey = [
+            importerKey,
+            targetKey,
+            binding.local,
+            binding.imported,
+            binding.kind,
+            ref.kind,
+            ref.specifier,
+          ].join('\u0000');
+          const referenceCount = referenceLocations.length;
+          addDeclarationRelationship(
+            useBucket,
+            'importedFunctionUses',
+            seenUses,
+            relationshipKey,
+            compactUseRelationship({ targetRecord, target, binding, ref, referenceCount }),
+          );
+          addDeclarationRelationship(
+            importedByBucket,
+            'importedBy',
+            seenImportedBy,
+            relationshipKey,
+            compactImportedByRelationship({ importerRecord, importerName, importerSpan, target, binding, ref, referenceCount }),
+          );
+        }
+      }
+    }
+  }
+
+  for (const bucket of relationships.values()) {
+    bucket.importedFunctionUses.sort(compareDeclarationRelationship);
+    bucket.importedBy.sort(compareDeclarationRelationship);
+  }
+  return relationships;
 }
 
 function buildDeclarationImportMetrics(graph) {
@@ -884,7 +1089,7 @@ function importedScriptMembersForJsx(record, graph, declarationImportMetrics) {
   return Array.from(members.values()).sort((a, b) => compareLocale(a.name, b.name));
 }
 
-function importedScriptSourceDeclarationsForJsx(record, graph, moduleId, declarationImportMetrics) {
+function importedScriptSourceDeclarationsForJsx(record, graph, moduleId, declarationImportMetrics, declarationRelationships) {
   const declarations = new Map();
   for (const candidate of importedScriptCandidatesForJsx(record, graph, declarationImportMetrics)) {
     const { name, targetRecord, binding, declarationName, metrics } = candidate;
@@ -899,6 +1104,7 @@ function importedScriptSourceDeclarationsForJsx(record, graph, moduleId, declara
       declarationName,
       sourceOrigin: 'imported-script-member',
       metrics,
+      relationships: declarationRelationshipsFor(declarationRelationships, targetRecord, declarationName),
     });
     if (entry && !declarations.has(entry.name)) declarations.set(entry.name, entry);
   }
@@ -984,277 +1190,6 @@ function buildImportEdges(graph, { reachableOnly = false } = {}) {
       || compareLocale(a.target, b.target));
 }
 
-function emptyModuleImportEvidence() {
-  return {
-    importerFiles: new Set(),
-    namespaceImportFiles: new Set(),
-    moduleOnlyImportFiles: new Set(),
-    loadKinds: new Set(),
-    samples: [],
-  };
-}
-
-function compactImportSample(ref, importerPath) {
-  const bindings = Array.isArray(ref?.bindings) ? ref.bindings : [];
-  const bindingLabels = bindings
-    .map((binding) => {
-      if (binding.kind === 'namespace') return `* as ${binding.local}`;
-      if (binding.kind === 'default') return `default as ${binding.local}`;
-      return binding.imported === binding.local ? binding.local : `${binding.imported} as ${binding.local}`;
-    })
-    .filter(Boolean);
-  return {
-    importerPath,
-    specifier: ref.specifier,
-    loadKind: normalizeString(ref.kind).trim() || 'import',
-    bindings: bindingLabels,
-  };
-}
-
-function buildModuleImportEvidence(graph) {
-  const moduleEvidence = new Map();
-  for (const record of graph.modules.values()) {
-    for (const ref of Array.isArray(record.importRefs) ? record.importRefs : []) {
-      const targetRel = normalizeString(ref?.localRel).trim();
-      if (!targetRel || !graph.modules.has(targetRel) || record.rel === targetRel) continue;
-      if (!moduleEvidence.has(targetRel)) moduleEvidence.set(targetRel, emptyModuleImportEvidence());
-      const evidence = moduleEvidence.get(targetRel);
-      const loadKind = normalizeString(ref.kind).trim() || 'import';
-      const bindings = Array.isArray(ref.bindings) ? ref.bindings : [];
-      evidence.importerFiles.add(record.rel);
-      evidence.loadKinds.add(loadKind);
-      if (bindings.length === 0) evidence.moduleOnlyImportFiles.add(record.rel);
-      if (bindings.some((binding) => binding.kind === 'namespace')) evidence.namespaceImportFiles.add(record.rel);
-      if (evidence.samples.length < 5) evidence.samples.push(compactImportSample(ref, record.rel));
-    }
-  }
-
-  return new Map(Array.from(moduleEvidence, ([modulePath, evidence]) => [modulePath, {
-    importerFileCount: evidence.importerFiles.size,
-    namespaceImportFileCount: evidence.namespaceImportFiles.size,
-    moduleOnlyImportFileCount: evidence.moduleOnlyImportFiles.size,
-    loadKinds: Array.from(evidence.loadKinds).sort(compareLocale),
-    samples: evidence.samples.sort((a, b) => compareLocale(a.importerPath, b.importerPath)
-      || compareLocale(a.loadKind, b.loadKind)
-      || compareLocale(a.specifier, b.specifier)),
-  }]));
-}
-
-function deadFunctionCandidateId(record, span) {
-  return [
-    'dead-function',
-    record.rel,
-    span.name,
-    span.startLine,
-    span.endLine,
-  ].join(':');
-}
-
-function deadFunctionSourceModuleId(modulePath) {
-  return `dead_${normalizeString(modulePath)
-    .replace(/\.[A-Za-z0-9]+$/g, '')
-    .replace(/[^A-Za-z0-9_$]/g, '_') || 'module'}`;
-}
-
-function summarizeLoadKinds(loadKinds = []) {
-  return Array.isArray(loadKinds) && loadKinds.length > 0 ? loadKinds.join(', ') : 'none';
-}
-
-function candidateEvidence(label, detail, tone = 'neutral') {
-  return { label, detail, tone };
-}
-
-function publicApiLabel(publicApi = {}) {
-  const kinds = Array.isArray(publicApi.exportKinds) ? publicApi.exportKinds : [];
-  const names = Array.isArray(publicApi.exportedNames) ? publicApi.exportedNames : [];
-  const kindText = kinds.length > 0 ? kinds.join(', ') : 'export';
-  const nameText = names.length > 0 ? ` as ${names.join(', ')}` : '';
-  return `${kindText}${nameText}`;
-}
-
-function moduleImportSampleText(moduleEvidence = {}) {
-  const samples = Array.isArray(moduleEvidence.samples) ? moduleEvidence.samples : [];
-  return samples
-    .slice(0, 3)
-    .map((sample) => {
-      const bindingText = Array.isArray(sample.bindings) && sample.bindings.length > 0
-        ? ` (${sample.bindings.join(', ')})`
-        : '';
-      return `${sample.importerPath} via ${sample.loadKind}${bindingText}`;
-    })
-    .join('; ');
-}
-
-function buildDeadFunctionCandidate({
-  graph,
-  record,
-  span,
-  metrics,
-  moduleEvidence = {},
-}) {
-  const publicApi = metrics.publicApi || emptyDeclarationImportMetrics().publicApi;
-  const loadKinds = Array.isArray(moduleEvidence.loadKinds) ? moduleEvidence.loadKinds : [];
-  const dynamicLoadKinds = loadKinds.filter((kind) => kind === 'dynamic' || kind === 'lazy');
-  const isEntrypointModule = record.rel === graph.entryRel;
-  const isReachableModule = Boolean(record.reachable);
-  const isComponentConvention = /^[A-Z]/.test(span.name);
-  const isHookConvention = /^use[A-Z0-9]/.test(span.name);
-  const hasNamespaceImport = Number(moduleEvidence.namespaceImportFileCount) > 0;
-  const hasModuleOnlyImport = Number(moduleEvidence.moduleOnlyImportFileCount) > 0;
-  const hasCommonJsReference = loadKinds.includes('require');
-  const hasDynamicReference = dynamicLoadKinds.length > 0;
-  const hasExportReference = loadKinds.includes('export');
-  const hasSideEffectReference = loadKinds.includes('side-effect');
-  const manualSignals = [];
-  const evidence = [
-    candidateEvidence(
-      'Zero direct refs',
-      `${metrics.directIdentifierReferenceCount} direct identifier references; ${metrics.sameFileReferenceCount} same-file references; ${metrics.incomingReferenceCount} direct import references.`,
-      'good',
-    ),
-    candidateEvidence(
-      'Zero direct importers',
-      `${metrics.importerFileCount} files import this declaration by name or default binding.`,
-      'good',
-    ),
-    candidateEvidence(
-      isReachableModule ? 'Reachable scope' : 'Unreachable scope',
-      isReachableModule
-        ? 'The module is reachable from the configured entry walk.'
-        : 'The module is outside the configured entry walk but was discovered under the project root.',
-      'neutral',
-    ),
-  ];
-
-  if (metrics.declarationOnlyNameOccurrence) {
-    evidence.push(candidateEvidence(
-      'No outside-declaration name hits',
-      [
-        `${metrics.identifierOccurrenceCount} total code occurrences`,
-        `${metrics.ownDeclarationReferenceCount || 0} inside the declaration span`,
-      ].join('; ') + '.',
-      'good',
-    ));
-  } else {
-    evidence.push(candidateEvidence(
-      'Extra name occurrences',
-      [
-        `${metrics.sameFileNameOccurrenceCount} outside-declaration name occurrences`,
-        `${metrics.ownDeclarationReferenceCount || 0} inside the declaration span`,
-        `${metrics.publicApiReferenceCount} are public API/export exposures`,
-      ].join('; ') + '.',
-      'review',
-    ));
-    manualSignals.push('extra name occurrences');
-  }
-
-  if (publicApi.exported) {
-    evidence.push(candidateEvidence('Export/public API', publicApiLabel(publicApi), 'review'));
-    manualSignals.push('exported/public API');
-  }
-  if (isEntrypointModule) {
-    evidence.push(candidateEvidence('Entrypoint module', record.rel, 'review'));
-    manualSignals.push('entrypoint module');
-  }
-  if (isComponentConvention) {
-    evidence.push(candidateEvidence('Component convention', `${span.name} starts with an uppercase letter.`, 'review'));
-    manualSignals.push('component convention');
-  }
-  if (isHookConvention) {
-    evidence.push(candidateEvidence('Hook convention', `${span.name} starts with use*.`, 'review'));
-    manualSignals.push('hook convention');
-  }
-  if (hasNamespaceImport || hasModuleOnlyImport || hasCommonJsReference || hasDynamicReference || hasExportReference || hasSideEffectReference) {
-    const sampleText = moduleImportSampleText(moduleEvidence);
-    evidence.push(candidateEvidence(
-      'Module-level references',
-      [
-        `${moduleEvidence.importerFileCount || 0} importing files`,
-        `kinds: ${summarizeLoadKinds(loadKinds)}`,
-        sampleText ? `samples: ${sampleText}` : '',
-      ].filter(Boolean).join('; '),
-      'review',
-    ));
-    manualSignals.push('module-level import/reference');
-  }
-
-  const confidence = manualSignals.length > 0 ? 'manual-review' : 'high-confidence';
-  const reason = confidence === 'high-confidence'
-    ? 'No direct references or direct importers, private declaration, and no known convention or module-level caveat.'
-    : `No direct references/importers, but review ${Array.from(new Set(manualSignals)).slice(0, 3).join(', ')} evidence.`;
-
-  return {
-    id: deadFunctionCandidateId(record, span),
-    name: span.name,
-    kind: span.kind,
-    modulePath: record.rel,
-    startLine: span.startLine,
-    endLine: span.endLine,
-    lineCount: span.lineCount,
-    confidence,
-    reason,
-    counts: {
-      directIdentifierReferences: metrics.directIdentifierReferenceCount,
-      sameFileReferences: metrics.sameFileReferenceCount,
-      ownDeclarationReferences: metrics.ownDeclarationReferenceCount,
-      incomingImportReferences: metrics.incomingReferenceCount,
-      directImportingFiles: metrics.importerFileCount,
-      nameOccurrences: metrics.identifierOccurrenceCount,
-      publicApiReferences: metrics.publicApiReferenceCount,
-      moduleImportingFiles: moduleEvidence.importerFileCount || 0,
-      namespaceImportingFiles: moduleEvidence.namespaceImportFileCount || 0,
-      moduleOnlyImportingFiles: moduleEvidence.moduleOnlyImportFileCount || 0,
-    },
-    signals: {
-      declarationOnlyNameOccurrence: metrics.declarationOnlyNameOccurrence,
-      reachableModule: isReachableModule,
-      exported: Boolean(publicApi.exported),
-      entrypointModule: isEntrypointModule,
-      componentConvention: isComponentConvention,
-      hookConvention: isHookConvention,
-      namespaceModuleReference: hasNamespaceImport,
-      moduleOnlyReference: hasModuleOnlyImport,
-      dynamicModuleReference: hasDynamicReference,
-      commonJsModuleReference: hasCommonJsReference,
-      exportModuleReference: hasExportReference,
-      sideEffectModuleReference: hasSideEffectReference,
-    },
-    exportKinds: Array.isArray(publicApi.exportKinds) ? publicApi.exportKinds : [],
-    exportedNames: Array.isArray(publicApi.exportedNames) ? publicApi.exportedNames : [],
-    moduleImportKinds: loadKinds,
-    reachable: isReachableModule,
-    evidence,
-  };
-}
-
-function compareDeadFunctionCandidates(a, b) {
-  const confidenceRank = { 'high-confidence': 0, 'manual-review': 1 };
-  return (confidenceRank[a.confidence] ?? 9) - (confidenceRank[b.confidence] ?? 9)
-    || compareLocale(a.modulePath, b.modulePath)
-    || a.startLine - b.startLine
-    || compareLocale(a.name, b.name);
-}
-
-function buildDeadFunctionCandidates(graph, declarationImportMetrics) {
-  const moduleImportEvidence = buildModuleImportEvidence(graph);
-  const candidates = [];
-  for (const record of Array.from(graph.modules.values()).sort((a, b) => compareLocale(a.rel, b.rel))) {
-    for (const span of Array.isArray(record.declarationSpans) ? record.declarationSpans : []) {
-      if (span.declarationType === 'function-expression-name') continue;
-      const metrics = declarationImportMetricsFor(declarationImportMetrics, record, span.name);
-      if (metrics.directIdentifierReferenceCount !== 0 || metrics.importerFileCount !== 0) continue;
-      candidates.push(buildDeadFunctionCandidate({
-        graph,
-        record,
-        span,
-        metrics,
-        moduleEvidence: moduleImportEvidence.get(record.rel) || {},
-      }));
-    }
-  }
-  return candidates.sort(compareDeadFunctionCandidates);
-}
-
 function buildMermaid(graph, importEdges, declarationImportMetrics, { reachableOnly = false } = {}) {
   const jsxModules = jsxModuleRecords(graph, { reachableOnly });
   const classIds = buildClassIds(jsxModules);
@@ -1292,44 +1227,28 @@ function buildMermaid(graph, importEdges, declarationImportMetrics, { reachableO
   return lines.join('\n');
 }
 
-function buildSourceCode(
-  graph,
-  declarationImportMetrics,
-  deadFunctionCandidates = [],
-  candidateDeclarationImportMetrics = declarationImportMetrics,
-) {
+function buildSourceCode(graph, declarationImportMetrics, declarationRelationships) {
   const jsxModules = jsxModuleRecords(graph, { reachableOnly: true });
   const classIds = buildClassIds(jsxModules);
   const declarations = [];
   const seen = new Set();
-  const sourceLocations = new Map();
-
-  const sourceLocationKey = (entry) => entry && [
-    entry.modulePath,
-    entry.name,
-    entry.startLine,
-    entry.endLine,
-  ].join('\u0000');
 
   const pushEntry = (entry) => {
-    const locationKey = sourceLocationKey(entry);
-    const existing = locationKey ? sourceLocations.get(locationKey) : null;
-    if (existing && entry?.candidateId) {
-      existing.candidateId = entry.candidateId;
-      return;
-    }
-    const key = entry && (entry.candidateId
-      ? `candidate\u0000${entry.candidateId}`
-      : `${entry.moduleId}\u0000${entry.sourceOrigin}\u0000${entry.name}`);
+    const key = entry && `${entry.moduleId}\u0000${entry.sourceOrigin}\u0000${entry.name}`;
     if (!entry || seen.has(key)) return;
     seen.add(key);
-    if (locationKey && !sourceLocations.has(locationKey)) sourceLocations.set(locationKey, entry);
     declarations.push(entry);
   };
 
   for (const record of jsxModules) {
     const moduleId = classIds.get(record.rel);
-    for (const entry of importedScriptSourceDeclarationsForJsx(record, graph, moduleId, declarationImportMetrics)) {
+    for (const entry of importedScriptSourceDeclarationsForJsx(
+      record,
+      graph,
+      moduleId,
+      declarationImportMetrics,
+      declarationRelationships,
+    )) {
       pushEntry(entry);
     }
     for (const [component, span] of componentSpans(record)) {
@@ -1340,25 +1259,9 @@ function buildSourceCode(
         span,
         sourceOrigin: 'current-file-declaration',
         metrics: declarationImportMetricsFor(declarationImportMetrics, record, component),
+        relationships: declarationRelationshipsFor(declarationRelationships, record, component),
       }));
     }
-  }
-
-  for (const candidate of Array.isArray(deadFunctionCandidates) ? deadFunctionCandidates : []) {
-    const record = graph.modules.get(candidate.modulePath);
-    const span = (Array.isArray(record?.declarationSpans) ? record.declarationSpans : [])
-      .find((item) => item.name === candidate.name
-        && item.startLine === candidate.startLine
-        && item.endLine === candidate.endLine);
-    pushEntry(sourceDeclarationEntry({
-      moduleId: deadFunctionSourceModuleId(candidate.modulePath),
-      visibleName: candidate.name,
-      record,
-      span,
-      sourceOrigin: 'dead-function-candidate',
-      candidateId: candidate.id,
-      metrics: declarationImportMetricsFor(candidateDeclarationImportMetrics, record, candidate.name),
-    }));
   }
 
   return { declarations };
@@ -1546,25 +1449,16 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
   const jsxClassCount = reachableJsxScripts.length;
   const reachableGraph = reachableGraphView(graph);
   const importEdges = buildImportEdges(graph, { reachableOnly: true });
-  const declarationImportMetrics = buildDeclarationImportMetrics(graph);
   const reachableDeclarationImportMetrics = buildDeclarationImportMetrics(reachableGraph);
-  const deadFunctionCandidates = buildDeadFunctionCandidates(graph, declarationImportMetrics);
+  const declarationRelationships = buildDeclarationRelationships(graph);
   const mermaid = buildMermaid(graph, importEdges, reachableDeclarationImportMetrics, { reachableOnly: true });
   const sourceCode = buildSourceCode(
     graph,
     reachableDeclarationImportMetrics,
-    deadFunctionCandidates,
-    declarationImportMetrics,
+    declarationRelationships,
   );
   const treeText = buildTreeText(graph);
   const jsxTreeText = buildJsxTreeText(reachableJsxScripts);
-  const deadFunctionHighConfidenceCount = deadFunctionCandidates
-    .filter((candidate) => candidate.confidence === 'high-confidence').length;
-  const deadFunctionManualReviewCount = deadFunctionCandidates
-    .filter((candidate) => candidate.confidence === 'manual-review').length;
-  const deadFunctionReachableCount = deadFunctionCandidates
-    .filter((candidate) => candidate.reachable).length;
-  const deadFunctionUnreachableCount = deadFunctionCandidates.length - deadFunctionReachableCount;
 
   return {
     rootDir: resolvedRoot,
@@ -1576,7 +1470,6 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
     jsxScripts,
     mermaid,
     importEdges,
-    deadFunctionCandidates,
     sourceCode,
     summary: {
       moduleCount: modules.size,
@@ -1588,11 +1481,6 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
       jsScriptCount: jsScripts.length,
       reachableJsScriptCount: reachableJsScripts.length,
       externalCount: externals.size,
-      deadFunctionCandidateCount: deadFunctionCandidates.length,
-      deadFunctionHighConfidenceCount,
-      deadFunctionManualReviewCount,
-      deadFunctionReachableCount,
-      deadFunctionUnreachableCount,
     },
   };
 }

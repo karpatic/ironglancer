@@ -142,7 +142,6 @@ function analysisPayload(analysis) {
     jsxScripts: analysis.jsxScripts,
     mermaid: analysis.mermaid,
     importEdges: analysis.importEdges,
-    deadFunctionCandidates: analysis.deadFunctionCandidates,
     summary: analysis.summary,
   };
 }
