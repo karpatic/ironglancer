@@ -714,7 +714,10 @@ function compareDeclarationSpan(a, b) {
 
 function functionDeclarationTypeAt(masked, startIndex) {
   const previousIndex = previousSignificantIndex(masked, startIndex);
-  if (previousIndex === -1 || ';{}'.includes(masked[previousIndex])) return 'function-declaration';
+  if (previousIndex === -1 || ';}'.includes(masked[previousIndex])) return 'function-declaration';
+  if (masked[previousIndex] === '{') {
+    return masked[previousIndex - 1] === '$' ? 'function-expression-name' : 'function-declaration';
+  }
   if (
     hasLineTerminatorBetween(masked, previousIndex + 1, startIndex)
     && canEndStatementAt(masked, previousIndex)

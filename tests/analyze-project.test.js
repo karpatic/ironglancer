@@ -529,6 +529,61 @@ test('analyzeProject excludes named function expression internal names from dead
   assert.equal(candidatesByName.get('abandonedTask').confidence, 'high-confidence');
 });
 
+test('analyzeProject excludes named function expressions inside template interpolation from dead candidates', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import { renderMessage } from './feature.js';",
+      '',
+      'export function App() {',
+      '  return <main>{renderMessage()}</main>;',
+      '}',
+    ].join('\n'),
+    'src/feature.js': [
+      'export function renderMessage() {',
+      '  return `${function helper() {}}`;',
+      '}',
+      '',
+      'function abandonedTask() {',
+      "  return 'dead';",
+      '}',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
+
+  assert.ok(!candidatesByName.has('helper'));
+  assert.equal(candidatesByName.get('abandonedTask').confidence, 'high-confidence');
+});
+
+test('analyzeProject maps named export aliases back to local declarations for import metrics', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import { bar } from './feature.js';",
+      '',
+      'export function App() {',
+      '  return <main>{bar()}</main>;',
+      '}',
+    ].join('\n'),
+    'src/feature.js': [
+      'function foo() {};',
+      'export { foo as bar };',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
+  const importedDeclaration = result.sourceCode.declarations.find((item) => item.declarationName === 'foo');
+
+  assert.ok(!candidatesByName.has('foo'));
+  assert.ok(importedDeclaration);
+  assert.equal(importedDeclaration.name, 'bar');
+  assert.equal(importedDeclaration.incomingReferenceCount, 1);
+  assert.equal(importedDeclaration.importerFileCount, 1);
+  assert.equal(importedDeclaration.referenceCount, 1);
+  assert.match(result.mermaid, /\+bar \[lines: 1 \| refs: 1 \| importers: 1\]/);
+});
+
 test('analyzeProject keeps ASI-separated function declarations as dead candidates without named expression noise', async () => {
   const rootDir = await writeTempProject({
     'src/app.jsx': [

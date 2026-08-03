@@ -551,9 +551,45 @@ function declarationImportMetricKey(modulePath, declarationName) {
   return rel && name ? `${rel}\u0000${name}` : '';
 }
 
+function namedExportDeclarationMap(record) {
+  const source = normalizeString(record?.source);
+  const masked = maskIgnorableSyntax(source);
+  const spans = declarationSpansByName(record);
+  const exports = new Map();
+  const add = (exportedName, localName) => {
+    const exported = normalizeIdentifier(exportedName);
+    const local = normalizeIdentifier(localName);
+    if (exported && local && spans.has(local) && !exports.has(exported)) exports.set(exported, local);
+  };
+
+  const directFunctionExportPattern = /\bexport\s+(?:async\s+)?function\s*\*?\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g;
+  const directArrowExportPattern = /\bexport\s+(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=/g;
+  let match;
+  while ((match = directFunctionExportPattern.exec(masked))) add(match[1], match[1]);
+  while ((match = directArrowExportPattern.exec(masked))) add(match[1], match[1]);
+  for (const entry of namedExportListEntries(masked)) {
+    for (const part of identifierListParts(entry.specifiersText)) {
+      const specifier = parseNamedExportSpecifier(part);
+      if (specifier) add(specifier.exported, specifier.local);
+    }
+  }
+  return exports;
+}
+
+function namedExportDeclarationName(record, exportedName) {
+  const imported = normalizeIdentifier(exportedName);
+  if (!imported) return '';
+  const exportedDeclarations = namedExportDeclarationMap(record);
+  if (exportedDeclarations.has(imported)) return exportedDeclarations.get(imported);
+  return declarationSpansByName(record).has(imported) ? imported : '';
+}
+
 function importBindingDeclarationName(targetRecord, binding) {
   const kind = normalizeString(binding?.kind || 'named').trim() || 'named';
-  if (kind === 'named') return normalizeString(binding?.imported).trim();
+  if (kind === 'named') {
+    const imported = normalizeIdentifier(binding?.imported);
+    return namedExportDeclarationName(targetRecord, imported) || imported;
+  }
   if (kind === 'default') return defaultExportDeclarationName(targetRecord) || normalizeString(binding?.local).trim();
   return '';
 }
@@ -796,7 +832,8 @@ function compareImportEdgeBinding(a, b) {
 
 function importBindingLineCount(graph, targetRel, binding) {
   if (binding.kind !== 'named') return null;
-  return declarationLineCount(graph.modules.get(targetRel), binding.imported);
+  const targetRecord = graph.modules.get(targetRel);
+  return declarationLineCount(targetRecord, importBindingDeclarationName(targetRecord, binding));
 }
 
 function edgeRestingLabel(loadKinds) {

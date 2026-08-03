@@ -315,6 +315,21 @@ test('extractDeclarationSpans treats ASI-separated functions as declarations onl
   assert.equal(spansByName.get('callbackHelper').declarationType, 'function-expression-name');
 });
 
+test('extractDeclarationSpans treats template interpolation function names as expression-internal', () => {
+  const source = [
+    'const label = `${function helper() {}}`;',
+    '',
+    'function afterTemplate() {',
+    "  return 'dead';",
+    '}',
+  ].join('\n');
+
+  const spansByName = new Map(extractDeclarationSpans(source).map((span) => [span.name, span]));
+
+  assert.equal(spansByName.get('helper').declarationType, 'function-expression-name');
+  assert.equal(spansByName.get('afterTemplate').declarationType, 'function-declaration');
+});
+
 test('extractDeclarationSpans measures multiline arrow block bodies while ignoring templates', () => {
   const source = [
     'export const BlockArrow = () => {',
