@@ -5,6 +5,8 @@ import {
   countIdentifierReferences,
   extractDeclarationSpans,
   extractImportRefs,
+  identifierReferenceLocations,
+  maskIgnorableSyntax,
 } from './import-parser.js';
 import { compareLocale, extensionCandidates, fileExists, isWithinPath, normalizeString, toPosixPath } from './utils.js';
 
@@ -219,6 +221,48 @@ function declarationLineCount(record, name) {
   return Number.isInteger(span?.lineCount) && span.lineCount > 0 ? span.lineCount : null;
 }
 
+function escapeRegExp(value) {
+  return normalizeString(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeIdentifier(value) {
+  const raw = normalizeString(value).trim().replace(/^(?:type|typeof)\s+/, '');
+  const match = raw.match(/^[A-Za-z_$][A-Za-z0-9_$]*$/);
+  return match ? match[0] : '';
+}
+
+function identifierListParts(text) {
+  return normalizeString(text)
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function parseNamedExportSpecifier(part) {
+  const cleaned = normalizeString(part)
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*$/g, '')
+    .trim()
+    .replace(/^(?:type|typeof)\s+/, '');
+  if (!cleaned) return null;
+  const aliasMatch = cleaned.match(/^([A-Za-z_$][A-Za-z0-9_$]*)\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)$/);
+  if (aliasMatch) return { local: aliasMatch[1], exported: aliasMatch[2] };
+  const local = normalizeIdentifier(cleaned);
+  return local ? { local, exported: local } : null;
+}
+
+function parseCommonJsObjectSpecifier(part) {
+  const cleaned = normalizeString(part)
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*$/g, '')
+    .trim();
+  if (!cleaned) return null;
+  const aliasMatch = cleaned.match(/^([A-Za-z_$][A-Za-z0-9_$]*)\s*:\s*([A-Za-z_$][A-Za-z0-9_$]*)$/);
+  if (aliasMatch) return { exported: aliasMatch[1], local: aliasMatch[2] };
+  const local = normalizeIdentifier(cleaned);
+  return local ? { exported: local, local } : null;
+}
+
 function defaultExportDeclarationName(record) {
   const source = normalizeString(record?.source);
   if (!source) return '';
@@ -230,6 +274,153 @@ function defaultExportDeclarationName(record) {
   const identifierMatch = source.match(/\bexport\s+default\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/);
   if (identifierMatch && spans.has(identifierMatch[1])) return identifierMatch[1];
   return '';
+}
+
+function addPublicApiSignal(info, { kind, exportedName, startIndex, endIndex }) {
+  const signalKind = normalizeString(kind).trim();
+  const name = normalizeString(exportedName).trim();
+  if (signalKind && !info.exportKinds.includes(signalKind)) info.exportKinds.push(signalKind);
+  if (name && !info.exportedNames.includes(name)) info.exportedNames.push(name);
+  if (Number.isInteger(startIndex) && Number.isInteger(endIndex) && endIndex > startIndex) {
+    info.ranges.push({ startIndex, endIndex });
+  }
+}
+
+function declarationPublicApiInfo(record, declarationName) {
+  const name = normalizeIdentifier(declarationName);
+  const source = normalizeString(record?.source);
+  const masked = maskIgnorableSyntax(source);
+  const info = {
+    exported: false,
+    exportedNames: [],
+    exportKinds: [],
+    ranges: [],
+  };
+  if (!name || !source) return info;
+
+  const escaped = escapeRegExp(name);
+  const directFunctionExportPattern = new RegExp(`\\bexport\\s+(default\\s+)?(?:async\\s+)?function\\s*\\*?\\s+${escaped}\\s*\\(`, 'g');
+  const directArrowExportPattern = new RegExp(`\\bexport\\s+(?:const|let|var)\\s+${escaped}\\s*=`, 'g');
+  const defaultIdentifierExportPattern = new RegExp(`\\bexport\\s+default\\s+${escaped}\\b`, 'g');
+  const namedExportListPattern = /\bexport\s*\{([\s\S]*?)\}\s*([^;]*)/g;
+  const commonJsPropertyPattern = new RegExp(`\\b(?:module\\.)?exports\\s*\\.\\s*([A-Za-z_$][A-Za-z0-9_$]*)\\s*=\\s*${escaped}\\b`, 'g');
+  const commonJsDefaultPattern = new RegExp(`\\bmodule\\s*\\.\\s*exports\\s*=\\s*${escaped}\\b`, 'g');
+  const commonJsObjectPattern = /\bmodule\s*\.\s*exports\s*=\s*\{([\s\S]*?)\}/g;
+
+  let match;
+  while ((match = directFunctionExportPattern.exec(masked))) {
+    info.exported = true;
+    const kind = match[1] ? 'default-export' : 'named-export';
+    addPublicApiSignal(info, {
+      kind,
+      exportedName: match[1] ? 'default' : name,
+      startIndex: match.index,
+      endIndex: directFunctionExportPattern.lastIndex,
+    });
+  }
+  while ((match = directArrowExportPattern.exec(masked))) {
+    info.exported = true;
+    addPublicApiSignal(info, {
+      kind: 'named-export',
+      exportedName: name,
+      startIndex: match.index,
+      endIndex: directArrowExportPattern.lastIndex,
+    });
+  }
+  while ((match = defaultIdentifierExportPattern.exec(masked))) {
+    info.exported = true;
+    addPublicApiSignal(info, {
+      kind: 'default-export',
+      exportedName: 'default',
+      startIndex: match.index,
+      endIndex: defaultIdentifierExportPattern.lastIndex,
+    });
+  }
+  while ((match = namedExportListPattern.exec(masked))) {
+    const trailing = normalizeString(match[2]);
+    if (/\bfrom\b/.test(trailing)) continue;
+    for (const part of identifierListParts(match[1])) {
+      const specifier = parseNamedExportSpecifier(part);
+      if (!specifier || specifier.local !== name) continue;
+      info.exported = true;
+      addPublicApiSignal(info, {
+        kind: specifier.exported === 'default' ? 'default-export' : 'named-export',
+        exportedName: specifier.exported,
+        startIndex: match.index,
+        endIndex: namedExportListPattern.lastIndex,
+      });
+    }
+  }
+  while ((match = commonJsPropertyPattern.exec(masked))) {
+    info.exported = true;
+    addPublicApiSignal(info, {
+      kind: 'commonjs-export',
+      exportedName: match[1],
+      startIndex: match.index,
+      endIndex: commonJsPropertyPattern.lastIndex,
+    });
+  }
+  while ((match = commonJsDefaultPattern.exec(masked))) {
+    info.exported = true;
+    addPublicApiSignal(info, {
+      kind: 'commonjs-export',
+      exportedName: 'module.exports',
+      startIndex: match.index,
+      endIndex: commonJsDefaultPattern.lastIndex,
+    });
+  }
+  while ((match = commonJsObjectPattern.exec(masked))) {
+    for (const part of identifierListParts(match[1])) {
+      const specifier = parseCommonJsObjectSpecifier(part);
+      if (!specifier || specifier.local !== name) continue;
+      info.exported = true;
+      addPublicApiSignal(info, {
+        kind: 'commonjs-export',
+        exportedName: specifier.exported,
+        startIndex: match.index,
+        endIndex: commonJsObjectPattern.lastIndex,
+      });
+    }
+  }
+
+  info.exportKinds.sort(compareLocale);
+  info.exportedNames.sort(compareLocale);
+  return info;
+}
+
+function isDeclarationNameLocation(span, location) {
+  return Number.isInteger(span?.nameStartIndex)
+    && Number.isInteger(span?.nameEndIndex)
+    && location?.index === span.nameStartIndex
+    && location?.endIndex === span.nameEndIndex;
+}
+
+function locationInRanges(location, ranges) {
+  return ranges.some((range) => (
+    Number.isInteger(range?.startIndex)
+    && Number.isInteger(range?.endIndex)
+    && location.index >= range.startIndex
+    && location.endIndex <= range.endIndex
+  ));
+}
+
+function declarationIdentifierMetrics(record, span, publicApiInfo) {
+  const locations = identifierReferenceLocations(record?.source, span?.name);
+  const declarationLocations = locations.filter((location) => isDeclarationNameLocation(span, location));
+  const nonDeclarationLocations = locations.filter((location) => !isDeclarationNameLocation(span, location));
+  const publicApiLocations = nonDeclarationLocations
+    .filter((location) => locationInRanges(location, publicApiInfo.ranges));
+  const publicApiIndexes = new Set(publicApiLocations.map((location) => `${location.index}:${location.endIndex}`));
+  const sameFileLocations = nonDeclarationLocations
+    .filter((location) => !publicApiIndexes.has(`${location.index}:${location.endIndex}`));
+
+  return {
+    identifierOccurrenceCount: locations.length,
+    declarationNameOccurrenceCount: declarationLocations.length,
+    declarationOnlyNameOccurrence: locations.length === declarationLocations.length,
+    sameFileReferenceCount: sameFileLocations.length,
+    publicApiReferenceCount: publicApiLocations.length,
+  };
 }
 
 function declarationSnippet(record, span) {
@@ -254,6 +445,7 @@ function sourceDeclarationEntry({
   span,
   declarationName = visibleName,
   sourceOrigin,
+  candidateId = '',
   metrics = emptyDeclarationImportMetrics(),
 }) {
   const code = declarationSnippet(record, span);
@@ -268,7 +460,11 @@ function sourceDeclarationEntry({
     endLine: span.endLine,
     code,
     sourceOrigin,
+    candidateId,
     referenceCount: metrics.referenceCount,
+    sameFileReferenceCount: metrics.sameFileReferenceCount,
+    incomingReferenceCount: metrics.incomingReferenceCount,
+    directIdentifierReferenceCount: metrics.directIdentifierReferenceCount,
     importerFileCount: metrics.importerFileCount,
   };
 }
@@ -276,7 +472,21 @@ function sourceDeclarationEntry({
 function emptyDeclarationImportMetrics() {
   return {
     referenceCount: 0,
+    directIdentifierReferenceCount: 0,
+    sameFileReferenceCount: 0,
+    sameFileNameOccurrenceCount: 0,
+    incomingReferenceCount: 0,
+    identifierOccurrenceCount: 0,
+    declarationNameOccurrenceCount: 0,
+    declarationOnlyNameOccurrence: false,
+    publicApiReferenceCount: 0,
     importerFileCount: 0,
+    incomingImports: [],
+    publicApi: {
+      exported: false,
+      exportedNames: [],
+      exportKinds: [],
+    },
   };
 }
 
@@ -303,12 +513,21 @@ function declarationImportMetricsFor(metrics, record, declarationName) {
 function buildDeclarationImportMetrics(graph) {
   const buckets = new Map();
   for (const record of graph.modules.values()) {
-    for (const declarationName of declarationSpansByName(record).keys()) {
+    for (const [declarationName, span] of declarationSpansByName(record)) {
       const key = declarationImportMetricKey(record.rel, declarationName);
       if (!key) continue;
+      const publicApi = declarationPublicApiInfo(record, declarationName);
+      const identifierMetrics = declarationIdentifierMetrics(record, span, publicApi);
       buckets.set(key, {
-        referenceCount: Math.max(0, countIdentifierReferences(record.source, declarationName) - 1),
+        ...identifierMetrics,
+        incomingReferenceCount: 0,
         importerFiles: new Set(),
+        incomingImports: [],
+        publicApi: {
+          exported: publicApi.exported,
+          exportedNames: publicApi.exportedNames,
+          exportKinds: publicApi.exportKinds,
+        },
       });
     }
   }
@@ -324,20 +543,57 @@ function buildDeclarationImportMetrics(graph) {
         if (!key) continue;
         if (!buckets.has(key)) {
           buckets.set(key, {
-            referenceCount: 0,
+            identifierOccurrenceCount: 0,
+            declarationNameOccurrenceCount: 0,
+            declarationOnlyNameOccurrence: false,
+            sameFileReferenceCount: 0,
+            publicApiReferenceCount: 0,
+            incomingReferenceCount: 0,
             importerFiles: new Set(),
+            incomingImports: [],
+            publicApi: {
+              exported: false,
+              exportedNames: [],
+              exportKinds: [],
+            },
           });
         }
         const bucket = buckets.get(key);
-        bucket.referenceCount += Math.max(0, countIdentifierReferences(importerRecord.source, binding.local) - 1);
-        if (importerRecord.rel !== targetRecord.rel) bucket.importerFiles.add(importerRecord.rel);
+        const referenceCount = Math.max(0, countIdentifierReferences(importerRecord.source, binding.local) - 1);
+        bucket.incomingReferenceCount += referenceCount;
+        if (importerRecord.rel !== targetRecord.rel) {
+          bucket.importerFiles.add(importerRecord.rel);
+          bucket.incomingImports.push({
+            importerPath: importerRecord.rel,
+            specifier: ref.specifier,
+            loadKind: normalizeString(ref.kind).trim() || 'import',
+            imported: binding.imported,
+            local: binding.local,
+            bindingKind: binding.kind,
+            inferred: Boolean(binding.inferred),
+            referenceCount,
+          });
+        }
       }
     }
   }
 
   return new Map(Array.from(buckets, ([key, bucket]) => [key, {
-    referenceCount: bucket.referenceCount,
+    referenceCount: bucket.sameFileReferenceCount + bucket.incomingReferenceCount,
+    directIdentifierReferenceCount: bucket.sameFileReferenceCount + bucket.incomingReferenceCount,
+    sameFileReferenceCount: bucket.sameFileReferenceCount,
+    sameFileNameOccurrenceCount: Math.max(0, bucket.identifierOccurrenceCount - bucket.declarationNameOccurrenceCount),
+    incomingReferenceCount: bucket.incomingReferenceCount,
+    identifierOccurrenceCount: bucket.identifierOccurrenceCount,
+    declarationNameOccurrenceCount: bucket.declarationNameOccurrenceCount,
+    declarationOnlyNameOccurrence: bucket.declarationOnlyNameOccurrence,
+    publicApiReferenceCount: bucket.publicApiReferenceCount,
     importerFileCount: bucket.importerFiles.size,
+    incomingImports: bucket.incomingImports.sort((a, b) => compareLocale(a.importerPath, b.importerPath)
+      || compareLocale(a.loadKind, b.loadKind)
+      || compareLocale(a.imported, b.imported)
+      || compareLocale(a.local, b.local)),
+    publicApi: bucket.publicApi,
   }]));
 }
 
@@ -547,6 +803,258 @@ function buildImportEdges(graph) {
       || compareLocale(a.target, b.target));
 }
 
+function emptyModuleImportEvidence() {
+  return {
+    importerFiles: new Set(),
+    namespaceImportFiles: new Set(),
+    moduleOnlyImportFiles: new Set(),
+    loadKinds: new Set(),
+    samples: [],
+  };
+}
+
+function compactImportSample(ref, importerPath) {
+  const bindings = Array.isArray(ref?.bindings) ? ref.bindings : [];
+  const bindingLabels = bindings
+    .map((binding) => {
+      if (binding.kind === 'namespace') return `* as ${binding.local}`;
+      if (binding.kind === 'default') return `default as ${binding.local}`;
+      return binding.imported === binding.local ? binding.local : `${binding.imported} as ${binding.local}`;
+    })
+    .filter(Boolean);
+  return {
+    importerPath,
+    specifier: ref.specifier,
+    loadKind: normalizeString(ref.kind).trim() || 'import',
+    bindings: bindingLabels,
+  };
+}
+
+function buildModuleImportEvidence(graph) {
+  const moduleEvidence = new Map();
+  for (const record of graph.modules.values()) {
+    for (const ref of Array.isArray(record.importRefs) ? record.importRefs : []) {
+      const targetRel = normalizeString(ref?.localRel).trim();
+      if (!targetRel || !graph.modules.has(targetRel) || record.rel === targetRel) continue;
+      if (!moduleEvidence.has(targetRel)) moduleEvidence.set(targetRel, emptyModuleImportEvidence());
+      const evidence = moduleEvidence.get(targetRel);
+      const loadKind = normalizeString(ref.kind).trim() || 'import';
+      const bindings = Array.isArray(ref.bindings) ? ref.bindings : [];
+      evidence.importerFiles.add(record.rel);
+      evidence.loadKinds.add(loadKind);
+      if (bindings.length === 0) evidence.moduleOnlyImportFiles.add(record.rel);
+      if (bindings.some((binding) => binding.kind === 'namespace')) evidence.namespaceImportFiles.add(record.rel);
+      if (evidence.samples.length < 5) evidence.samples.push(compactImportSample(ref, record.rel));
+    }
+  }
+
+  return new Map(Array.from(moduleEvidence, ([modulePath, evidence]) => [modulePath, {
+    importerFileCount: evidence.importerFiles.size,
+    namespaceImportFileCount: evidence.namespaceImportFiles.size,
+    moduleOnlyImportFileCount: evidence.moduleOnlyImportFiles.size,
+    loadKinds: Array.from(evidence.loadKinds).sort(compareLocale),
+    samples: evidence.samples.sort((a, b) => compareLocale(a.importerPath, b.importerPath)
+      || compareLocale(a.loadKind, b.loadKind)
+      || compareLocale(a.specifier, b.specifier)),
+  }]));
+}
+
+function deadFunctionCandidateId(record, span) {
+  return [
+    'dead-function',
+    record.rel,
+    span.name,
+    span.startLine,
+    span.endLine,
+  ].join(':');
+}
+
+function deadFunctionSourceModuleId(modulePath) {
+  return `dead_${normalizeString(modulePath)
+    .replace(/\.[A-Za-z0-9]+$/g, '')
+    .replace(/[^A-Za-z0-9_$]/g, '_') || 'module'}`;
+}
+
+function summarizeLoadKinds(loadKinds = []) {
+  return Array.isArray(loadKinds) && loadKinds.length > 0 ? loadKinds.join(', ') : 'none';
+}
+
+function candidateEvidence(label, detail, tone = 'neutral') {
+  return { label, detail, tone };
+}
+
+function publicApiLabel(publicApi = {}) {
+  const kinds = Array.isArray(publicApi.exportKinds) ? publicApi.exportKinds : [];
+  const names = Array.isArray(publicApi.exportedNames) ? publicApi.exportedNames : [];
+  const kindText = kinds.length > 0 ? kinds.join(', ') : 'export';
+  const nameText = names.length > 0 ? ` as ${names.join(', ')}` : '';
+  return `${kindText}${nameText}`;
+}
+
+function moduleImportSampleText(moduleEvidence = {}) {
+  const samples = Array.isArray(moduleEvidence.samples) ? moduleEvidence.samples : [];
+  return samples
+    .slice(0, 3)
+    .map((sample) => {
+      const bindingText = Array.isArray(sample.bindings) && sample.bindings.length > 0
+        ? ` (${sample.bindings.join(', ')})`
+        : '';
+      return `${sample.importerPath} via ${sample.loadKind}${bindingText}`;
+    })
+    .join('; ');
+}
+
+function buildDeadFunctionCandidate({
+  graph,
+  record,
+  span,
+  metrics,
+  moduleEvidence = {},
+}) {
+  const publicApi = metrics.publicApi || emptyDeclarationImportMetrics().publicApi;
+  const loadKinds = Array.isArray(moduleEvidence.loadKinds) ? moduleEvidence.loadKinds : [];
+  const dynamicLoadKinds = loadKinds.filter((kind) => kind === 'dynamic' || kind === 'lazy');
+  const isEntrypointModule = record.rel === graph.entryRel;
+  const isComponentConvention = /^[A-Z]/.test(span.name);
+  const isHookConvention = /^use[A-Z0-9]/.test(span.name);
+  const hasNamespaceImport = Number(moduleEvidence.namespaceImportFileCount) > 0;
+  const hasModuleOnlyImport = Number(moduleEvidence.moduleOnlyImportFileCount) > 0;
+  const hasCommonJsReference = loadKinds.includes('require');
+  const hasDynamicReference = dynamicLoadKinds.length > 0;
+  const hasExportReference = loadKinds.includes('export');
+  const hasSideEffectReference = loadKinds.includes('side-effect');
+  const manualSignals = [];
+  const evidence = [
+    candidateEvidence(
+      'Zero direct refs',
+      `${metrics.directIdentifierReferenceCount} direct identifier references; ${metrics.sameFileReferenceCount} same-file references; ${metrics.incomingReferenceCount} direct import references.`,
+      'good',
+    ),
+    candidateEvidence(
+      'Zero direct importers',
+      `${metrics.importerFileCount} files import this declaration by name or default binding.`,
+      'good',
+    ),
+  ];
+
+  if (metrics.declarationOnlyNameOccurrence) {
+    evidence.push(candidateEvidence(
+      'Declaration-only name',
+      `The name occurs ${metrics.identifierOccurrenceCount} time in code, at the declaration.`,
+      'good',
+    ));
+  } else {
+    evidence.push(candidateEvidence(
+      'Extra name occurrences',
+      `${metrics.sameFileNameOccurrenceCount} non-declaration name occurrences; ${metrics.publicApiReferenceCount} are public API/export exposures.`,
+      'review',
+    ));
+    manualSignals.push('extra name occurrences');
+  }
+
+  if (publicApi.exported) {
+    evidence.push(candidateEvidence('Export/public API', publicApiLabel(publicApi), 'review'));
+    manualSignals.push('exported/public API');
+  }
+  if (isEntrypointModule) {
+    evidence.push(candidateEvidence('Entrypoint module', record.rel, 'review'));
+    manualSignals.push('entrypoint module');
+  }
+  if (isComponentConvention) {
+    evidence.push(candidateEvidence('Component convention', `${span.name} starts with an uppercase letter.`, 'review'));
+    manualSignals.push('component convention');
+  }
+  if (isHookConvention) {
+    evidence.push(candidateEvidence('Hook convention', `${span.name} starts with use*.`, 'review'));
+    manualSignals.push('hook convention');
+  }
+  if (hasNamespaceImport || hasModuleOnlyImport || hasCommonJsReference || hasDynamicReference || hasExportReference || hasSideEffectReference) {
+    const sampleText = moduleImportSampleText(moduleEvidence);
+    evidence.push(candidateEvidence(
+      'Module-level references',
+      [
+        `${moduleEvidence.importerFileCount || 0} importing files`,
+        `kinds: ${summarizeLoadKinds(loadKinds)}`,
+        sampleText ? `samples: ${sampleText}` : '',
+      ].filter(Boolean).join('; '),
+      'review',
+    ));
+    manualSignals.push('module-level import/reference');
+  }
+
+  const confidence = manualSignals.length > 0 ? 'manual-review' : 'high-confidence';
+  const reason = confidence === 'high-confidence'
+    ? 'No direct references or direct importers, private declaration, and no known convention or module-level caveat.'
+    : `No direct references/importers, but review ${Array.from(new Set(manualSignals)).slice(0, 3).join(', ')} evidence.`;
+
+  return {
+    id: deadFunctionCandidateId(record, span),
+    name: span.name,
+    kind: span.kind,
+    modulePath: record.rel,
+    startLine: span.startLine,
+    endLine: span.endLine,
+    lineCount: span.lineCount,
+    confidence,
+    reason,
+    counts: {
+      directIdentifierReferences: metrics.directIdentifierReferenceCount,
+      sameFileReferences: metrics.sameFileReferenceCount,
+      incomingImportReferences: metrics.incomingReferenceCount,
+      directImportingFiles: metrics.importerFileCount,
+      nameOccurrences: metrics.identifierOccurrenceCount,
+      publicApiReferences: metrics.publicApiReferenceCount,
+      moduleImportingFiles: moduleEvidence.importerFileCount || 0,
+      namespaceImportingFiles: moduleEvidence.namespaceImportFileCount || 0,
+      moduleOnlyImportingFiles: moduleEvidence.moduleOnlyImportFileCount || 0,
+    },
+    signals: {
+      declarationOnlyNameOccurrence: metrics.declarationOnlyNameOccurrence,
+      exported: Boolean(publicApi.exported),
+      entrypointModule: isEntrypointModule,
+      componentConvention: isComponentConvention,
+      hookConvention: isHookConvention,
+      namespaceModuleReference: hasNamespaceImport,
+      moduleOnlyReference: hasModuleOnlyImport,
+      dynamicModuleReference: hasDynamicReference,
+      commonJsModuleReference: hasCommonJsReference,
+      exportModuleReference: hasExportReference,
+      sideEffectModuleReference: hasSideEffectReference,
+    },
+    exportKinds: Array.isArray(publicApi.exportKinds) ? publicApi.exportKinds : [],
+    exportedNames: Array.isArray(publicApi.exportedNames) ? publicApi.exportedNames : [],
+    moduleImportKinds: loadKinds,
+    evidence,
+  };
+}
+
+function compareDeadFunctionCandidates(a, b) {
+  const confidenceRank = { 'high-confidence': 0, 'manual-review': 1 };
+  return (confidenceRank[a.confidence] ?? 9) - (confidenceRank[b.confidence] ?? 9)
+    || compareLocale(a.modulePath, b.modulePath)
+    || a.startLine - b.startLine
+    || compareLocale(a.name, b.name);
+}
+
+function buildDeadFunctionCandidates(graph, declarationImportMetrics) {
+  const moduleImportEvidence = buildModuleImportEvidence(graph);
+  const candidates = [];
+  for (const record of Array.from(graph.modules.values()).sort((a, b) => compareLocale(a.rel, b.rel))) {
+    for (const span of Array.isArray(record.declarationSpans) ? record.declarationSpans : []) {
+      const metrics = declarationImportMetricsFor(declarationImportMetrics, record, span.name);
+      if (metrics.directIdentifierReferenceCount !== 0 || metrics.importerFileCount !== 0) continue;
+      candidates.push(buildDeadFunctionCandidate({
+        graph,
+        record,
+        span,
+        metrics,
+        moduleEvidence: moduleImportEvidence.get(record.rel) || {},
+      }));
+    }
+  }
+  return candidates.sort(compareDeadFunctionCandidates);
+}
+
 function buildMermaid(graph, importEdges, declarationImportMetrics) {
   const jsxModules = jsxModuleRecords(graph);
   const classIds = buildClassIds(jsxModules);
@@ -584,16 +1092,33 @@ function buildMermaid(graph, importEdges, declarationImportMetrics) {
   return lines.join('\n');
 }
 
-function buildSourceCode(graph, declarationImportMetrics) {
+function buildSourceCode(graph, declarationImportMetrics, deadFunctionCandidates = []) {
   const jsxModules = jsxModuleRecords(graph);
   const classIds = buildClassIds(jsxModules);
   const declarations = [];
   const seen = new Set();
+  const sourceLocations = new Map();
+
+  const sourceLocationKey = (entry) => entry && [
+    entry.modulePath,
+    entry.name,
+    entry.startLine,
+    entry.endLine,
+  ].join('\u0000');
 
   const pushEntry = (entry) => {
-    const key = entry && `${entry.moduleId}\u0000${entry.sourceOrigin}\u0000${entry.name}`;
+    const locationKey = sourceLocationKey(entry);
+    const existing = locationKey ? sourceLocations.get(locationKey) : null;
+    if (existing && entry?.candidateId) {
+      existing.candidateId = entry.candidateId;
+      return;
+    }
+    const key = entry && (entry.candidateId
+      ? `candidate\u0000${entry.candidateId}`
+      : `${entry.moduleId}\u0000${entry.sourceOrigin}\u0000${entry.name}`);
     if (!entry || seen.has(key)) return;
     seen.add(key);
+    if (locationKey && !sourceLocations.has(locationKey)) sourceLocations.set(locationKey, entry);
     declarations.push(entry);
   };
 
@@ -612,6 +1137,23 @@ function buildSourceCode(graph, declarationImportMetrics) {
         metrics: declarationImportMetricsFor(declarationImportMetrics, record, component),
       }));
     }
+  }
+
+  for (const candidate of Array.isArray(deadFunctionCandidates) ? deadFunctionCandidates : []) {
+    const record = graph.modules.get(candidate.modulePath);
+    const span = (Array.isArray(record?.declarationSpans) ? record.declarationSpans : [])
+      .find((item) => item.name === candidate.name
+        && item.startLine === candidate.startLine
+        && item.endLine === candidate.endLine);
+    pushEntry(sourceDeclarationEntry({
+      moduleId: deadFunctionSourceModuleId(candidate.modulePath),
+      visibleName: candidate.name,
+      record,
+      span,
+      sourceOrigin: 'dead-function-candidate',
+      candidateId: candidate.id,
+      metrics: declarationImportMetricsFor(declarationImportMetrics, record, candidate.name),
+    }));
   }
 
   return { declarations };
@@ -766,10 +1308,15 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
   const jsxClassCount = jsxScripts.length;
   const importEdges = buildImportEdges(graph);
   const declarationImportMetrics = buildDeclarationImportMetrics(graph);
+  const deadFunctionCandidates = buildDeadFunctionCandidates(graph, declarationImportMetrics);
   const mermaid = buildMermaid(graph, importEdges, declarationImportMetrics);
-  const sourceCode = buildSourceCode(graph, declarationImportMetrics);
+  const sourceCode = buildSourceCode(graph, declarationImportMetrics, deadFunctionCandidates);
   const treeText = buildTreeText(graph);
   const jsxTreeText = buildJsxTreeText(jsxScripts);
+  const deadFunctionHighConfidenceCount = deadFunctionCandidates
+    .filter((candidate) => candidate.confidence === 'high-confidence').length;
+  const deadFunctionManualReviewCount = deadFunctionCandidates
+    .filter((candidate) => candidate.confidence === 'manual-review').length;
 
   return {
     rootDir: resolvedRoot,
@@ -781,6 +1328,7 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
     jsxScripts,
     mermaid,
     importEdges,
+    deadFunctionCandidates,
     sourceCode,
     summary: {
       moduleCount: modules.size,
@@ -788,6 +1336,9 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
       jsxFileCount: jsxScripts.length,
       jsScriptCount: jsScripts.length,
       externalCount: externals.size,
+      deadFunctionCandidateCount: deadFunctionCandidates.length,
+      deadFunctionHighConfidenceCount,
+      deadFunctionManualReviewCount,
     },
   };
 }

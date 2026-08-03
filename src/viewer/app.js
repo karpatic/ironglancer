@@ -11,6 +11,10 @@ const diagramEl = document.getElementById('diagram');
 const viewportEl = document.getElementById('diagram-viewport');
 const statsEl = document.getElementById('stats');
 const selectedImportEl = document.getElementById('selected-import');
+const deadFunctionsCountsEl = document.getElementById('dead-functions-counts');
+const deadFunctionsFilterEl = document.getElementById('dead-functions-filter');
+const deadFunctionsSearchEl = document.getElementById('dead-functions-search');
+const deadFunctionsListEl = document.getElementById('dead-functions-list');
 const downloadBtn = document.getElementById('download-svg-btn');
 const zoomInBtn = document.getElementById('zoom-in-btn');
 const zoomOutBtn = document.getElementById('zoom-out-btn');
@@ -31,6 +35,7 @@ const sourceDialogCloseBtn = document.getElementById('source-dialog-close');
 let latestSvg = '';
 let rawJsxTreeText = '';
 let rawMermaidSourceText = '';
+let deadFunctionCandidates = [];
 let activeSvg = null;
 let baseWidth = 0;
 let baseHeight = 0;
@@ -49,7 +54,7 @@ let sourceMemberTargetCounter = 0;
 let sourceMemberTargets = new Map();
 
 function emptySourceDeclarationLookup() {
-  return { byName: new Map(), groups: new Map() };
+  return { byName: new Map(), byCandidateId: new Map(), groups: new Map() };
 }
 
 function statCard(label, value) {
@@ -243,17 +248,20 @@ function sourceNavigationGroup(declaration) {
 
 function sourceDeclarationLookupFromPayload(sourcePayload = {}) {
   const byName = new Map();
+  const byCandidateId = new Map();
   const groups = new Map();
   for (const declaration of Array.isArray(sourcePayload?.declarations) ? sourcePayload.declarations : []) {
     const moduleId = typeof declaration.moduleId === 'string' ? declaration.moduleId : '';
     const name = typeof declaration.name === 'string' ? declaration.name : '';
     if (moduleId && name && !byName.has(sourceKey(moduleId, name))) byName.set(sourceKey(moduleId, name), declaration);
+    const candidateId = typeof declaration.candidateId === 'string' ? declaration.candidateId : '';
+    if (candidateId && !byCandidateId.has(candidateId)) byCandidateId.set(candidateId, declaration);
     const group = sourceNavigationGroup(declaration);
     if (!group) continue;
     if (!groups.has(group)) groups.set(group, []);
     groups.get(group).push(declaration);
   }
-  return { byName, groups };
+  return { byName, byCandidateId, groups };
 }
 
 function sourcePayloadMatchesOutput(payload = {}, sourcePayload = {}) {
@@ -743,6 +751,147 @@ function renderSelectedImport(edge, labels) {
   selectedImportEl.append(title, rows, listTitle, list);
 }
 
+function safeCount(value) {
+  const count = Number(value);
+  return Number.isInteger(count) && count >= 0 ? count : 0;
+}
+
+function deadConfidenceLabel(confidence) {
+  return confidence === 'high-confidence' ? 'High confidence' : 'Manual review';
+}
+
+function appendDeadCountPill(parent, label, value) {
+  const pill = document.createElement('span');
+  pill.className = 'dead-count-pill';
+  pill.textContent = label + ': ' + safeCount(value);
+  parent.appendChild(pill);
+}
+
+function renderDeadFunctionCounts(candidates) {
+  if (!deadFunctionsCountsEl) return;
+  const total = Array.isArray(candidates) ? candidates.length : 0;
+  const highConfidence = candidates.filter((candidate) => candidate.confidence === 'high-confidence').length;
+  const manualReview = candidates.filter((candidate) => candidate.confidence === 'manual-review').length;
+  deadFunctionsCountsEl.textContent = '';
+  appendDeadCountPill(deadFunctionsCountsEl, 'total', total);
+  appendDeadCountPill(deadFunctionsCountsEl, 'high', highConfidence);
+  appendDeadCountPill(deadFunctionsCountsEl, 'review', manualReview);
+}
+
+function deadFunctionSearchText(candidate = {}) {
+  return [
+    candidate.name,
+    candidate.modulePath,
+    candidate.kind,
+    candidate.confidence,
+    candidate.reason,
+    ...(Array.isArray(candidate.exportKinds) ? candidate.exportKinds : []),
+    ...(Array.isArray(candidate.moduleImportKinds) ? candidate.moduleImportKinds : []),
+  ].join(' ').toLowerCase();
+}
+
+function filteredDeadFunctionCandidates() {
+  const filter = deadFunctionsFilterEl?.value || 'all';
+  const query = String(deadFunctionsSearchEl?.value || '').trim().toLowerCase();
+  return deadFunctionCandidates.filter((candidate) => {
+    if (filter !== 'all' && candidate.confidence !== filter) return false;
+    if (query && !deadFunctionSearchText(candidate).includes(query)) return false;
+    return true;
+  });
+}
+
+function appendDeadFunctionCount(parent, label, value) {
+  const chip = document.createElement('span');
+  chip.className = 'dead-function-count';
+  chip.textContent = label + ' ' + safeCount(value);
+  parent.appendChild(chip);
+}
+
+function renderDeadFunctionEvidence(candidate, parent) {
+  const list = document.createElement('ul');
+  list.className = 'dead-function-evidence';
+  for (const evidence of (Array.isArray(candidate.evidence) ? candidate.evidence : []).slice(0, 5)) {
+    const item = document.createElement('li');
+    const label = document.createElement('b');
+    label.textContent = (evidence.label || 'Evidence') + ': ';
+    const detail = document.createElement('span');
+    detail.textContent = evidence.detail || '';
+    item.append(label, detail);
+    list.appendChild(item);
+  }
+  parent.appendChild(list);
+}
+
+function renderDeadFunctionCandidate(candidate) {
+  const item = document.createElement('article');
+  item.className = 'dead-function-item';
+  item.setAttribute('role', 'listitem');
+
+  const header = document.createElement('div');
+  header.className = 'dead-function-header';
+  const titleGroup = document.createElement('div');
+  const title = document.createElement('h3');
+  title.className = 'dead-function-title';
+  title.textContent = candidate.name || 'anonymous';
+  const location = document.createElement('div');
+  location.className = 'dead-function-location';
+  location.textContent = (candidate.modulePath || 'unknown source') + ':' + (candidate.startLine || '?');
+  titleGroup.append(title, location);
+  const status = document.createElement('span');
+  status.className = 'dead-function-status is-' + (candidate.confidence || 'manual-review');
+  status.textContent = deadConfidenceLabel(candidate.confidence);
+  header.append(titleGroup, status);
+
+  const reason = document.createElement('p');
+  reason.className = 'dead-function-reason';
+  reason.textContent = candidate.reason || 'No direct references or direct importing files were found.';
+
+  const counts = document.createElement('div');
+  counts.className = 'dead-function-counts';
+  appendDeadFunctionCount(counts, 'refs', candidate.counts?.directIdentifierReferences);
+  appendDeadFunctionCount(counts, 'same-file', candidate.counts?.sameFileReferences);
+  appendDeadFunctionCount(counts, 'import refs', candidate.counts?.incomingImportReferences);
+  appendDeadFunctionCount(counts, 'importers', candidate.counts?.directImportingFiles);
+  appendDeadFunctionCount(counts, 'name hits', candidate.counts?.nameOccurrences);
+
+  const actions = document.createElement('div');
+  actions.className = 'dead-function-actions';
+  const sourceButton = document.createElement('button');
+  sourceButton.type = 'button';
+  sourceButton.textContent = 'Source';
+  const sourceDeclaration = sourceDeclarationLookup.byCandidateId.get(candidate.id);
+  if (sourceDeclaration) {
+    sourceButton.addEventListener('click', () => showSourceDialog(sourceDeclaration, sourceButton));
+  } else {
+    sourceButton.disabled = true;
+  }
+  actions.appendChild(sourceButton);
+
+  item.append(header, reason, counts);
+  renderDeadFunctionEvidence(candidate, item);
+  item.appendChild(actions);
+  return item;
+}
+
+function renderDeadFunctions() {
+  if (!deadFunctionsListEl) return;
+  renderDeadFunctionCounts(deadFunctionCandidates);
+  deadFunctionsListEl.textContent = '';
+  const visibleCandidates = filteredDeadFunctionCandidates();
+  if (visibleCandidates.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'muted';
+    empty.textContent = deadFunctionCandidates.length === 0
+      ? 'No zero-reference function candidates found.'
+      : 'No candidates match the current filter.';
+    deadFunctionsListEl.appendChild(empty);
+    return;
+  }
+  for (const candidate of visibleCandidates) {
+    deadFunctionsListEl.appendChild(renderDeadFunctionCandidate(candidate));
+  }
+}
+
 let expandedEdge = null;
 
 function collapseExpandedEdge() {
@@ -1032,6 +1181,7 @@ async function main() {
   if (!response.ok) throw new Error('Failed to load output.json');
   const payload = await response.json();
   sourceDeclarationLookup = await loadSourceDeclarationMap(payload);
+  deadFunctionCandidates = Array.isArray(payload.deadFunctionCandidates) ? payload.deadFunctionCandidates : [];
   rawJsxTreeText = typeof payload.jsxTreeText === 'string' ? payload.jsxTreeText : '';
   rawMermaidSourceText = typeof payload.mermaid === 'string' ? payload.mermaid : '';
   subtitleEl.textContent = payload.entry + '  •  ' + payload.rootDir;
@@ -1046,7 +1196,9 @@ async function main() {
     statCard('jsx files', payload.summary.jsxFileCount ?? payload.summary.jsxClassCount),
     statCard('scripts', payload.summary.jsScriptCount),
     statCard('externals', payload.summary.externalCount),
+    statCard('dead candidates', payload.summary.deadFunctionCandidateCount ?? deadFunctionCandidates.length),
   );
+  renderDeadFunctions();
   const { svg } = await mermaid.render('ironglancer-diagram-' + Date.now(), payload.mermaid);
   prepareSvgForInteraction(svg, payload.importEdges);
 }
@@ -1071,6 +1223,9 @@ copyJsxTreeBtn.addEventListener('click', () => {
 copyMermaidSourceBtn.addEventListener('click', () => {
   copyRawText(rawMermaidSourceText, 'Mermaid source', copyMermaidSourceStatusEl);
 });
+
+if (deadFunctionsFilterEl) deadFunctionsFilterEl.addEventListener('change', renderDeadFunctions);
+if (deadFunctionsSearchEl) deadFunctionsSearchEl.addEventListener('input', renderDeadFunctions);
 
 bindInteraction();
 main().catch((error) => {

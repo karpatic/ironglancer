@@ -387,3 +387,87 @@ test('analyzeProject resolves local require forms and preserves require edge met
     },
   ]);
 });
+
+test('analyzeProject classifies zero-reference dead function candidates with static evidence', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import { usedTool } from './tools.js';",
+      "import * as Shared from './shared.js';",
+      "require('./register.js');",
+      '',
+      'export function App() {',
+      '  return <main>{usedTool()}{Shared.usedShared()}</main>;',
+      '}',
+      '',
+      'function entryHelper() {',
+      "  return 'entry';",
+      '}',
+    ].join('\n'),
+    'src/tools.js': [
+      'export function usedTool() {',
+      "  return 'used';",
+      '}',
+      '',
+      'function abandonedTool() {',
+      "  return 'dead';",
+      '}',
+      '',
+      'function exportedUtility() {',
+      "  return 'public';",
+      '}',
+      '',
+      'export { exportedUtility };',
+    ].join('\n'),
+    'src/shared.js': [
+      'export function usedShared() {',
+      "  return 'namespace';",
+      '}',
+      '',
+      'function namespaceOnly() {',
+      "  return 'maybe';",
+      '}',
+    ].join('\n'),
+    'src/register.js': [
+      'function registerSideEffect() {',
+      '  return true;',
+      '}',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+  const candidatesByName = new Map(result.deadFunctionCandidates.map((candidate) => [candidate.name, candidate]));
+
+  assert.ok(!candidatesByName.has('usedTool'));
+  assert.equal(candidatesByName.get('abandonedTool').confidence, 'high-confidence');
+  assert.equal(candidatesByName.get('abandonedTool').counts.directIdentifierReferences, 0);
+  assert.equal(candidatesByName.get('abandonedTool').counts.directImportingFiles, 0);
+  assert.equal(candidatesByName.get('abandonedTool').signals.declarationOnlyNameOccurrence, true);
+
+  assert.equal(candidatesByName.get('App').confidence, 'manual-review');
+  assert.equal(candidatesByName.get('App').signals.exported, true);
+  assert.equal(candidatesByName.get('App').signals.entrypointModule, true);
+  assert.equal(candidatesByName.get('App').signals.componentConvention, true);
+
+  assert.equal(candidatesByName.get('exportedUtility').confidence, 'manual-review');
+  assert.equal(candidatesByName.get('exportedUtility').counts.directIdentifierReferences, 0);
+  assert.equal(candidatesByName.get('exportedUtility').counts.publicApiReferences, 1);
+  assert.equal(candidatesByName.get('exportedUtility').signals.exported, true);
+
+  assert.equal(candidatesByName.get('usedShared').confidence, 'manual-review');
+  assert.equal(candidatesByName.get('usedShared').signals.namespaceModuleReference, true);
+  assert.equal(candidatesByName.get('namespaceOnly').signals.namespaceModuleReference, true);
+
+  assert.equal(candidatesByName.get('registerSideEffect').confidence, 'manual-review');
+  assert.equal(candidatesByName.get('registerSideEffect').signals.moduleOnlyReference, true);
+  assert.equal(candidatesByName.get('registerSideEffect').signals.commonJsModuleReference, true);
+
+  assert.equal(result.summary.deadFunctionCandidateCount, result.deadFunctionCandidates.length);
+  assert.equal(result.summary.deadFunctionHighConfidenceCount, 1);
+  assert.equal(
+    result.summary.deadFunctionManualReviewCount,
+    result.deadFunctionCandidates.length - result.summary.deadFunctionHighConfidenceCount,
+  );
+  const abandonedSource = result.sourceCode.declarations.find((item) => item.name === 'abandonedTool');
+  assert.ok(abandonedSource.candidateId);
+  assert.equal(abandonedSource.sourceOrigin, 'dead-function-candidate');
+});

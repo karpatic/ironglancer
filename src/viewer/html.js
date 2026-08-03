@@ -165,6 +165,66 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
       .selected-import-row code { overflow-wrap:anywhere; }
       .selected-import-list { display:grid; gap:6px; margin:0; padding:0; list-style:none; }
       .selected-import-list li { border:1px solid var(--border); border-radius:8px; background:#fbfcff; padding:8px 10px; overflow-wrap:anywhere; }
+      .dead-functions-panel { grid-column:1 / -1; }
+      .dead-functions-body { display:grid; gap:12px; }
+      .dead-functions-toolbar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; justify-content:space-between; }
+      .dead-functions-filters { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+      .dead-functions-filter, .dead-functions-search {
+        border:1px solid var(--border);
+        border-radius:8px;
+        background:#fff;
+        color:var(--text);
+        padding:8px 10px;
+        font:inherit;
+      }
+      .dead-functions-search { min-width:min(100%, 260px); }
+      .dead-functions-counts { display:flex; gap:8px; flex-wrap:wrap; }
+      .dead-count-pill {
+        border:1px solid var(--border);
+        border-radius:999px;
+        background:#fbfcff;
+        color:var(--muted);
+        padding:5px 9px;
+        font-size:.82rem;
+        font-weight:700;
+      }
+      .dead-functions-list { display:grid; gap:10px; }
+      .dead-function-item {
+        display:grid;
+        gap:8px;
+        border:1px solid var(--border);
+        border-radius:8px;
+        background:#fbfcff;
+        padding:10px;
+      }
+      .dead-function-header { display:flex; gap:10px; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; }
+      .dead-function-title { margin:0; font-size:.98rem; overflow-wrap:anywhere; }
+      .dead-function-location { color:var(--muted); font-size:.84rem; overflow-wrap:anywhere; }
+      .dead-function-status {
+        border:1px solid var(--border);
+        border-radius:999px;
+        padding:4px 8px;
+        font-size:.76rem;
+        font-weight:700;
+        white-space:nowrap;
+      }
+      .dead-function-status.is-high-confidence { border-color:#abefc6; background:#ecfdf3; color:#16703d; }
+      .dead-function-status.is-manual-review { border-color:#fedf89; background:#fffaeb; color:#93370d; }
+      .dead-function-reason { margin:0; color:var(--muted); }
+      .dead-function-counts { display:flex; gap:6px; flex-wrap:wrap; }
+      .dead-function-count {
+        border:1px solid #d7e3f7;
+        border-radius:999px;
+        background:#f7faff;
+        color:#22407d;
+        padding:3px 7px;
+        font-size:.75rem;
+        font-weight:700;
+      }
+      .dead-function-evidence { display:grid; gap:5px; margin:0; padding:0; list-style:none; }
+      .dead-function-evidence li { color:var(--muted); font-size:.84rem; overflow-wrap:anywhere; }
+      .dead-function-evidence b { color:var(--text); }
+      .dead-function-actions { display:flex; gap:8px; flex-wrap:wrap; }
       .source-dialog {
         width:min(900px, calc(100vw - 32px));
         max-height:min(82vh, 760px);
@@ -235,6 +295,23 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
           <div class="panel">
             <h2>Summary</h2>
             <div id="stats" class="body stats"></div>
+          </div>
+          <div class="panel dead-functions-panel">
+            <h2>Potential dead functions</h2>
+            <div class="body dead-functions-body">
+              <div class="dead-functions-toolbar">
+                <div id="dead-functions-counts" class="dead-functions-counts"></div>
+                <div class="dead-functions-filters">
+                  <select id="dead-functions-filter" class="dead-functions-filter" aria-label="Filter potential dead functions by status">
+                    <option value="all">All</option>
+                    <option value="high-confidence">High confidence</option>
+                    <option value="manual-review">Manual review</option>
+                  </select>
+                  <input id="dead-functions-search" class="dead-functions-search" type="search" placeholder="Filter by name or path" aria-label="Filter potential dead functions by name or path">
+                </div>
+              </div>
+              <div id="dead-functions-list" class="dead-functions-list" role="list"></div>
+            </div>
           </div>
           <details class="panel collapsible-panel" id="jsx-tree-panel">
             <summary><h2>JSX hierarchy</h2></summary>

@@ -461,6 +461,8 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.match(html, /<details class="panel collapsible-panel" id="mermaid-source-panel">/);
   assert.match(html, /<div id="selected-import" class="body selected-import-details"/);
   assert.match(html, />Selected import</);
+  assert.match(html, /id="dead-functions-list"/);
+  assert.match(html, />Potential dead functions</);
   assert.doesNotMatch(html, /id="jsx-line-counts-panel"/);
   assert.doesNotMatch(html, />JSX line counts</);
   assert.doesNotMatch(html, />Open JSON</);
@@ -482,6 +484,8 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.ok(!output.jsxTreeText.includes('src/lib/util.js'));
   assert.ok(!output.jsxTreeText.includes('[external]'));
   assert.deepEqual(output.importEdges, result.importEdges);
+  assert.deepEqual(output.deadFunctionCandidates, result.deadFunctionCandidates);
+  assert.equal(output.summary.deadFunctionCandidateCount, result.deadFunctionCandidates.length);
 
   assert.match(output.meta.buildId, /^[a-f0-9]{64}$/);
   assert.match(output.meta.sourceCodeHash, /^[a-f0-9]{64}$/);
@@ -562,6 +566,98 @@ test('generateStaticSite refuses credential-looking source snippets without reje
       credentialCase.name,
     );
   }
+});
+
+test('generated viewer renders and filters potential dead function candidates', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import { usedTool } from './tools.js';",
+      "import * as Shared from './shared.js';",
+      "require('./register.js');",
+      '',
+      'export function App() {',
+      '  return <main>{usedTool()}{Shared.usedShared()}</main>;',
+      '}',
+      '',
+      'function entryHelper() {',
+      "  return 'entry';",
+      '}',
+    ].join('\n'),
+    'src/tools.js': [
+      'export function usedTool() {',
+      "  return 'used';",
+      '}',
+      '',
+      'function abandonedTool() {',
+      "  return 'dead';",
+      '}',
+      '',
+      'function exportedUtility() {',
+      "  return 'public';",
+      '}',
+      '',
+      'export { exportedUtility };',
+    ].join('\n'),
+    'src/shared.js': [
+      'export function usedShared() {',
+      "  return 'namespace';",
+      '}',
+      '',
+      'function namespaceOnly() {',
+      "  return 'maybe';",
+      '}',
+    ].join('\n'),
+    'src/register.js': [
+      'function registerSideEffect() {',
+      '  return true;',
+      '}',
+    ].join('\n'),
+  });
+  const { appJs, payload, sourcePayload } = await generateTestSite({
+    rootDir,
+    prefix: 'ironglancer-static-dead-functions-',
+  });
+  const abandoned = payload.deadFunctionCandidates.find((candidate) => candidate.name === 'abandonedTool');
+  const exported = payload.deadFunctionCandidates.find((candidate) => candidate.name === 'exportedUtility');
+
+  assert.equal(abandoned.confidence, 'high-confidence');
+  assert.equal(exported.confidence, 'manual-review');
+  assert.ok(sourcePayload.declarations.some((item) => item.candidateId === abandoned.id));
+
+  const { document } = await runGeneratedViewerApp({ appJs, payload, sourcePayload });
+  const counts = document.getElementById('dead-functions-counts');
+  const list = document.getElementById('dead-functions-list');
+
+  assert.match(counts.textContent, /total: 7/);
+  assert.match(counts.textContent, /high: 1/);
+  assert.match(counts.textContent, /review: 6/);
+  assert.match(list.textContent, /abandonedTool/);
+  assert.match(list.textContent, /High confidence/);
+  assert.match(list.textContent, /exportedUtility/);
+  assert.match(list.textContent, /Manual review/);
+
+  const firstSourceButton = list.querySelector('article.dead-function-item').querySelector('button');
+  firstSourceButton.click();
+  assert.equal(document.getElementById('source-dialog').open, true);
+  assert.equal(document.getElementById('source-dialog-title').textContent, 'abandonedTool');
+  assert.equal(document.getElementById('source-dialog-path').textContent, 'src/tools.js:5-7');
+
+  const filter = document.getElementById('dead-functions-filter');
+  filter.value = 'manual-review';
+  filter.dispatchEvent({ type: 'change' });
+  assert.doesNotMatch(list.textContent, /abandonedTool/);
+  assert.match(list.textContent, /exportedUtility/);
+
+  const search = document.getElementById('dead-functions-search');
+  search.value = 'namespaceOnly';
+  search.dispatchEvent({ type: 'input' });
+  assert.match(list.textContent, /namespaceOnly/);
+  assert.doesNotMatch(list.textContent, /exportedUtility/);
+
+  filter.value = 'all';
+  search.value = 'not-present';
+  search.dispatchEvent({ type: 'input' });
+  assert.equal(list.textContent, 'No candidates match the current filter.');
 });
 
 test('generated viewer opens visible member source snippets from scoped source payload', async () => {

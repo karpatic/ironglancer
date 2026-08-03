@@ -453,7 +453,7 @@ function maskRegexLiteral(chars, text, start) {
   return index;
 }
 
-function maskIgnorableSyntax(text) {
+export function maskIgnorableSyntax(text) {
   const chars = text.split('');
   let index = 0;
   while (index < text.length) {
@@ -482,6 +482,22 @@ export function countIdentifierReferences(source, identifier) {
   const masked = maskIgnorableSyntax(normalizeString(source))
     .replace(/<\/\s*[A-Za-z_$][A-Za-z0-9_$]*/g, (closingTag) => ' '.repeat(closingTag.length));
   return Array.from(masked.matchAll(pattern)).length;
+}
+
+export function identifierReferenceLocations(source, identifier) {
+  const name = normalizeJsIdentifier(identifier);
+  if (!name) return [];
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp(`(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])`, 'g');
+  const text = normalizeString(source);
+  const lineStarts = lineStartIndexes(text);
+  const masked = maskIgnorableSyntax(text)
+    .replace(/<\/\s*[A-Za-z_$][A-Za-z0-9_$]*/g, (closingTag) => ' '.repeat(closingTag.length));
+  return Array.from(masked.matchAll(pattern)).map((match) => ({
+    index: match.index,
+    endIndex: match.index + match[0].length,
+    line: lineNumberAt(match.index, lineStarts),
+  }));
 }
 
 function lineStartIndexes(text) {
@@ -588,16 +604,23 @@ function findRegexLiteralEnd(text, start) {
   return -1;
 }
 
-function declarationSpan({ name, kind, startIndex, endIndex, lineStarts }) {
+function declarationSpan({ name, kind, startIndex, endIndex, nameStartIndex, lineStarts }) {
   const startLine = lineNumberAt(startIndex, lineStarts);
   const endLine = lineNumberAt(endIndex, lineStarts);
-  return {
+  const span = {
     name,
     kind,
     startLine,
     endLine,
     lineCount: endLine - startLine + 1,
   };
+  Object.defineProperties(span, {
+    startIndex: { value: startIndex },
+    endIndex: { value: endIndex },
+    nameStartIndex: { value: nameStartIndex },
+    nameEndIndex: { value: Number.isInteger(nameStartIndex) ? nameStartIndex + name.length : null },
+  });
+  return span;
 }
 
 function compareDeclarationSpan(a, b) {
@@ -629,6 +652,7 @@ export function extractDeclarationSpans(source) {
       kind: 'function',
       startIndex: match.index,
       endIndex: bodyEnd,
+      nameStartIndex: match.index + match[0].lastIndexOf(match[1]),
       lineStarts,
     }));
   }
@@ -659,6 +683,7 @@ export function extractDeclarationSpans(source) {
       kind: 'arrow',
       startIndex: match.index,
       endIndex: bodyEnd,
+      nameStartIndex: match.index + match[0].lastIndexOf(match[1]),
       lineStarts,
     }));
   }
