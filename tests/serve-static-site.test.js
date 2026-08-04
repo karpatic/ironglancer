@@ -64,6 +64,8 @@ test('static analysis server exposes viewer files and a versioned cached API', a
     assert.equal(discovery.response.status, 200);
     assert.equal(discovery.body.ok, true);
     assert.equal(discovery.body.data.apiVersion, 'v1');
+    assert.equal(discovery.body.data.schema.href, '/api/v1/schema');
+    assert.ok(discovery.body.data.routes.some((route) => route.path === '/api/v1/schema'));
     assert.ok(discovery.body.data.routes.some((route) => route.path === '/api/v1/modules'));
     assert.ok(discovery.body.data.routes.some((route) => route.path === '/api/v1/symbols/:id/references'));
 
@@ -91,15 +93,71 @@ test('static analysis server exposes viewer files and a versioned cached API', a
     const allModules = await fetchJson(new URL('/api/v1/modules', serviceUrl));
     const appModule = allModules.body.data.items.find((item) => item.path === 'src/app.jsx');
     assert.ok(appModule, 'expected src/app.jsx in module list');
+    assert.match(appModule.stableId, /^mod_[a-f0-9]{16}$/);
     assert.equal(appModule.sourceAvailable, true);
+
+    const projectedModules = await fetchJson(new URL('/api/v1/modules?fields=path,lineCount&limit=1', serviceUrl));
+    assert.deepEqual(Object.keys(projectedModules.body.data.items[0]).sort(), ['id', 'lineCount', 'path', 'stableId']);
+    const invalidProjection = await fetchJson(new URL('/api/v1/modules?fields=path,nope', serviceUrl));
+    assert.equal(invalidProjection.response.status, 400);
+    assert.equal(invalidProjection.body.error.code, 'invalid_query');
+    for (const malformedSelector of [
+      '/api/v1/modules?fields=',
+      '/api/v1/modules?fields=,,,',
+      '/api/v1/modules?fields=path&fields=',
+      `/api/v1/modules/${appModule.stableId}?include=`,
+      `/api/v1/modules/${appModule.stableId}?include=,,,`,
+      `/api/v1/modules/${appModule.stableId}?include=dependencies&include=`,
+      '/api/v1/search?q=App&types=',
+      '/api/v1/search?q=App&types=,,,',
+      '/api/v1/search?q=App&types=function&types=',
+    ]) {
+      const malformed = await fetchJson(new URL(malformedSelector, serviceUrl));
+      assert.equal(malformed.response.status, 400, malformedSelector);
+      assert.equal(malformed.body.error.code, 'invalid_query', malformedSelector);
+    }
+
+    const appByStableId = await fetchJson(new URL(`/api/v1/modules/${appModule.stableId}`, serviceUrl));
+    assert.equal(appByStableId.response.status, 200);
+    assert.equal(appByStableId.body.data.module.path, 'src/app.jsx');
+    assert.ok(appByStableId.body.data.imports.every((ref) => typeof ref.kind === 'string'));
+    assert.ok(appByStableId.body.data.imports.every((ref) => ref.loadKind === ref.kind));
+
+    const schema = await fetchJson(new URL('/api/v1/schema', serviceUrl));
+    assert.equal(schema.response.status, 200);
+    assert.equal(schema.body.data.$schema, 'https://json-schema.org/draft/2020-12/schema');
+    assert.deepEqual(schema.body.data.$defs.moduleSummary.required, ['id', 'stableId']);
+    assert.deepEqual(schema.body.data.$defs.importSummary.required, ['stableId']);
+    assert.match('fn_0123456789abcdef_10', new RegExp(schema.body.data.$defs.functionSummary.properties.stableId.pattern));
+    const rawSchema = await requestUrl('/api/v1/schema.json');
+    assert.equal(rawSchema.status, 200);
+    assert.match(rawSchema.headers['content-type'], /^application\/schema\+json/);
+    assert.equal((await rawSchema.json()).$id, '/api/v1/schema.json');
 
     const exactFunctions = await fetchJson(new URL('/api/v1/functions?name=App', serviceUrl));
     assert.equal(exactFunctions.response.status, 200);
     assert.deepEqual(exactFunctions.body.data.items.map((item) => item.name), ['App']);
+    assert.match(exactFunctions.body.data.items[0].stableId, /^fn_[a-f0-9]{16}$/);
+    assert.equal(
+      (await fetchJson(new URL(`/api/v1/functions/${exactFunctions.body.data.items[0].stableId}`, serviceUrl))).body.data.function.name,
+      'App',
+    );
 
     const dependencyFilteredFunctions = await fetchJson(new URL('/api/v1/functions?dependencyCount=2', serviceUrl));
     assert.equal(dependencyFilteredFunctions.response.status, 200);
     assert.deepEqual(dependencyFilteredFunctions.body.data.items.map((item) => item.name), ['RootApp']);
+    const linkedFunction = await fetchJson(new URL(
+      `/api/v1/functions/${dependencyFilteredFunctions.body.data.items[0].stableId}?include=links`,
+      serviceUrl,
+    ));
+    const firstLinkedEdge = linkedFunction.body.data.dependencies[0];
+    assert.match(firstLinkedEdge.stableId, /^fedge_[a-f0-9]{16}$/);
+    assert.match(firstLinkedEdge.sourceStableId, /^fn_[a-f0-9]{16}$/);
+    assert.match(firstLinkedEdge.targetStableId, /^fn_[a-f0-9]{16}$/);
+    assert.ok(firstLinkedEdge.sourceLink.href.startsWith('/api/v1/functions/fn_'));
+    assert.ok(firstLinkedEdge.targetLink.href.startsWith('/api/v1/functions/fn_'));
+    assert.equal('source' in firstLinkedEdge, false);
+    assert.equal('target' in firstLinkedEdge, false);
 
     const userFilteredFunctions = await fetchJson(new URL('/api/v1/functions?userCount=1', serviceUrl));
     assert.equal(userFilteredFunctions.response.status, 200);
@@ -108,6 +166,11 @@ test('static analysis server exposes viewer files and a versioned cached API', a
     const exactSymbols = await fetchJson(new URL('/api/v1/symbols?name=App', serviceUrl));
     assert.equal(exactSymbols.response.status, 200);
     assert.deepEqual(exactSymbols.body.data.items.map((item) => item.name), ['App']);
+    assert.match(exactSymbols.body.data.items[0].stableId, /^sym_[a-f0-9]{16}$/);
+    assert.equal(
+      (await fetchJson(new URL(`/api/v1/symbols/${exactSymbols.body.data.items[0].stableId}`, serviceUrl))).body.data.symbol.name,
+      'App',
+    );
 
     const referenceFilteredSymbols = await fetchJson(new URL('/api/v1/symbols?referenceCount=1', serviceUrl));
     assert.equal(referenceFilteredSymbols.response.status, 200);
@@ -129,6 +192,12 @@ test('static analysis server exposes viewer files and a versioned cached API', a
       'src/panes/Inspector.jsx',
     ]);
     assert.deepEqual(appDetail.body.data.dependencies.external, ['cdn.example.com']);
+
+    const dependencyOnlyModule = await fetchJson(new URL(
+      `/api/v1/modules/${appModule.stableId}?include=dependencies`,
+      serviceUrl,
+    ));
+    assert.deepEqual(Object.keys(dependencyOnlyModule.body.data).sort(), ['dependencies', 'module']);
 
     const source = await fetchJson(new URL(`/api/v1/modules/${appModule.id}/source?startLine=7&endLine=9`, serviceUrl));
     assert.equal(source.response.status, 200);
@@ -182,6 +251,34 @@ test('static analysis server exposes viewer files and a versioned cached API', a
     assert.equal(unknown.body.error.code, 'not_found');
   } finally {
     activeHandler = null;
+  }
+});
+
+test('source excerpts preserve the API v1 80-line default and maximum', async () => {
+  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-source-limit-src-'));
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-source-limit-out-'));
+  await fs.mkdir(path.join(rootDir, 'src'), { recursive: true });
+  await fs.writeFile(
+    path.join(rootDir, 'src/app.js'),
+    ['export function App() { return 1; }', ...Array.from({ length: 119 }, (_, index) => `// line ${index + 2}`)].join('\n'),
+    'utf8',
+  );
+  await generateStaticSite({ rootDir, entry: 'src/app.js', outDir });
+  activeHandler = await createStaticAnalysisRequestHandler({ outDir });
+
+  try {
+    const modules = await fetchJson('/api/v1/modules');
+    const appModule = modules.body.data.items.find((item) => item.path === 'src/app.js');
+    const source = await fetchJson(`/api/v1/modules/${appModule.stableId}/source`);
+    assert.equal(source.response.status, 200);
+    assert.equal(source.body.data.startLine, 1);
+    assert.equal(source.body.data.endLine, 80);
+    assert.equal(source.body.data.lineCount, 80);
+    assert.equal(source.body.data.maxLines, 80);
+  } finally {
+    activeHandler = null;
+    await fs.rm(rootDir, { recursive: true, force: true });
+    await fs.rm(outDir, { recursive: true, force: true });
   }
 });
 
@@ -265,6 +362,284 @@ test('module functions API supports compact summary pagination and query bounds'
     assert.match(unknownQuery.body.error.message, /mystery/);
   } finally {
     activeHandler = null;
+  }
+});
+
+test('function and module lists expose triage filters and deterministic sorting', async () => {
+  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-triage-src-'));
+  await fs.mkdir(path.join(rootDir, 'src'), { recursive: true });
+  await fs.writeFile(path.join(rootDir, 'src/app.js'), [
+    "import { a } from './dep.js';",
+    "import { b } from './dep.js';",
+    'export function PublicEntry() {',
+    '  const value = helper();',
+    '  return value;',
+    '}',
+    'function helper() { return 1; }',
+    'function unusedPrivate() { return 2; }',
+    'function recur() { return recur(); }',
+    'const jsxText = <div>hiddenJsxText suffixToken',
+    '  multiToken',
+    '  {helper}',
+    '  {true && <span>nestedToken suffixNested</span>}',
+    '</div>;',
+    "const missingLazy = import('./missing-lazy.js');",
+  ].join('\n'), 'utf8');
+  await fs.writeFile(path.join(rootDir, 'src/dep.js'), 'export const a = 1; export const b = 2;\n', 'utf8');
+  await fs.writeFile(path.join(rootDir, 'src/orphan.js'), 'export function Orphan() { return 3; }\n', 'utf8');
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-triage-api-'));
+  await generateStaticSite({ rootDir, entry: 'src/app.js', outDir });
+  activeHandler = await createStaticAnalysisRequestHandler({ outDir });
+
+  try {
+    const serviceUrl = new URL('http://127.0.0.1/');
+    const privateZeroUsers = await fetchJson(new URL(
+      '/api/v1/functions?exported=false&standalone=true&userCount=0',
+      serviceUrl,
+    ));
+    assert.deepEqual(privateZeroUsers.body.data.items.map((item) => item.name), ['unusedPrivate', 'recur']);
+    assert.equal(privateZeroUsers.body.data.items[0].reachable, true);
+    assert.deepEqual(privateZeroUsers.body.data.items[0].exportedNames, []);
+
+    const unreachableFunctions = await fetchJson(new URL('/api/v1/functions?reachable=false', serviceUrl));
+    assert.deepEqual(unreachableFunctions.body.data.items.map((item) => item.name), ['Orphan']);
+
+    const sortedFunctions = await fetchJson(new URL(
+      '/api/v1/functions?sort=lineCount&order=desc',
+      serviceUrl,
+    ));
+    assert.equal(sortedFunctions.body.data.items[0].name, 'PublicEntry');
+
+    const unreachableModules = await fetchJson(new URL('/api/v1/modules?reachable=false', serviceUrl));
+    assert.deepEqual(unreachableModules.body.data.items.map((item) => item.path), ['src/orphan.js']);
+    const sortedModules = await fetchJson(new URL('/api/v1/modules?sort=lineCount&order=desc', serviceUrl));
+    assert.equal(sortedModules.body.data.items[0].path, 'src/app.js');
+
+    const invalidSort = await fetchJson(new URL('/api/v1/functions?sort=nope', serviceUrl));
+    assert.equal(invalidSort.response.status, 400);
+    assert.equal(invalidSort.body.error.code, 'invalid_query');
+
+    const unresolvedDynamicImports = await fetchJson(new URL(
+      '/api/v1/imports?resolution=unresolved&dynamic=true',
+      serviceUrl,
+    ));
+    assert.deepEqual(unresolvedDynamicImports.body.data.items.map((item) => ({
+      specifier: item.specifier,
+      loadKind: item.loadKind,
+      resolution: item.resolution,
+      dynamic: item.dynamic,
+    })), [{
+      specifier: './missing-lazy.js',
+      loadKind: 'dynamic',
+      resolution: 'unresolved',
+      dynamic: true,
+    }]);
+    assert.match(unresolvedDynamicImports.body.data.items[0].stableId, /^imp_[a-f0-9]{16}$/);
+    const importBySpecifier = await fetchJson(new URL(
+      '/api/v1/imports?specifier=.%2Fmissing-lazy.js',
+      serviceUrl,
+    ));
+    assert.equal(importBySpecifier.body.data.pagination.total, 1);
+    const repeatedImports = await fetchJson(new URL(
+      '/api/v1/imports?specifier=.%2Fdep.js',
+      serviceUrl,
+    ));
+    assert.equal(repeatedImports.body.data.pagination.total, 2);
+    assert.ok(repeatedImports.body.data.items.every((item) => /^imp_[a-f0-9]{16}$/.test(item.stableId)));
+    assert.equal(new Set(repeatedImports.body.data.items.map((item) => item.stableId)).size, 2);
+    const projectedImports = await fetchJson(new URL('/api/v1/imports?fields=sourcePath,specifier&limit=1', serviceUrl));
+    assert.equal(projectedImports.response.status, 200);
+    assert.deepEqual(Object.keys(projectedImports.body.data.items[0]).sort(), ['sourcePath', 'specifier', 'stableId']);
+    assert.deepEqual(
+      repeatedImports.body.data.items.map((item) => item.bindings[0]?.local).sort(),
+      ['a', 'b'],
+    );
+
+    const exactSearch = await fetchJson(new URL(
+      '/api/v1/search?q=helper&match=exact&types=function,occurrence',
+      serviceUrl,
+    ));
+    assert.equal(exactSearch.body.data.items.filter((item) => item.type === 'function').length, 1);
+    const helperOccurrences = exactSearch.body.data.items.filter((item) => item.type === 'occurrence');
+    assert.equal(helperOccurrences.length, 3);
+    assert.deepEqual(
+      helperOccurrences.map((item) => item.enclosingFunction?.name).filter(Boolean).sort(),
+      ['PublicEntry', 'helper'],
+    );
+    assert.ok(helperOccurrences.some((item) => item.enclosingFunction === null && item.role === 'reference'));
+    assert.ok(exactSearch.body.data.items.every((item) => !('text' in item)));
+    assert.ok(exactSearch.body.data.items
+      .filter((item) => item.type === 'occurrence')
+      .every((item) => item.role !== 'jsx-text'));
+
+    const recursiveSearch = await fetchJson(new URL(
+      '/api/v1/search?q=recur&match=exact&types=occurrence',
+      serviceUrl,
+    ));
+    assert.deepEqual(recursiveSearch.body.data.items.map((item) => item.role), ['declaration', 'reference']);
+    const jsxTextSearch = await fetchJson(new URL(
+      '/api/v1/search?q=hiddenJsxText&match=exact&types=occurrence',
+      serviceUrl,
+    ));
+    assert.deepEqual(jsxTextSearch.body.data.items.map((item) => item.role), ['jsx-text']);
+    for (const jsxQuery of ['suffixToken', 'multiToken']) {
+      const jsxSearch = await fetchJson(new URL(
+        `/api/v1/search?q=${jsxQuery}&match=exact&types=occurrence`,
+        serviceUrl,
+      ));
+      assert.deepEqual(jsxSearch.body.data.items.map((item) => item.role), ['jsx-text']);
+    }
+
+    const invalidOccurrenceSearch = await fetchJson(new URL(
+      '/api/v1/search?q=help&match=substring&types=occurrence',
+      serviceUrl,
+    ));
+    assert.equal(invalidOccurrenceSearch.response.status, 400);
+    assert.equal(invalidOccurrenceSearch.body.error.code, 'invalid_query');
+  } finally {
+    activeHandler = null;
+  }
+});
+
+test('module and function graph APIs return bounded shortest paths and blast radius', async () => {
+  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-graph-src-'));
+  await fs.mkdir(path.join(rootDir, 'src'), { recursive: true });
+  await fs.writeFile(path.join(rootDir, 'src/app.js'), [
+    "import { Mid } from './mid.js';",
+    'export function Root() { return Mid(); }',
+  ].join('\n'), 'utf8');
+  await fs.writeFile(path.join(rootDir, 'src/mid.js'), [
+    "import { Leaf } from './leaf.js';",
+    'export function Mid() { return Leaf(); }',
+  ].join('\n'), 'utf8');
+  await fs.writeFile(path.join(rootDir, 'src/leaf.js'), 'export function Leaf() { return 1; }\n', 'utf8');
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-graph-api-'));
+  await generateStaticSite({ rootDir, entry: 'src/app.js', outDir });
+  activeHandler = await createStaticAnalysisRequestHandler({ outDir });
+
+  try {
+    const serviceUrl = new URL('http://127.0.0.1/');
+    const modules = (await fetchJson(new URL('/api/v1/modules', serviceUrl))).body.data.items;
+    const moduleByPath = new Map(modules.map((module) => [module.path, module]));
+    const modulePath = await fetchJson(new URL(
+      `/api/v1/modules/${moduleByPath.get('src/app.js').stableId}/shortest-path?targetId=${moduleByPath.get('src/leaf.js').stableId}`,
+      serviceUrl,
+    ));
+    assert.equal(modulePath.body.data.found, true);
+    assert.equal(modulePath.body.data.distance, 2);
+    assert.equal(modulePath.body.data.direction, 'dependencies');
+    assert.deepEqual(modulePath.body.data.nodes.map((node) => node.path), [
+      'src/app.js', 'src/mid.js', 'src/leaf.js',
+    ]);
+
+    const moduleBlast = await fetchJson(new URL(
+      `/api/v1/modules/${moduleByPath.get('src/leaf.js').stableId}/blast-radius`,
+      serviceUrl,
+    ));
+    assert.equal(moduleBlast.body.data.direction, 'dependents');
+    assert.deepEqual(moduleBlast.body.data.direct.map((node) => node.path), ['src/mid.js']);
+    assert.deepEqual(moduleBlast.body.data.transitive.map((node) => node.path), ['src/app.js']);
+    assert.equal(moduleBlast.body.data.truncated, false);
+
+    const functions = (await fetchJson(new URL('/api/v1/functions', serviceUrl))).body.data.items;
+    const functionByName = new Map(functions.map((fn) => [fn.name, fn]));
+    const functionPath = await fetchJson(new URL(
+      `/api/v1/functions/${functionByName.get('Root').stableId}/shortest-path?targetId=${functionByName.get('Leaf').stableId}`,
+      serviceUrl,
+    ));
+    assert.equal(functionPath.body.data.found, true);
+    assert.equal(functionPath.body.data.distance, 2);
+    assert.equal(functionPath.body.data.direction, 'dependencies');
+    assert.deepEqual(functionPath.body.data.nodes.map((node) => node.name), ['Root', 'Mid', 'Leaf']);
+    assert.equal(functionPath.body.data.edges.length, 2);
+    assert.ok(functionPath.body.data.edges.every((edge) => edge.targetLink.href.startsWith('/api/v1/functions/fn_')));
+
+    const functionBlast = await fetchJson(new URL(
+      `/api/v1/functions/${functionByName.get('Leaf').stableId}/blast-radius?maxDepth=1`,
+      serviceUrl,
+    ));
+    assert.deepEqual(functionBlast.body.data.direct.map((node) => node.name), ['Mid']);
+    assert.deepEqual(functionBlast.body.data.transitive, []);
+    assert.equal(functionBlast.body.data.truncated, true);
+    assert.ok(functionBlast.body.data.truncationReasons.includes('maxDepth'));
+
+    const invalidDepth = await fetchJson(new URL(
+      `/api/v1/functions/${functionByName.get('Leaf').stableId}/blast-radius?maxDepth=51`,
+      serviceUrl,
+    ));
+    assert.equal(invalidDepth.response.status, 400);
+    assert.equal(invalidDepth.body.error.code, 'invalid_query');
+  } finally {
+    activeHandler = null;
+  }
+});
+
+test('stable IDs survive unrelated line insertions while legacy declaration IDs remain compatible', async () => {
+  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-stable-id-src-'));
+  const sourcePath = path.join(rootDir, 'src/app.jsx');
+  await fs.mkdir(path.dirname(sourcePath), { recursive: true });
+  const writeVariant = async (prefix) => fs.writeFile(sourcePath, [
+    prefix,
+    'export function App() {',
+    '  function App() { return 1; }',
+    '  return <main>{App()}</main>;',
+    '}',
+  ].filter(Boolean).join('\n'), 'utf8');
+  const readIds = async (outDir) => {
+    await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
+    activeHandler = await createStaticAnalysisRequestHandler({ outDir });
+    const module = (await fetchJson(new URL('http://127.0.0.1/api/v1/modules'))).body.data.items[0];
+    const functions = (await fetchJson(new URL('http://127.0.0.1/api/v1/functions?name=App'))).body.data.items;
+    const symbol = (await fetchJson(new URL('http://127.0.0.1/api/v1/symbols?name=App'))).body.data.items[0];
+    return { module, functions, symbol };
+  };
+
+  try {
+    await writeVariant('');
+    const before = await readIds(await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-stable-id-before-')));
+    await writeVariant('// unrelated header\n\n');
+    const after = await readIds(await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-stable-id-after-')));
+
+    assert.equal(after.module.stableId, before.module.stableId);
+    assert.equal(before.functions.length, 2);
+    assert.deepEqual(
+      after.functions.map((fn) => fn.stableId),
+      before.functions.map((fn) => fn.stableId),
+    );
+    assert.ok(before.functions.every((fn) => /^fn_[a-f0-9]{16}$/.test(fn.stableId)));
+    assert.equal(new Set(before.functions.map((fn) => fn.stableId)).size, 2);
+    assert.equal(after.symbol.stableId, before.symbol.stableId);
+    assert.notDeepEqual(
+      after.functions.map((fn) => fn.id),
+      before.functions.map((fn) => fn.id),
+    );
+    assert.notEqual(after.symbol.id, before.symbol.id);
+  } finally {
+    activeHandler = null;
+  }
+});
+
+test('import stable IDs ignore named-binding order', async () => {
+  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-import-id-src-'));
+  const sourcePath = path.join(rootDir, 'src/app.js');
+  await fs.mkdir(path.dirname(sourcePath), { recursive: true });
+  await fs.writeFile(path.join(rootDir, 'src/dep.js'), 'export const a = 1; export const b = 2;\n', 'utf8');
+  const readStableId = async (bindings) => {
+    await fs.writeFile(sourcePath, `import { ${bindings} } from './dep.js';\nexport function App() { return a + b; }\n`, 'utf8');
+    const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-import-id-out-'));
+    await generateStaticSite({ rootDir, entry: 'src/app.js', outDir });
+    activeHandler = await createStaticAnalysisRequestHandler({ outDir });
+    const imports = await fetchJson('/api/v1/imports?sourcePath=src%2Fapp.js');
+    return imports.body.data.items[0].stableId;
+  };
+
+  try {
+    const before = await readStableId('a, b');
+    const after = await readStableId('b, a');
+    assert.equal(after, before);
+  } finally {
+    activeHandler = null;
+    await fs.rm(rootDir, { recursive: true, force: true });
   }
 });
 

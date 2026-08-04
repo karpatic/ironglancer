@@ -6,6 +6,282 @@ import fs from 'node:fs/promises';
 
 import { analyzeProject } from '../src/lib/analyze-project.js';
 
+function legacyFunctionId(modulePath, name, kind, startLine, endLine) {
+  return Buffer.from([
+    'function',
+    modulePath,
+    name,
+    kind,
+    startLine,
+    endLine,
+  ].join('\u0000'), 'utf8').toString('base64url');
+}
+
+test('function dependency nodes expose conservative reachability and export metadata', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.js': [
+      "import './missing.js';",
+      "import 'external-package';",
+      "const missingLazy = import('./missing-lazy.js');",
+      'export function PublicEntry() {',
+      '  return helper();',
+      '}',
+      'function helper() {',
+      "  return 'helper';",
+      '}',
+      'const exportedArrow = () => helper();',
+      'export { exportedArrow };',
+      'const callback = function internalName() { return helper(); };',
+      'export function same() {',
+      '  function same() { return 1; }',
+      '  return same();',
+      '}',
+      'if (true) { function same() { return 2; } }',
+    ].join('\n'),
+    'src/orphan.js': 'export function Orphan() { return 1; }\n',
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.js' });
+  const byName = new Map(result.functionDependencyMap.functions.map((node) => [node.name, node]));
+
+  assert.deepEqual(
+    {
+      reachable: byName.get('PublicEntry').reachable,
+      exported: byName.get('PublicEntry').exported,
+      exportedNames: byName.get('PublicEntry').exportedNames,
+      declarationType: byName.get('PublicEntry').declarationType,
+      standalone: byName.get('PublicEntry').standalone,
+    },
+    {
+      reachable: true,
+      exported: true,
+      exportedNames: ['PublicEntry'],
+      declarationType: 'function-declaration',
+      standalone: true,
+    },
+  );
+  assert.equal(byName.get('helper').exported, false);
+  assert.equal(byName.get('exportedArrow').exported, true);
+  assert.equal(byName.get('internalName').standalone, false);
+  const sameNodes = result.functionDependencyMap.functions
+    .filter((node) => node.name === 'same')
+    .sort((a, b) => a.startLine - b.startLine || b.lineCount - a.lineCount);
+  assert.deepEqual(sameNodes.map(({ exported, standalone }) => ({ exported, standalone })), [
+    { exported: true, standalone: true },
+    { exported: false, standalone: false },
+    { exported: false, standalone: false },
+  ]);
+  assert.equal(byName.get('Orphan').reachable, false);
+
+  const refs = new Map(result.graph.modules.get('src/app.js').importRefs.map((ref) => [ref.specifier, ref]));
+  assert.deepEqual(
+    {
+      resolution: refs.get('./missing.js').resolution,
+      reason: refs.get('./missing.js').unresolvedReason,
+    },
+    { resolution: 'unresolved', reason: 'not_found' },
+  );
+  assert.equal(refs.get('./missing-lazy.js').resolution, 'unresolved');
+  assert.equal(refs.get('external-package').resolution, 'external');
+});
+
+test('analyzeProject gives same-line duplicate functions unique IDs while preserving noncolliding legacy IDs', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.js': [
+      'export function outer() { function duplicate() { return left(); } function duplicate() { return right(); } return duplicate; }',
+      'function left() {}',
+      'function right() {}',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.js' });
+  const functions = result.functionDependencyMap.functions;
+  const outer = functions.find((node) => node.name === 'outer');
+  const duplicateNodes = functions.filter((node) => node.name === 'duplicate');
+  const duplicateIds = new Set(duplicateNodes.map((node) => node.id));
+  const duplicateEdges = result.functionDependencyMap.edges
+    .filter((edge) => edge.sourceFunction === 'duplicate')
+    .sort((a, b) => a.targetFunction.localeCompare(b.targetFunction));
+
+  assert.ok(outer, 'expected the noncolliding outer declaration');
+  assert.equal(outer.id, legacyFunctionId('src/app.js', 'outer', 'function', 1, 1));
+  assert.equal(duplicateNodes.length, 2);
+  assert.equal(duplicateIds.size, 2);
+  assert.deepEqual(duplicateEdges.map((edge) => edge.targetFunction), ['left', 'right']);
+  assert.ok(duplicateEdges.every((edge) => duplicateIds.has(edge.sourceId)));
+  assert.equal(new Set(duplicateEdges.map((edge) => edge.sourceId)).size, 2);
+});
+
+test('analyzeProject keeps nested scope identity stable when comments change', async () => {
+  const plainRoot = await writeTempProject({
+    'src/app.js': [
+      'export function outer(ready) {',
+      '  if (ready) {',
+      '    function nested() { return ready; }',
+      '    return nested();',
+      '  }',
+      '}',
+    ].join('\n'),
+  });
+  const commentedRoot = await writeTempProject({
+    'src/app.js': [
+      'export function outer(ready) {',
+      `  if (/* ${'x'.repeat(220)} */ ready) {`,
+      '    function nested() { return ready; }',
+      '    return nested();',
+      '  }',
+      '}',
+    ].join('\n'),
+  });
+
+  const plain = await analyzeProject({ rootDir: plainRoot, entry: 'src/app.js' });
+  const commented = await analyzeProject({ rootDir: commentedRoot, entry: 'src/app.js' });
+  const plainNested = plain.functionDependencyMap.functions.find((node) => node.name === 'nested');
+  const commentedNested = commented.functionDependencyMap.functions.find((node) => node.name === 'nested');
+
+  assert.ok(plainNested);
+  assert.ok(commentedNested);
+  assert.equal(commentedNested.scopePath, plainNested.scopePath);
+  assert.ok(!commentedNested.scopePath.includes('*/'));
+});
+
+test('analyzeProject nests functions declared in bare lexical blocks under an anonymous scope', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.js': [
+      '{',
+      '  function insideBlock() { return blockHelper(); }',
+      '}',
+      'function blockHelper() { return 1; }',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.js' });
+  const insideBlock = result.functionDependencyMap.functions.find((node) => node.name === 'insideBlock');
+
+  assert.ok(insideBlock);
+  assert.equal(insideBlock.standalone, false);
+  assert.match(insideBlock.scopePath, /anonymous-block/);
+});
+
+test('analyzeProject marks top-level CommonJS function-expression exports as exported without requiring standalone', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.js': [
+      'exports.pub = function internal() {',
+      '  return privateHelper();',
+      '};',
+      'function privateHelper() {',
+      '  return 1;',
+      '}',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.js' });
+  const internal = result.functionDependencyMap.functions.find((node) => node.name === 'internal');
+
+  assert.ok(internal);
+  assert.equal(internal.exported, true);
+  assert.deepEqual(internal.exportedNames, ['pub']);
+  assert.equal(internal.standalone, false);
+});
+
+test('analyzeProject resolves same-module references to the lexically visible declaration', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.js': [
+      'function helper() { return "outer"; }',
+      'export function caller() {',
+      '  function helper() { return "inner"; }',
+      '  return helper();',
+      '}',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.js' });
+  const helperEdges = result.functionDependencyMap.edges.filter((edge) => (
+    edge.sourceFunction === 'caller'
+    && edge.targetFunction === 'helper'
+    && edge.scope === 'same-module'
+  ));
+
+  assert.equal(helperEdges.length, 1);
+  assert.equal(helperEdges[0].targetStartLine, 3);
+});
+
+test('analyzeProject resolves imported aliases to the exact exported declaration', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import { exportedThing as Alias } from './feature.js';",
+      '',
+      'export function App() {',
+      '  return <main>{Alias()}</main>;',
+      '}',
+    ].join('\n'),
+    'src/feature.js': [
+      'function wrapper() {',
+      '  function exportedThing() { return "nested"; }',
+      '  return exportedThing;',
+      '}',
+      'export function exportedThing() {',
+      '  return "public";',
+      '}',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+  const importedEdge = result.functionDependencyMap.edges.find((edge) => (
+    edge.sourceFunction === 'App'
+    && edge.targetFunction === 'exportedThing'
+    && edge.scope === 'imported'
+  ));
+
+  assert.ok(importedEdge);
+  assert.equal(importedEdge.targetStartLine, 5);
+  assert.equal(importedEdge.import.localName, 'Alias');
+});
+
+test('analyzeProject resolves import-map package prefix aliases with longest-prefix expansion', async () => {
+  const rootDir = await writeTempProject({
+    'index.html': [
+      '<script type="importmap">',
+      JSON.stringify({
+        imports: {
+          'lib/': './src/lib/',
+          'lib/special/': './src/special/',
+        },
+      }),
+      '</script>',
+    ].join('\n'),
+    'src/app.js': [
+      "import { helper } from 'lib/helper.js';",
+      "import { pick } from 'lib/special/pick.js';",
+      'export function App() {',
+      '  return helper() + pick();',
+      '}',
+    ].join('\n'),
+    'src/lib/helper.js': [
+      'export function helper() {',
+      "  return 'helper';",
+      '}',
+    ].join('\n'),
+    'src/lib/special/pick.js': [
+      'export function pick() {',
+      "  return 'wrong prefix';",
+      '}',
+    ].join('\n'),
+    'src/special/pick.js': [
+      'export function pick() {',
+      "  return 'longest prefix';",
+      '}',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.js' });
+  const refs = new Map(result.graph.modules.get('src/app.js').importRefs.map((ref) => [ref.specifier, ref]));
+
+  assert.equal(refs.get('lib/helper.js').localRel, 'src/lib/helper.js');
+  assert.equal(refs.get('lib/special/pick.js').localRel, 'src/special/pick.js');
+  assert.equal(refs.get('lib/special/pick.js').resolution, 'local');
+});
+
 const fixtureRoot = path.resolve('tests/fixtures/sample-app');
 
 async function writeTempProject(files) {

@@ -141,6 +141,32 @@ function expandImportAliasTarget(value) {
     .replace('__REVIEW_ORIGIN__/', 'public/');
 }
 
+function joinImportAliasPrefixTarget(target, rest) {
+  const normalizedTarget = toPosixPath(normalizeString(target).trim());
+  const normalizedRest = toPosixPath(normalizeString(rest).trim());
+  if (!normalizedRest) return normalizedTarget;
+  return normalizedTarget.endsWith('/')
+    ? `${normalizedTarget}${normalizedRest}`
+    : path.posix.join(normalizedTarget, normalizedRest);
+}
+
+function importAliasTargetForSpecifier(specifier, aliases) {
+  const raw = normalizeString(specifier).trim();
+  let best = null;
+  for (const [key, value] of aliases instanceof Map ? aliases : []) {
+    const alias = normalizeString(key).trim();
+    if (!alias) continue;
+    if (raw === alias) {
+      const candidate = { key: alias, target: value, rest: '' };
+      if (!best || candidate.key.length > best.key.length) best = candidate;
+    } else if (alias.endsWith('/') && raw.startsWith(alias)) {
+      const candidate = { key: alias, target: value, rest: raw.slice(alias.length) };
+      if (!best || candidate.key.length > best.key.length) best = candidate;
+    }
+  }
+  return best ? joinImportAliasPrefixTarget(best.target, best.rest) : '';
+}
+
 async function resolveFromRoot(rootDir, relativePath) {
   for (const candidate of extensionCandidates(relativePath)) {
     const filePath = path.resolve(rootDir, candidate);
@@ -228,7 +254,7 @@ async function resolveRouteAlias({ rootDir, specifier, routeAliases }) {
 async function resolveImport({ rootDir, specifier, importerRel, aliases, routeAliases }) {
   const raw = normalizeString(specifier).trim();
   if (!raw || /^https?:\/\//i.test(raw)) return null;
-  const aliasTarget = aliases.get(raw);
+  const aliasTarget = importAliasTargetForSpecifier(raw, aliases);
   if (aliasTarget) {
     const expandedAlias = expandImportAliasTarget(aliasTarget);
     const routedAlias = await resolveRouteAlias({ rootDir, specifier: expandedAlias, routeAliases });
@@ -270,10 +296,32 @@ function scriptStats(rel, source) {
 
 function declarationSpansByName(record) {
   const spans = new Map();
-  for (const span of Array.isArray(record?.declarationSpans) ? record.declarationSpans : []) {
+  for (const span of declarationSpans(record)) {
     if (!spans.has(span.name)) spans.set(span.name, span);
   }
   return spans;
+}
+
+function declarationSpans(record) {
+  return Array.isArray(record?.declarationSpans) ? record.declarationSpans : [];
+}
+
+function declarationSpansNamed(record, name) {
+  const declarationName = normalizeIdentifier(name);
+  if (!declarationName) return [];
+  return declarationSpans(record)
+    .filter((span) => span?.name === declarationName)
+    .sort((a, b) => a.startIndex - b.startIndex
+      || a.endIndex - b.endIndex
+      || compareLocale(a.kind, b.kind));
+}
+
+function declarationSpanAtNameStart(record, name, nameStartIndex) {
+  const declarationName = normalizeIdentifier(name);
+  return declarationSpans(record).find((span) => (
+    span?.name === declarationName
+    && span.nameStartIndex === nameStartIndex
+  )) || null;
 }
 
 function componentSpans(record) {
@@ -439,21 +487,49 @@ function namedExportListEntries(masked) {
   return entries;
 }
 
-function defaultExportDeclarationName(record) {
+function declarationTargetFromSpan(declarationName, span) {
+  const name = normalizeIdentifier(declarationName);
+  return name && span ? { declarationName: name, span } : null;
+}
+
+function defaultExportDeclarationTarget(record) {
   const source = normalizeString(record?.source);
-  if (!source) return '';
+  if (!source) return null;
   const masked = maskIgnorableSyntax(source);
-  const spans = declarationSpansByName(record);
   const directMatch = masked.match(/\bexport\s+default\s+(?:async\s+)?function\s*\*?\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/);
-  if (directMatch && spans.has(directMatch[1])) return directMatch[1];
+  if (directMatch) {
+    const nameStartIndex = directMatch.index + directMatch[0].lastIndexOf(directMatch[1]);
+    const span = declarationSpanAtNameStart(record, directMatch[1], nameStartIndex);
+    const target = declarationTargetFromSpan(directMatch[1], span);
+    if (target) return target;
+  }
   for (const entry of namedExportListEntries(masked)) {
     for (const part of identifierListParts(entry.specifiersText)) {
       const specifier = parseNamedExportSpecifier(part);
-      if (specifier?.exported === 'default' && spans.has(specifier.local)) return specifier.local;
+      if (specifier?.exported !== 'default') continue;
+      const span = visibleDeclarationSpanForName(record, specifier.local, {
+        index: entry.startIndex,
+        endIndex: entry.endIndex,
+      }) || declarationSpansNamed(record, specifier.local)[0];
+      const target = declarationTargetFromSpan(specifier.local, span);
+      if (target) return target;
     }
   }
   const identifierMatch = masked.match(/\bexport\s+default\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/);
-  if (identifierMatch && spans.has(identifierMatch[1])) return identifierMatch[1];
+  if (identifierMatch) {
+    const span = visibleDeclarationSpanForName(record, identifierMatch[1], {
+      index: identifierMatch.index,
+      endIndex: identifierMatch.index + identifierMatch[0].length,
+    }) || declarationSpansNamed(record, identifierMatch[1])[0];
+    const target = declarationTargetFromSpan(identifierMatch[1], span);
+    if (target) return target;
+  }
+  return null;
+}
+
+function defaultExportDeclarationName(record) {
+  const target = defaultExportDeclarationTarget(record);
+  if (target) return target.declarationName;
   return '';
 }
 
@@ -1347,6 +1423,60 @@ function visibleLocalBindingLocationsUncached(record, span, identifier) {
     || a.index - b.index);
 }
 
+function moduleBindingScope(record) {
+  return {
+    scopeStart: 0,
+    scopeEnd: normalizeString(record?.source).length,
+  };
+}
+
+function normalizedBindingScope(record, scope) {
+  return Number.isInteger(scope?.scopeStart)
+    && Number.isInteger(scope?.scopeEnd)
+    && scope.scopeEnd >= scope.scopeStart
+    ? scope
+    : moduleBindingScope(record);
+}
+
+function functionExpressionNameScope(span) {
+  return {
+    scopeStart: span?.nameStartIndex,
+    scopeEnd: declarationSpanExclusiveEnd(span),
+  };
+}
+
+function declarationBindingScope(record, span) {
+  const declarationType = normalizeString(span?.declarationType).trim();
+  if (declarationType === 'function-expression-name') {
+    return normalizedBindingScope(record, functionExpressionNameScope(span));
+  }
+  const ownerSpan = parentDeclarationSpanForSpan(record, span);
+  return normalizedBindingScope(record, blockScopedBindingScope(record, ownerSpan, {
+    index: span?.nameStartIndex,
+    endIndex: span?.nameEndIndex,
+  }));
+}
+
+function locationInBindingScope(scope, location) {
+  return Number.isInteger(scope?.scopeStart)
+    && Number.isInteger(scope?.scopeEnd)
+    && Number.isInteger(location?.index)
+    && Number.isInteger(location?.endIndex)
+    && location.index >= scope.scopeStart
+    && location.endIndex <= scope.scopeEnd;
+}
+
+function visibleDeclarationSpanForName(record, name, location) {
+  const candidates = declarationSpansNamed(record, name)
+    .map((span) => ({ span, scope: declarationBindingScope(record, span) }))
+    .filter(({ scope }) => locationInBindingScope(scope, location))
+    .sort((a, b) => (a.scope.scopeEnd - a.scope.scopeStart) - (b.scope.scopeEnd - b.scope.scopeStart)
+      || b.scope.scopeStart - a.scope.scopeStart
+      || b.span.startIndex - a.span.startIndex
+      || compareLocale(a.span.kind, b.span.kind));
+  return candidates[0]?.span || null;
+}
+
 function sameLocation(a, b) {
   return a?.index === b?.index && a?.endIndex === b?.endIndex;
 }
@@ -1372,6 +1502,13 @@ function lineStartIndexesForSource(source) {
     if (text[index] === '\n') starts.push(index + 1);
   }
   return starts;
+}
+
+function sourceColumnAtIndex(source, index) {
+  if (!Number.isInteger(index) || index < 0) return null;
+  const text = normalizeString(source);
+  const lineStart = text.lastIndexOf('\n', Math.max(0, index - 1)) + 1;
+  return index - lineStart + 1;
 }
 
 function lineNumberAtSourceIndex(source, index) {
@@ -1587,15 +1724,21 @@ function declarationImportMetricKey(modulePath, declarationName) {
   return rel && name ? `${rel}\u0000${name}` : '';
 }
 
-function namedExportDeclarationMap(record) {
+function namedExportDeclarationTargetMap(record) {
   const source = normalizeString(record?.source);
   const masked = maskIgnorableSyntax(source);
-  const spans = declarationSpansByName(record);
   const exports = new Map();
-  const add = (exportedName, localName) => {
+  const add = (exportedName, localName, span) => {
     const exported = normalizeIdentifier(exportedName);
     const local = normalizeIdentifier(localName);
-    if (exported && local && spans.has(local) && !exports.has(exported)) exports.set(exported, local);
+    if (exported && local && span && !exports.has(exported)) {
+      exports.set(exported, { declarationName: local, span });
+    }
+  };
+  const addVisible = (exportedName, localName, location) => {
+    const span = visibleDeclarationSpanForName(record, localName, location)
+      || declarationSpansNamed(record, localName)[0];
+    add(exportedName, localName, span);
   };
 
   const directFunctionExportPattern = /\bexport\s+(?:async\s+)?function\s*\*?\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g;
@@ -1604,23 +1747,61 @@ function namedExportDeclarationMap(record) {
   const commonJsPropertyPattern = /\b(?:module\.)?exports\s*\.\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\b/g;
   const commonJsObjectPattern = /\bmodule\s*\.\s*exports\s*=\s*\{([\s\S]*?)\}/g;
   let match;
-  while ((match = directFunctionExportPattern.exec(masked))) add(match[1], match[1]);
-  while ((match = directArrowExportPattern.exec(masked))) add(match[1], match[1]);
-  while ((match = commonJsFunctionExpressionPattern.exec(masked))) add(match[1], match[2]);
-  while ((match = commonJsPropertyPattern.exec(masked))) add(match[1], match[2]);
+  while ((match = directFunctionExportPattern.exec(masked))) {
+    const nameStartIndex = match.index + match[0].lastIndexOf(match[1]);
+    add(match[1], match[1], declarationSpanAtNameStart(record, match[1], nameStartIndex));
+  }
+  while ((match = directArrowExportPattern.exec(masked))) {
+    const nameStartIndex = match.index + match[0].lastIndexOf(match[1]);
+    add(match[1], match[1], declarationSpanAtNameStart(record, match[1], nameStartIndex));
+  }
+  while ((match = commonJsFunctionExpressionPattern.exec(masked))) {
+    const nameStartIndex = match.index + match[0].lastIndexOf(match[2]);
+    add(match[1], match[2], declarationSpanAtNameStart(record, match[2], nameStartIndex));
+  }
+  while ((match = commonJsPropertyPattern.exec(masked))) {
+    addVisible(match[1], match[2], {
+      index: match.index,
+      endIndex: commonJsPropertyPattern.lastIndex,
+    });
+  }
   while ((match = commonJsObjectPattern.exec(masked))) {
     for (const part of identifierListParts(match[1])) {
       const specifier = parseCommonJsObjectSpecifier(part);
-      if (specifier) add(specifier.exported, specifier.local);
+      if (specifier) {
+        addVisible(specifier.exported, specifier.local, {
+          index: match.index,
+          endIndex: commonJsObjectPattern.lastIndex,
+        });
+      }
     }
   }
   for (const entry of namedExportListEntries(masked)) {
     for (const part of identifierListParts(entry.specifiersText)) {
       const specifier = parseNamedExportSpecifier(part);
-      if (specifier) add(specifier.exported, specifier.local);
+      if (specifier) {
+        addVisible(specifier.exported, specifier.local, {
+          index: entry.startIndex,
+          endIndex: entry.endIndex,
+        });
+      }
     }
   }
   return exports;
+}
+
+function namedExportDeclarationMap(record) {
+  return new Map(Array.from(namedExportDeclarationTargetMap(record), ([exportedName, target]) => [
+    exportedName,
+    target.declarationName,
+  ]));
+}
+
+function namedExportDeclarationTarget(record, exportedName) {
+  const imported = normalizeIdentifier(exportedName);
+  if (!imported) return null;
+  const exportedDeclarations = namedExportDeclarationTargetMap(record);
+  return exportedDeclarations.get(imported) || null;
 }
 
 function namedExportDeclarationName(record, exportedName) {
@@ -1639,6 +1820,16 @@ function importBindingDeclarationName(targetRecord, binding) {
   }
   if (kind === 'default') return defaultExportDeclarationName(targetRecord);
   return '';
+}
+
+function importBindingDeclarationTarget(targetRecord, binding) {
+  const kind = normalizeString(binding?.kind || 'named').trim() || 'named';
+  if (kind === 'named') {
+    const imported = normalizeIdentifier(binding?.imported);
+    return namedExportDeclarationTarget(targetRecord, imported);
+  }
+  if (kind === 'default') return defaultExportDeclarationTarget(targetRecord);
+  return null;
 }
 
 function declarationImportMetricsFor(metrics, record, declarationName) {
@@ -1840,29 +2031,25 @@ function namespaceMemberReferenceLocations(record, span, namespaceName, { bindin
 }
 
 function importBindingRelationshipTarget(targetRecord, binding) {
-  const targetSpans = declarationSpansByName(targetRecord);
   const bindingKind = normalizeString(binding?.kind || 'named').trim() || 'named';
   if (bindingKind === 'namespace') return null;
 
-  const declarationName = importBindingDeclarationName(targetRecord, binding);
-  const span = targetSpans.get(declarationName);
-  return span ? {
-    declarationName,
-    span,
+  const target = importBindingDeclarationTarget(targetRecord, binding);
+  return target?.span ? {
+    declarationName: target.declarationName,
+    span: target.span,
     importedName: bindingKind === 'default' ? 'default' : binding.imported,
     directCallableOnly: false,
   } : null;
 }
 
 function namespaceImportRelationshipTarget(targetRecord, binding, memberName) {
-  const targetSpans = declarationSpansByName(targetRecord);
   const importedName = normalizeIdentifier(memberName);
-  const declarationName = namedExportDeclarationName(targetRecord, importedName);
-  const span = targetSpans.get(declarationName);
+  const target = namedExportDeclarationTarget(targetRecord, importedName);
   const namespaceName = normalizeIdentifier(binding?.local);
-  return span ? {
-    declarationName,
-    span,
+  return target?.span ? {
+    declarationName: target.declarationName,
+    span: target.span,
     importedName,
     localName: namespaceName ? `${namespaceName}.${importedName}` : importedName,
     directCallableOnly: false,
@@ -2188,6 +2375,16 @@ function mermaidClassHeader(record, classId) {
   return `class ${classId}["${escapeMermaidLabel(mermaidClassLabel(record))}"]`;
 }
 
+function importSpecifierLooksLocal(specifier, aliases, routeAliases) {
+  const raw = normalizeString(specifier).trim();
+  if (!raw) return false;
+  if (raw.startsWith('.') || raw.startsWith('/')) return true;
+  for (const key of aliases.keys()) {
+    if (raw === key || (key.endsWith('/') && raw.startsWith(key))) return true;
+  }
+  return routeAliases.some((alias) => raw === alias.from.slice(0, -1) || raw.startsWith(alias.from));
+}
+
 function externalLabel(specifier) {
   const raw = normalizeString(specifier).trim();
   if (!raw) return '';
@@ -2265,27 +2462,31 @@ function importedScriptCandidatesForJsx(record, graph, declarationImportMetrics)
       .find((candidate) => candidate.local === name);
     if (targetRecord && binding?.kind === 'namespace') {
       for (const memberName of namespaceMemberNamesForRecord(record, binding, ref)) {
-        const declarationName = namedExportDeclarationName(targetRecord, memberName);
+        const target = namedExportDeclarationTarget(targetRecord, memberName);
+        const declarationName = target?.declarationName || '';
         const visibleName = `${name}.${memberName}`;
         candidates.push({
           name: visibleName,
           targetRecord,
           binding,
           declarationName,
-          lineCount: declarationLineCount(targetRecord, declarationName),
+          span: target?.span || null,
+          lineCount: target?.span?.lineCount || declarationLineCount(targetRecord, declarationName),
           metrics: declarationImportMetricsFor(declarationImportMetrics, targetRecord, declarationName),
         });
       }
       continue;
     }
-    const resolvedDeclarationName = importBindingDeclarationName(targetRecord, binding);
+    const target = importBindingDeclarationTarget(targetRecord, binding);
+    const resolvedDeclarationName = target?.declarationName || '';
     const declarationName = resolvedDeclarationName || (targetRecord ? '' : name);
     candidates.push({
       name,
       targetRecord,
       binding,
       declarationName,
-      lineCount: declarationLineCount(targetRecord, declarationName),
+      span: target?.span || null,
+      lineCount: target?.span?.lineCount || declarationLineCount(targetRecord, declarationName),
       metrics: declarationImportMetricsFor(declarationImportMetrics, targetRecord, declarationName),
     });
   }
@@ -2310,7 +2511,7 @@ function importedScriptSourceDeclarationsForJsx(record, graph, moduleId, declara
     const { name, targetRecord, binding, declarationName, metrics } = candidate;
     if (!targetRecord) continue;
 
-    const span = declarationSpansByName(targetRecord).get(declarationName);
+    const span = candidate.span || declarationSpansByName(targetRecord).get(declarationName);
     const entry = sourceDeclarationEntry({
       moduleId,
       visibleName: name,
@@ -2343,7 +2544,8 @@ function compareImportEdgeBinding(a, b) {
 function importBindingLineCount(graph, targetRel, binding) {
   if (binding.kind !== 'named') return null;
   const targetRecord = graph.modules.get(targetRel);
-  return declarationLineCount(targetRecord, importBindingDeclarationName(targetRecord, binding));
+  const target = importBindingDeclarationTarget(targetRecord, binding);
+  return target?.span?.lineCount || declarationLineCount(targetRecord, target?.declarationName);
 }
 
 function edgeRestingLabel(loadKinds) {
@@ -2409,7 +2611,7 @@ function encodedStaticId(value) {
   return Buffer.from(normalizeString(value), 'utf8').toString('base64url');
 }
 
-function functionSpanKey(record, span) {
+function legacyFunctionSpanKey(record, span) {
   return [
     normalizeString(record?.rel).trim(),
     normalizeString(span?.name).trim(),
@@ -2419,8 +2621,41 @@ function functionSpanKey(record, span) {
   ].join('\u0000');
 }
 
-function functionIdForSpan(record, span) {
-  return encodedStaticId(`function\u0000${functionSpanKey(record, span)}`);
+function functionSpanKey(record, span) {
+  return [
+    legacyFunctionSpanKey(record, span),
+    span?.startIndex,
+    span?.endIndex,
+    span?.nameStartIndex,
+  ].join('\u0000');
+}
+
+function functionIdentityKeysForSpans(record, spans) {
+  const groups = new Map();
+  for (const span of spans) {
+    const legacyKey = legacyFunctionSpanKey(record, span);
+    if (!groups.has(legacyKey)) groups.set(legacyKey, []);
+    groups.get(legacyKey).push(span);
+  }
+
+  const identities = new Map();
+  for (const [legacyKey, group] of groups) {
+    const ordered = [...group].sort((a, b) => a.startIndex - b.startIndex
+      || a.nameStartIndex - b.nameStartIndex
+      || a.endIndex - b.endIndex);
+    if (ordered.length === 1) {
+      identities.set(ordered[0], legacyKey);
+      continue;
+    }
+    ordered.forEach((span, index) => {
+      identities.set(span, `${legacyKey}\u0000${index + 1}`);
+    });
+  }
+  return identities;
+}
+
+function functionIdForSpan(record, span, identityKey = legacyFunctionSpanKey(record, span)) {
+  return encodedStaticId(`function\u0000${identityKey}`);
 }
 
 function functionDependencyEdgeId({ sourceNode, targetNode, scope, importInfo }) {
@@ -2441,8 +2676,10 @@ function compareFunctionNode(a, b) {
   return compareLocale(a.modulePath, b.modulePath)
     || a.startLine - b.startLine
     || a.endLine - b.endLine
+    || (a.declarationColumn || 0) - (b.declarationColumn || 0)
     || compareLocale(a.name, b.name)
-    || compareLocale(a.kind, b.kind);
+    || compareLocale(a.kind, b.kind)
+    || compareLocale(a.id, b.id);
 }
 
 function compareFunctionEdge(a, b) {
@@ -2455,19 +2692,58 @@ function compareFunctionEdge(a, b) {
     || compareLocale(a.import?.localName || '', b.import?.localName || '');
 }
 
-function functionNodeForSpan(record, span) {
+function functionNodeForSpan(record, span, { nested = false, scopePath = '', identityKey = null } = {}) {
   const name = normalizeString(span?.name).trim();
+  const declarationType = normalizeString(span?.declarationType).trim()
+    || (span?.kind === 'arrow' ? 'arrow-variable' : 'function-declaration');
+  const detectedPublicApi = declarationPublicApiInfo(record, name);
+  const commonJsFunctionExpressionExport = declarationType === 'function-expression-name'
+    && detectedPublicApi.exportKinds.includes('commonjs-export');
+  const publicApi = nested || (declarationType === 'function-expression-name' && !commonJsFunctionExpressionExport)
+    ? { exported: false, exportedNames: [], exportKinds: [] }
+    : detectedPublicApi;
   return {
-    id: functionIdForSpan(record, span),
+    id: functionIdForSpan(record, span, identityKey || legacyFunctionSpanKey(record, span)),
     modulePath: record.rel,
     name,
     declarationName: name,
     kind: normalizeString(span?.kind).trim() || 'function',
     component: /^[A-Z]/.test(name),
+    reachable: Boolean(record.reachable),
+    exported: Boolean(publicApi.exported),
+    exportedNames: publicApi.exportedNames,
+    exportKinds: publicApi.exportKinds,
+    declarationType,
+    standalone: !nested && declarationType !== 'function-expression-name',
+    scopePath,
+    declarationLine: lineNumberAtSourceIndex(record.source, span.nameStartIndex),
+    declarationColumn: sourceColumnAtIndex(record.source, span.nameStartIndex),
     startLine: span.startLine,
     endLine: span.endLine,
     lineCount: span.lineCount,
   };
+}
+
+function normalizeScopeSegment(segment) {
+  return normalizeString(maskIgnorableSyntax(segment))
+    .replace(/\s+/g, ' ')
+    .replace(/\(\s+/g, '(')
+    .replace(/\s+\)/g, ')')
+    .replace(/\s+([,;:{}[\]])/g, '$1')
+    .replace(/([({[\]])\s+/g, '$1')
+    .trim();
+}
+
+function scopeSegmentForRange(record, range) {
+  const source = maskIgnorableSyntax(normalizeString(record?.source));
+  const boundary = Math.max(
+    source.lastIndexOf('\n', range.startIndex - 1),
+    source.lastIndexOf(';', range.startIndex - 1),
+    source.lastIndexOf('}', range.startIndex - 1),
+  );
+  const segment = normalizeScopeSegment(source.slice(boundary + 1, range.startIndex));
+  if (segment) return segment;
+  return 'anonymous-block';
 }
 
 function functionNodeDescriptors(graph) {
@@ -2482,8 +2758,21 @@ function functionNodeDescriptors(graph) {
         || a.endLine - b.endLine
         || compareLocale(a.name, b.name)
         || compareLocale(a.kind, b.kind));
+    const blockRanges = lexicalBlockRanges(record);
+    const identityKeys = functionIdentityKeysForSpans(record, spans);
+    const scopePathFor = (span) => blockRanges
+      .filter((range) => range.startIndex < span.nameStartIndex && range.endIndex >= span.nameEndIndex)
+      .sort((a, b) => a.startIndex - b.startIndex || b.endIndex - a.endIndex)
+      .map((range) => scopeSegmentForRange(record, range))
+      .join('/');
     for (const span of spans) {
-      const node = functionNodeForSpan(record, span);
+      const scopePath = scopePathFor(span);
+      const nested = Boolean(scopePath);
+      const node = functionNodeForSpan(record, span, {
+        nested,
+        scopePath,
+        identityKey: identityKeys.get(span),
+      });
       const descriptor = { node, record, span };
       descriptors.push(descriptor);
       bySpanKey.set(functionSpanKey(record, span), descriptor);
@@ -2499,21 +2788,13 @@ function functionNodeDescriptors(graph) {
   return { descriptors, bySpanKey, byModulePath };
 }
 
-function uniqueSameModuleTargets(descriptors) {
-  const targets = new Map();
-  for (const descriptor of descriptors) {
-    if (!targets.has(descriptor.node.name)) targets.set(descriptor.node.name, descriptor);
-  }
-  return Array.from(targets.values());
-}
-
 function sameModuleReferenceLocations(record, callerSpan, targetSpan) {
   return declarationReferenceLocations(record, callerSpan, targetSpan?.name, {
     ignoredBindingLocations: [{
       index: targetSpan?.nameStartIndex,
       endIndex: targetSpan?.nameEndIndex,
     }],
-  });
+  }).filter((location) => visibleDeclarationSpanForName(record, targetSpan?.name, location) === targetSpan);
 }
 
 function declarationSearchText(record, span) {
@@ -2596,10 +2877,9 @@ function mergeFunctionDependencyEdge(edgeMap, edge) {
 function buildSameModuleFunctionEdges({ byModulePath }) {
   const edgeMap = new Map();
   for (const descriptors of byModulePath.values()) {
-    const targets = uniqueSameModuleTargets(descriptors);
     for (const callerDescriptor of descriptors) {
       const searchText = declarationSearchText(callerDescriptor.record, callerDescriptor.span);
-      for (const targetDescriptor of targets) {
+      for (const targetDescriptor of descriptors) {
         if (callerDescriptor.node.id === targetDescriptor.node.id) continue;
         if (!searchText.includes(targetDescriptor.node.name)) continue;
         const referenceLocations = sameModuleReferenceLocations(
@@ -2623,7 +2903,8 @@ function buildSameModuleFunctionEdges({ byModulePath }) {
 function buildImportedFunctionEdges(graph, { bySpanKey }) {
   const edgeMap = new Map();
   for (const importerRecord of graph.modules.values()) {
-    const importerSpans = Array.from(declarationSpansByName(importerRecord).values());
+    const importerSpans = declarationSpans(importerRecord)
+      .filter((span) => ['function', 'arrow'].includes(span?.kind));
     if (importerSpans.length === 0) continue;
     for (const ref of Array.isArray(importerRecord.importRefs) ? importerRecord.importRefs : []) {
       const targetRecord = ref?.localRel ? graph.modules.get(ref.localRel) : null;
@@ -2890,14 +3171,31 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
       });
       if (local && discoveredRelSet.has(local.rel)) {
         localDeps.push(local.rel);
-        normalizedImportRefs.push({ ...ref, localRel: local.rel });
+        normalizedImportRefs.push({
+          ...ref,
+          localRel: local.rel,
+          resolution: 'local',
+          unresolvedReason: null,
+        });
+      } else if (importSpecifierLooksLocal(ref.specifier, aliases, resolvedRouteAliases)) {
+        normalizedImportRefs.push({
+          ...ref,
+          localRel: null,
+          resolution: 'unresolved',
+          unresolvedReason: local ? 'outside_analysis' : 'not_found',
+        });
       } else {
         const label = externalLabel(ref.specifier);
         if (label && !isIgnoredExternalLabel(label)) {
           externals.add(label);
           externalDeps.push(label);
         }
-        normalizedImportRefs.push({ ...ref, localRel: null });
+        normalizedImportRefs.push({
+          ...ref,
+          localRel: null,
+          resolution: 'external',
+          unresolvedReason: null,
+        });
       }
     }
 

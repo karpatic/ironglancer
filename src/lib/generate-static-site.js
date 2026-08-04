@@ -13,7 +13,7 @@ const execFile = promisify(execFileCallback);
 const packageMeta = require('../../package.json');
 const viewerAppUrl = new URL('../viewer/app.js', import.meta.url);
 const API_VERSION = 'v1';
-const SCHEMA_VERSION = '1.0.0';
+const SCHEMA_VERSION = '1.1.0';
 const API_DATA_DIR = '.ironglancer-api';
 
 const CREDENTIAL_VALUE_PATTERNS = [
@@ -202,6 +202,8 @@ function sanitizedImportRef(ref = {}) {
     specifier: typeof ref.specifier === 'string' ? ref.specifier : '',
     kind: typeof ref.kind === 'string' ? ref.kind : '',
     localRel: typeof ref.localRel === 'string' ? ref.localRel : null,
+    resolution: ['local', 'external', 'unresolved'].includes(ref.resolution) ? ref.resolution : null,
+    unresolvedReason: typeof ref.unresolvedReason === 'string' ? ref.unresolvedReason : null,
     bindings: Array.isArray(ref.bindings)
       ? ref.bindings.map((binding) => ({
         imported: typeof binding.imported === 'string' ? binding.imported : '',

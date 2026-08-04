@@ -49,17 +49,27 @@ Read-only API
 - function dependency endpoints expose static identifier usage inside declared function spans; direct call, optional-call, tagged-template, and JSX element syntax are labeled when visible, while generic references remain `reference`
 - unknown API query parameters return HTTP 400 instead of being silently ignored
 - general list pagination uses `limit` and `offset`; explicit `limit` must be between 1 and 200, while `/modules/:id/functions` preserves its legacy all-functions result when both are omitted
-- `search` and `q` are case-insensitive substring filters; `name`, `userCount`, `dependencyCount`, and `referenceCount` are exact filters
+- legacy Base64URL `id` values remain accepted; module, function, symbol, import, and function-edge records also expose compact deterministic `stableId` join keys
+- compact function IDs use lexical scope rather than source lines; structurally indistinguishable duplicates or digest collisions receive unique ordinal suffixes whose assignment may change if those duplicates are reordered
+- summary lists accept opt-in `fields=...` sparse projections; module/function details accept bounded `include=...` expansion controls, with HTTP 400 for unknown selectors
+- `search` and `q` are case-insensitive substring filters on legacy list routes; exact filters include `name`, `userCount`, `dependencyCount`, and `referenceCount`
+- `/api/v1/search` adds exact function-aware lexical occurrence search over masked saved source without claiming binding identity or runtime execution; recognized JSX child text is labeled `jsx-text`, and occurrence scans fail with HTTP 413 above 5,000,000 saved-source characters or 10,000 matches
+- function triage supports `reachable`, `exported`, `standalone`, count filters, and deterministic sorting; import triage distinguishes local, external, unresolved, and dynamic static evidence
+- shortest paths and blast radius use bounded deterministic breadth-first traversal over immutable saved indexes (`maxDepth <= 50`, at most 10,000 visited nodes)
 - JSON errors are shaped as `{ "ok": false, "error": { "status": 404, "code": "not_found", "message": "..." } }`
 
 Routes
 - `GET /api/v1` discovers routes and semantics
+- `GET /api/v1/schema` returns the schema catalog in the standard API envelope; `GET /api/v1/schema.json` returns raw `application/schema+json`
 - `GET /api/v1/run` returns API/schema version, package version, build timestamp, root/entry, git commit when available, build id, source hash, and summary
 - `GET /api/v1/modules?search=app&reachable=true&extension=.jsx&limit=25&offset=0`
 - `GET /api/v1/modules/:id`
 - `GET /api/v1/modules/:id/dependencies`
 - `GET /api/v1/modules/:id/dependents`
 - `GET /api/v1/modules/:id/functions?detail=summary&limit=25&offset=0`
+- `GET /api/v1/modules/:id/shortest-path?targetId=<module-id>&maxDepth=10`
+- `GET /api/v1/modules/:id/blast-radius?maxDepth=10&limit=200`
+- `GET /api/v1/imports?resolution=unresolved&dynamic=true`
 - `GET /api/v1/modules/:id/source?startLine=1&endLine=40`
 - `GET /api/v1/source?path=src/app.jsx&startLine=1&endLine=40`
 - `GET /api/v1/symbols?search=helper&modulePath=src/app.jsx`
@@ -74,6 +84,9 @@ Routes
 - `GET /api/v1/functions/:id`
 - `GET /api/v1/functions/:id/dependencies`
 - `GET /api/v1/functions/:id/users`
+- `GET /api/v1/functions/:id/shortest-path?targetId=<function-id>&maxDepth=10`
+- `GET /api/v1/functions/:id/blast-radius?maxDepth=10&limit=200`
+- `GET /api/v1/search?q=RootApp&match=exact&types=function,occurrence`
 - `GET /api/v1/query?modulePath=src/app.jsx&symbol=RootApp`
 
 API examples
