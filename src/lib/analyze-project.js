@@ -58,7 +58,7 @@ const visibleLocalBindingLocationCache = new WeakMap();
 const FUNCTION_DEPENDENCY_LIMITATIONS = [
   'Static function dependencies are based on identifier references inside saved declaration spans; IronGlancer does not execute code or prove runtime control flow.',
   'Usage syntax is labeled as call, optional-call, tagged-template, jsx-element, or reference from nearby source syntax; reference entries are not claimed to be definite runtime calls.',
-  'Imported targets are limited to statically resolved local imports, dynamic imports, require calls, and supported lazy-module patterns with resolvable bindings.',
+  'Imported targets are limited to statically resolved local imports, dynamic imports, require calls, exact supported Faculty browser import wrappers, and supported lazy-module patterns with resolvable bindings.',
   'Same-module targets are limited to named function declarations and named arrow-function variable declarations discovered in the same file; dynamic property dispatch, aliasing through arbitrary values, and unresolved re-exports are outside this map.',
 ];
 

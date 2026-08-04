@@ -47,6 +47,9 @@ Read-only API
 - the built-in server does not serve `.ironglancer-api/` as static files
 - symbol relation endpoints expose static import/export/reference relationships IronGlancer captures, not runtime call graphs or data lineage
 - function dependency endpoints expose static identifier usage inside declared function spans; direct call, optional-call, tagged-template, and JSX element syntax are labeled when visible, while generic references remain `reference`
+- unknown API query parameters return HTTP 400 instead of being silently ignored
+- general list pagination uses `limit` and `offset`; explicit `limit` must be between 1 and 200, while `/modules/:id/functions` preserves its legacy all-functions result when both are omitted
+- `search` and `q` are case-insensitive substring filters; `name`, `userCount`, `dependencyCount`, and `referenceCount` are exact filters
 - JSON errors are shaped as `{ "ok": false, "error": { "status": 404, "code": "not_found", "message": "..." } }`
 
 Routes
@@ -56,15 +59,17 @@ Routes
 - `GET /api/v1/modules/:id`
 - `GET /api/v1/modules/:id/dependencies`
 - `GET /api/v1/modules/:id/dependents`
-- `GET /api/v1/modules/:id/functions`
+- `GET /api/v1/modules/:id/functions?detail=summary&limit=25&offset=0`
 - `GET /api/v1/modules/:id/source?startLine=1&endLine=40`
 - `GET /api/v1/source?path=src/app.jsx&startLine=1&endLine=40`
 - `GET /api/v1/symbols?search=helper&modulePath=src/app.jsx`
+- `GET /api/v1/symbols?name=helper&referenceCount=1`
 - `GET /api/v1/symbols/search?q=helper`
 - `GET /api/v1/symbols/:id`
 - `GET /api/v1/symbols/:id/references`
 - `GET /api/v1/symbols/:id/callers`
 - `GET /api/v1/functions?modulePath=src/app.jsx&component=true`
+- `GET /api/v1/functions?name=RootApp&dependencyCount=2&userCount=0`
 - `GET /api/v1/functions/search?q=RootApp`
 - `GET /api/v1/functions/:id`
 - `GET /api/v1/functions/:id/dependencies`
@@ -77,6 +82,8 @@ curl http://127.0.0.1:4173/api/v1/run
 curl 'http://127.0.0.1:4173/api/v1/modules?reachable=true&extension=.jsx'
 curl 'http://127.0.0.1:4173/api/v1/symbols/search?q=RootApp'
 curl 'http://127.0.0.1:4173/api/v1/functions/search?q=RootApp'
+curl 'http://127.0.0.1:4173/api/v1/functions?name=RootApp&dependencyCount=2'
+curl 'http://127.0.0.1:4173/api/v1/modules/<module-id>/functions?detail=summary&limit=25&offset=0'
 ```
 
 Development

@@ -199,6 +199,99 @@ test('analyzeProject resolves lazy-loaded module specifier constants', async () 
   assert.ok(!result.mermaid.includes(': imports'));
 });
 
+test('analyzeProject records same-module function edges for spread operand calls', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      'export function buildCreatorRubricsExplorerFiles(snapshot) {',
+      '  return [snapshot];',
+      '}',
+      '',
+      'export function CreatorRubricsExplorer(snapshot) {',
+      '  return [',
+      '    ...buildCreatorRubricsExplorerFiles(snapshot),',
+      '  ];',
+      '}',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+  const edge = result.functionDependencyMap.edges.find((candidate) => (
+    candidate.sourceFunction === 'CreatorRubricsExplorer'
+    && candidate.targetFunction === 'buildCreatorRubricsExplorerFiles'
+  ));
+
+  assert.ok(edge, 'expected spread operand call to create a same-module function edge');
+  assert.equal(edge.scope, 'same-module');
+  assert.equal(edge.relationKind, 'static-call');
+  assert.deepEqual(edge.syntaxKinds, ['call']);
+  assert.deepEqual(edge.usageLines, [7]);
+  assert.deepEqual(edge.usages, [{ line: 7, syntax: 'call' }]);
+  assert.equal(edge.referenceCount, 1);
+});
+
+test('analyzeProject resolves exact Faculty browser import wrappers without broad call inference', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "const BROWSER_SPECIFIER = './browser-child.jsx';",
+      "const NATIVE_SPECIFIER = './native-child.jsx';",
+      '',
+      'export async function App() {',
+      '  await importCreatorBrowserModule(BROWSER_SPECIFIER, NATIVE_SPECIFIER);',
+      "  importCreatorBrowserModule('./' + computedName, './computed-native.jsx');",
+      "  importOtherBrowserModule('./false-positive.jsx', './false-positive-native.jsx');",
+      '  return null;',
+      '}',
+    ].join('\n'),
+    'src/browser-child.jsx': [
+      'export function BrowserChild() {',
+      '  return null;',
+      '}',
+    ].join('\n'),
+    'src/native-child.jsx': [
+      'export function NativeChild() {',
+      '  return null;',
+      '}',
+    ].join('\n'),
+    'src/computed-native.jsx': [
+      'export function ComputedNative() {',
+      '  return null;',
+      '}',
+    ].join('\n'),
+    'src/false-positive.jsx': [
+      'export function FalsePositive() {',
+      '  return null;',
+      '}',
+    ].join('\n'),
+    'src/false-positive-native.jsx': [
+      'export function FalsePositiveNative() {',
+      '  return null;',
+      '}',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+  const appModule = result.graph.modules.get('src/app.jsx');
+
+  assert.deepEqual(appModule.localDeps, [
+    'src/browser-child.jsx',
+    'src/native-child.jsx',
+  ]);
+  assert.equal(result.graph.modules.get('src/browser-child.jsx').reachable, true);
+  assert.equal(result.graph.modules.get('src/native-child.jsx').reachable, true);
+  assert.equal(result.graph.modules.get('src/computed-native.jsx').reachable, false);
+  assert.equal(result.graph.modules.get('src/false-positive.jsx').reachable, false);
+  assert.equal(result.graph.modules.get('src/false-positive-native.jsx').reachable, false);
+  assert.deepEqual(
+    result.importEdges
+      .filter((edge) => edge.sourcePath === 'src/app.jsx')
+      .map(({ targetPath, loadKinds }) => ({ targetPath, loadKinds })),
+    [
+      { targetPath: 'src/browser-child.jsx', loadKinds: ['dynamic-wrapper'] },
+      { targetPath: 'src/native-child.jsx', loadKinds: ['dynamic-wrapper'] },
+    ],
+  );
+});
+
 const importEdgeMetadataRoot = path.resolve('tests/fixtures/import-edge-metadata');
 
 test('analyzeProject exposes JSX import edge metadata', async () => {

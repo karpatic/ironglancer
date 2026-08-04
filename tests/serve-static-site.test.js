@@ -93,6 +93,32 @@ test('static analysis server exposes viewer files and a versioned cached API', a
     assert.ok(appModule, 'expected src/app.jsx in module list');
     assert.equal(appModule.sourceAvailable, true);
 
+    const exactFunctions = await fetchJson(new URL('/api/v1/functions?name=App', serviceUrl));
+    assert.equal(exactFunctions.response.status, 200);
+    assert.deepEqual(exactFunctions.body.data.items.map((item) => item.name), ['App']);
+
+    const dependencyFilteredFunctions = await fetchJson(new URL('/api/v1/functions?dependencyCount=2', serviceUrl));
+    assert.equal(dependencyFilteredFunctions.response.status, 200);
+    assert.deepEqual(dependencyFilteredFunctions.body.data.items.map((item) => item.name), ['RootApp']);
+
+    const userFilteredFunctions = await fetchJson(new URL('/api/v1/functions?userCount=1', serviceUrl));
+    assert.equal(userFilteredFunctions.response.status, 200);
+    assert.deepEqual(userFilteredFunctions.body.data.items.map((item) => item.name), ['App', 'helper']);
+
+    const exactSymbols = await fetchJson(new URL('/api/v1/symbols?name=App', serviceUrl));
+    assert.equal(exactSymbols.response.status, 200);
+    assert.deepEqual(exactSymbols.body.data.items.map((item) => item.name), ['App']);
+
+    const referenceFilteredSymbols = await fetchJson(new URL('/api/v1/symbols?referenceCount=1', serviceUrl));
+    assert.equal(referenceFilteredSymbols.response.status, 200);
+    assert.deepEqual(referenceFilteredSymbols.body.data.items.map((item) => item.name), ['App', 'helper']);
+
+    const unknownQuery = await fetchJson(new URL('/api/v1/functions?name=App&unknownFilter=1', serviceUrl));
+    assert.equal(unknownQuery.response.status, 400);
+    assert.equal(unknownQuery.body.ok, false);
+    assert.equal(unknownQuery.body.error.code, 'unknown_query_parameter');
+    assert.match(unknownQuery.body.error.message, /unknownFilter/);
+
     const appDetail = await fetchJson(new URL(`/api/v1/modules/${appModule.id}`, serviceUrl));
     assert.equal(appDetail.response.status, 200);
     assert.equal(appDetail.body.data.module.path, 'src/app.jsx');
@@ -154,6 +180,89 @@ test('static analysis server exposes viewer files and a versioned cached API', a
     assert.equal(unknown.response.status, 404);
     assert.equal(unknown.body.ok, false);
     assert.equal(unknown.body.error.code, 'not_found');
+  } finally {
+    activeHandler = null;
+  }
+});
+
+test('module functions API supports compact summary pagination and query bounds', async () => {
+  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-module-functions-src-'));
+  const sourcePath = path.join(rootDir, 'src/app.jsx');
+  await fs.mkdir(path.dirname(sourcePath), { recursive: true });
+  await fs.writeFile(sourcePath, [
+    'export function Alpha() {',
+    '  return Beta();',
+    '}',
+    '',
+    'export function Beta() {',
+    "  return 'beta';",
+    '}',
+    '',
+    'export function Gamma() {',
+    '  return Beta();',
+    '}',
+  ].join('\n'), 'utf8');
+
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-module-functions-api-'));
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
+  activeHandler = await createStaticAnalysisRequestHandler({ outDir });
+
+  try {
+    const serviceUrl = new URL('http://127.0.0.1/');
+    const modules = await fetchJson(new URL('/api/v1/modules?search=app', serviceUrl));
+    const appModule = modules.body.data.items.find((item) => item.path === 'src/app.jsx');
+    assert.ok(appModule, 'expected src/app.jsx module summary');
+
+    const summary = await fetchJson(new URL(
+      `/api/v1/modules/${appModule.id}/functions?detail=summary&limit=2&offset=1`,
+      serviceUrl,
+    ));
+    assert.equal(summary.response.status, 200);
+    assert.deepEqual(summary.body.data.pagination, {
+      offset: 1,
+      limit: 2,
+      total: 3,
+      nextOffset: null,
+    });
+    assert.deepEqual(summary.body.data.functions.map((item) => item.name), ['Beta', 'Gamma']);
+    assert.ok(!('dependencies' in summary.body.data.functions[0]));
+    assert.ok(!('users' in summary.body.data.functions[0]));
+    assert.deepEqual(
+      summary.body.data.functions.map(({ name, dependencyCount, userCount }) => ({ name, dependencyCount, userCount })),
+      [
+        { name: 'Beta', dependencyCount: 0, userCount: 2 },
+        { name: 'Gamma', dependencyCount: 1, userCount: 0 },
+      ],
+    );
+
+    const full = await fetchJson(new URL(`/api/v1/modules/${appModule.id}/functions`, serviceUrl));
+    assert.equal(full.response.status, 200);
+    assert.equal(full.body.data.pagination.total, 3);
+    assert.equal(full.body.data.functions[0].function.name, 'Alpha');
+    assert.ok(Array.isArray(full.body.data.functions[0].dependencies));
+    assert.ok(Array.isArray(full.body.data.functions[0].users));
+
+    const invalidLimit = await fetchJson(new URL(
+      `/api/v1/modules/${appModule.id}/functions?detail=summary&limit=0`,
+      serviceUrl,
+    ));
+    assert.equal(invalidLimit.response.status, 400);
+    assert.equal(invalidLimit.body.error.code, 'invalid_query');
+
+    const invalidDetail = await fetchJson(new URL(
+      `/api/v1/modules/${appModule.id}/functions?detail=compact`,
+      serviceUrl,
+    ));
+    assert.equal(invalidDetail.response.status, 400);
+    assert.equal(invalidDetail.body.error.code, 'invalid_query');
+
+    const unknownQuery = await fetchJson(new URL(
+      `/api/v1/modules/${appModule.id}/functions?detail=summary&mystery=1`,
+      serviceUrl,
+    ));
+    assert.equal(unknownQuery.response.status, 400);
+    assert.equal(unknownQuery.body.error.code, 'unknown_query_parameter');
+    assert.match(unknownQuery.body.error.message, /mystery/);
   } finally {
     activeHandler = null;
   }

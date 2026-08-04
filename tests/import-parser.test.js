@@ -75,6 +75,31 @@ test('extractImportRefs classifies dynamic, lazy, and require refs without dupli
   ]);
 });
 
+test('extractImportRefs recognizes only resolvable Faculty browser import wrappers', () => {
+  const source = [
+    "const BROWSER_SPECIFIER = './browser-child.jsx';",
+    "const NATIVE_SPECIFIER = './native-child.jsx';",
+    'await importCreatorBrowserModule(BROWSER_SPECIFIER, NATIVE_SPECIFIER);',
+    "importCreatorBrowserModule('./literal-browser.jsx', './literal-native.jsx');",
+    "importCreatorBrowserModule('./' + computedName, './computed-native.jsx');",
+    "importOtherBrowserModule('./false-positive.jsx', './false-positive-native.jsx');",
+    "loader.importCreatorBrowserModule('./member.jsx', './member-native.jsx');",
+    "loader . importCreatorBrowserModule('./spaced-member.jsx', './spaced-member-native.jsx');",
+    "loader?.importCreatorBrowserModule('./optional-member.jsx', './optional-member-native.jsx');",
+    "loader?. importCreatorBrowserModule('./spaced-optional-member.jsx', './spaced-optional-member-native.jsx');",
+    "loader./* member */importCreatorBrowserModule('./comment-member.jsx', './comment-member-native.jsx');",
+    "$importCreatorBrowserModule('./prefixed.jsx', './prefixed-native.jsx');",
+    "éimportCreatorBrowserModule('./unicode-prefixed.jsx', './unicode-prefixed-native.jsx');",
+  ].join('\n');
+
+  assert.deepEqual(extractImportRefs(source), [
+    { specifier: './browser-child.jsx', bindings: [], kind: 'dynamic-wrapper' },
+    { specifier: './native-child.jsx', bindings: [], kind: 'dynamic-wrapper' },
+    { specifier: './literal-browser.jsx', bindings: [], kind: 'dynamic-wrapper' },
+    { specifier: './literal-native.jsx', bindings: [], kind: 'dynamic-wrapper' },
+  ]);
+});
+
 test('countIdentifierReferences preserves template interpolation code and ignores template text', () => {
   const source = [
     'const text = `helper appears as literal text',

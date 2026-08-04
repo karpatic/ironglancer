@@ -12,10 +12,47 @@ const DEFAULT_PAGE_LIMIT = 50;
 const MAX_PAGE_LIMIT = 200;
 const MAX_SOURCE_EXCERPT_LINES = 80;
 const API_DATA_DIR = '.ironglancer-api';
+const PAGINATION_QUERY_PARAMS = ['limit', 'offset'];
+const MODULE_LIST_QUERY_PARAMS = ['search', 'q', 'extension', 'reachable', 'jsx', ...PAGINATION_QUERY_PARAMS];
+const SOURCE_QUERY_PARAMS = ['startLine', 'endLine'];
+const SOURCE_BY_PATH_QUERY_PARAMS = ['path', ...SOURCE_QUERY_PARAMS];
+const FUNCTION_LIST_QUERY_PARAMS = [
+  'search',
+  'q',
+  'modulePath',
+  'name',
+  'kind',
+  'component',
+  'userCount',
+  'dependencyCount',
+  ...PAGINATION_QUERY_PARAMS,
+];
+const MODULE_FUNCTION_QUERY_PARAMS = [
+  'detail',
+  'search',
+  'q',
+  'name',
+  'kind',
+  'component',
+  'userCount',
+  'dependencyCount',
+  ...PAGINATION_QUERY_PARAMS,
+];
+const SYMBOL_LIST_QUERY_PARAMS = [
+  'search',
+  'q',
+  'modulePath',
+  'name',
+  'kind',
+  'sourceOrigin',
+  'referenceCount',
+  ...PAGINATION_QUERY_PARAMS,
+];
+const QUERY_AGGREGATE_PARAMS = ['modulePath', 'path', 'symbol', 'q', ...PAGINATION_QUERY_PARAMS];
 const FUNCTION_DEPENDENCY_LIMITATIONS = [
   'Static function dependencies are based on identifier references inside saved declaration spans; IronGlancer does not execute code or prove runtime control flow.',
   'Usage syntax is labeled as call, optional-call, tagged-template, jsx-element, or reference from nearby source syntax; reference entries are not claimed to be definite runtime calls.',
-  'Imported targets are limited to statically resolved local imports, dynamic imports, require calls, and supported lazy-module patterns with resolvable bindings.',
+  'Imported targets are limited to statically resolved local imports, dynamic imports, require calls, exact supported Faculty browser import wrappers, and supported lazy-module patterns with resolvable bindings.',
   'Same-module targets are limited to named function declarations and named arrow-function variable declarations discovered in the same file; dynamic property dispatch, aliasing through arbitrary values, and unresolved re-exports are outside this map.',
 ];
 
@@ -565,15 +602,15 @@ function routeEntries() {
     { method: 'GET', path: '/api/v1/modules/:id', description: 'Return one analyzed module with dependencies, dependents, imports, and symbols.' },
     { method: 'GET', path: '/api/v1/modules/:id/dependencies', description: 'Return local and external dependencies for one analyzed module.' },
     { method: 'GET', path: '/api/v1/modules/:id/dependents', description: 'Return modules that import one analyzed module.' },
-    { method: 'GET', path: '/api/v1/modules/:id/functions', description: 'Return functions declared in one module with outgoing static dependencies and reverse users.' },
+    { method: 'GET', path: '/api/v1/modules/:id/functions', description: 'Return functions declared in one module with detail, exact/count filters, limit, and offset controls.' },
     { method: 'GET', path: '/api/v1/modules/:id/source', description: 'Return a bounded source excerpt from saved analyzed module source.' },
     { method: 'GET', path: '/api/v1/source', description: 'Return a bounded source excerpt by exact analyzed module path.' },
-    { method: 'GET', path: '/api/v1/symbols', description: 'List saved source symbols with search, modulePath, kind, sourceOrigin, limit, and offset filters.' },
+    { method: 'GET', path: '/api/v1/symbols', description: 'List saved source symbols with search, exact name, modulePath, kind, sourceOrigin, referenceCount, limit, and offset filters.' },
     { method: 'GET', path: '/api/v1/symbols/search', description: 'Search saved source symbols using q or search.' },
     { method: 'GET', path: '/api/v1/symbols/:id', description: 'Return one saved source symbol and its declaration source snippet.' },
     { method: 'GET', path: '/api/v1/symbols/:id/references', description: 'Return captured static reference/importer relationships for one symbol.' },
     { method: 'GET', path: '/api/v1/symbols/:id/callers', description: 'Alias for static importer relationships; this is not a runtime call graph.' },
-    { method: 'GET', path: '/api/v1/functions', description: 'List saved function declarations with search, modulePath, kind, component, limit, and offset filters.' },
+    { method: 'GET', path: '/api/v1/functions', description: 'List saved function declarations with search, exact name, modulePath, kind, component, dependencyCount, userCount, limit, and offset filters.' },
     { method: 'GET', path: '/api/v1/functions/search', description: 'Search saved function declarations using q or search.' },
     { method: 'GET', path: '/api/v1/functions/:id', description: 'Return one function with outgoing static dependencies and reverse users.' },
     { method: 'GET', path: '/api/v1/functions/:id/dependencies', description: 'Return outgoing static function dependencies for one function.' },
@@ -590,9 +627,11 @@ function discovery(index) {
     examples: [
       '/api/v1/run',
       '/api/v1/modules?reachable=true&extension=.jsx&limit=25',
-      '/api/v1/modules/<module-id>/functions',
+      '/api/v1/modules/<module-id>/functions?detail=summary&limit=25&offset=0',
       '/api/v1/modules/<module-id>/source?startLine=1&endLine=40',
+      '/api/v1/symbols?name=App&referenceCount=1',
       '/api/v1/symbols/search?q=App',
+      '/api/v1/functions?name=CreatorShell&dependencyCount=2',
       '/api/v1/functions/search?q=CreatorShell',
       '/api/v1/query?modulePath=src/app.jsx&symbol=RootApp',
     ],
@@ -600,6 +639,12 @@ function discovery(index) {
       analysis: 'Responses are served from generated output.json, source-code.json, .ironglancer-api/source-modules.json, and .ironglancer-api/function-map.json loaded once at server start.',
       relations: 'Symbol relation endpoints expose static import/export/reference relationships captured by IronGlancer, not runtime call graphs or data lineage.',
       functionDependencies: index.functionLimitations,
+      queryParameters: {
+        unknown: 'Unknown query parameters are rejected with HTTP 400 instead of being ignored.',
+        pagination: `General list endpoints default to limit ${DEFAULT_PAGE_LIMIT}. Explicit limit must be a positive integer up to ${MAX_PAGE_LIMIT}; offset must be non-negative. The module-functions endpoint preserves its legacy all-functions response when limit and offset are both omitted.`,
+        exactFilters: 'name, userCount, dependencyCount, and referenceCount are exact matches. search and q remain case-insensitive substring filters.',
+        moduleFunctions: 'GET /api/v1/modules/:id/functions defaults to backwards-compatible detail=full. Use detail=summary with limit and offset for compact pageable function summaries.',
+      },
       source: `Source excerpts are bounded to ${MAX_SOURCE_EXCERPT_LINES} lines and only come from modules saved in the analyzed run.`,
     },
   };
@@ -658,6 +703,32 @@ function parseIntegerParam(searchParams, name, defaultValue, { min = 0, max = Nu
   return value;
 }
 
+function rejectUnknownQueryParams(url, allowedNames) {
+  const allowed = new Set(allowedNames);
+  const unknown = Array.from(new Set(Array.from(url.searchParams.keys())
+    .filter((name) => !allowed.has(name))))
+    .sort(compareLocale);
+  if (unknown.length === 0) return;
+
+  const label = unknown.length === 1 ? 'parameter' : 'parameters';
+  throw apiError(
+    400,
+    'unknown_query_parameter',
+    `Unknown query ${label}: ${unknown.join(', ')}.`,
+    {
+      unknown,
+      allowed: Array.from(allowed).sort(compareLocale),
+    },
+  );
+}
+
+function parseExactCountParam(searchParams, name) {
+  return parseIntegerParam(searchParams, name, null, {
+    min: 0,
+    max: Number.MAX_SAFE_INTEGER,
+  });
+}
+
 function pagination(url) {
   const limit = parseIntegerParam(url.searchParams, 'limit', DEFAULT_PAGE_LIMIT, {
     min: 1,
@@ -668,6 +739,10 @@ function pagination(url) {
     max: Number.MAX_SAFE_INTEGER,
   });
   return { limit, offset };
+}
+
+function hasPaginationParam(url) {
+  return url.searchParams.has('limit') || url.searchParams.has('offset');
 }
 
 function paginated(items, url) {
@@ -681,6 +756,19 @@ function paginated(items, url) {
       limit,
       total: items.length,
       nextOffset,
+    },
+  };
+}
+
+function optionallyPaginated(items, url) {
+  if (hasPaginationParam(url)) return paginated(items, url);
+  return {
+    items,
+    pagination: {
+      offset: 0,
+      limit: items.length,
+      total: items.length,
+      nextOffset: null,
     },
   };
 }
@@ -848,11 +936,51 @@ function functionUsersPayload(index, node) {
   };
 }
 
-function moduleFunctionsPayload(index, module) {
+function moduleFunctionDetailMode(url) {
+  const detail = lowerSearch(url.searchParams.get('detail')) || 'full';
+  if (detail !== 'full' && detail !== 'summary') {
+    throw apiError(400, 'invalid_query', 'detail must be full or summary.');
+  }
+  return detail;
+}
+
+function filteredFunctionNodes(index, url, { requireSearch = false, modulePath } = {}) {
+  const search = lowerSearch(url.searchParams.get('search') || url.searchParams.get('q'));
+  if (requireSearch && !search) throw apiError(400, 'missing_query', 'Provide q or search.');
+  const exactName = normalizeString(url.searchParams.get('name')).trim();
+  const kind = lowerSearch(url.searchParams.get('kind'));
+  const component = parseBoolean(url.searchParams.get('component'), 'component');
+  const userCount = parseExactCountParam(url.searchParams, 'userCount');
+  const dependencyCount = parseExactCountParam(url.searchParams, 'dependencyCount');
+  const explicitModulePath = modulePath || normalizeString(url.searchParams.get('modulePath')).trim();
+  const moduleFilter = explicitModulePath ? getModuleByPath(index, explicitModulePath).path : '';
+  return index.functions
+    .filter((node) => !moduleFilter || node.modulePath === moduleFilter)
+    .filter((node) => !exactName || node.name === exactName)
+    .filter((node) => !search || [
+      node.name,
+      node.declarationName,
+      node.modulePath,
+    ].some((value) => lowerSearch(value).includes(search)))
+    .filter((node) => !kind || lowerSearch(node.kind) === kind)
+    .filter((node) => component == null || node.component === component)
+    .filter((node) => userCount == null || (index.usersByFunctionId.get(node.id) || []).length === userCount)
+    .filter((node) => (
+      dependencyCount == null || (index.dependenciesByFunctionId.get(node.id) || []).length === dependencyCount
+    ));
+}
+
+function moduleFunctionsPayload(index, module, url) {
+  const detail = moduleFunctionDetailMode(url);
+  const page = optionallyPaginated(filteredFunctionNodes(index, url, { modulePath: module.path }), url);
   return {
     module: index.moduleSummary(module),
     staticAnalysis: functionDependencySemantics(index),
-    functions: (index.functionsByModulePath.get(module.path) || []).map((node) => functionDetail(index, node)),
+    detail,
+    functions: page.items.map((node) => (
+      detail === 'summary' ? createFunctionSummary(index, node) : functionDetail(index, node)
+    )),
+    pagination: page.pagination,
   };
 }
 
@@ -863,21 +991,7 @@ function getFunctionById(index, id) {
 }
 
 function functionList(index, url, { requireSearch = false, modulePath } = {}) {
-  const search = lowerSearch(url.searchParams.get('search') || url.searchParams.get('q'));
-  if (requireSearch && !search) throw apiError(400, 'missing_query', 'Provide q or search.');
-  const kind = lowerSearch(url.searchParams.get('kind'));
-  const component = parseBoolean(url.searchParams.get('component'), 'component');
-  const explicitModulePath = modulePath || normalizeString(url.searchParams.get('modulePath')).trim();
-  const moduleFilter = explicitModulePath ? getModuleByPath(index, explicitModulePath).path : '';
-  const items = index.functions
-    .filter((node) => !moduleFilter || node.modulePath === moduleFilter)
-    .filter((node) => !search || [
-      node.name,
-      node.declarationName,
-      node.modulePath,
-    ].some((value) => lowerSearch(value).includes(search)))
-    .filter((node) => !kind || lowerSearch(node.kind) === kind)
-    .filter((node) => component == null || node.component === component)
+  const items = filteredFunctionNodes(index, url, { requireSearch, modulePath })
     .map((node) => createFunctionSummary(index, node));
   return {
     ...paginated(items, url),
@@ -885,15 +999,18 @@ function functionList(index, url, { requireSearch = false, modulePath } = {}) {
   };
 }
 
-function symbolList(index, url, { requireSearch = false, modulePath } = {}) {
+function filteredSymbols(index, url, { requireSearch = false, modulePath } = {}) {
   const search = lowerSearch(url.searchParams.get('search') || url.searchParams.get('q'));
   if (requireSearch && !search) throw apiError(400, 'missing_query', 'Provide q or search.');
+  const exactName = normalizeString(url.searchParams.get('name')).trim();
   const kind = lowerSearch(url.searchParams.get('kind'));
   const sourceOrigin = lowerSearch(url.searchParams.get('sourceOrigin'));
+  const referenceCount = parseExactCountParam(url.searchParams, 'referenceCount');
   const explicitModulePath = modulePath || normalizeString(url.searchParams.get('modulePath')).trim();
   const moduleFilter = explicitModulePath ? getModuleByPath(index, explicitModulePath).path : '';
-  const items = index.symbols
+  return index.symbols
     .filter((symbol) => !moduleFilter || symbol.modulePath === moduleFilter)
+    .filter((symbol) => !exactName || symbol.name === exactName)
     .filter((symbol) => !search || [
       symbol.name,
       symbol.declarationName,
@@ -902,6 +1019,11 @@ function symbolList(index, url, { requireSearch = false, modulePath } = {}) {
     ].some((value) => lowerSearch(value).includes(search)))
     .filter((symbol) => !kind || lowerSearch(symbol.kind) === kind)
     .filter((symbol) => !sourceOrigin || lowerSearch(symbol.sourceOrigin) === sourceOrigin)
+    .filter((symbol) => referenceCount == null || symbol.referenceCount === referenceCount);
+}
+
+function symbolList(index, url, { requireSearch = false, modulePath } = {}) {
+  const items = filteredSymbols(index, url, { requireSearch, modulePath })
     .map(createSymbolSummary);
   return paginated(items, url);
 }
@@ -974,55 +1096,92 @@ function handleApiRequest({ request, response, index, outDir }) {
   }
   const resource = parts[2] || '';
 
-  if (!resource) return sendApiData(response, discovery(index));
-  if (resource === 'run' && parts.length === 3) return sendApiData(response, runMetadata(index, outDir));
+  if (!resource) {
+    rejectUnknownQueryParams(url, []);
+    return sendApiData(response, discovery(index));
+  }
+  if (resource === 'run' && parts.length === 3) {
+    rejectUnknownQueryParams(url, []);
+    return sendApiData(response, runMetadata(index, outDir));
+  }
   if (resource === 'modules') {
-    if (parts.length === 3) return sendApiData(response, moduleList(index, url));
+    if (parts.length === 3) {
+      rejectUnknownQueryParams(url, MODULE_LIST_QUERY_PARAMS);
+      return sendApiData(response, moduleList(index, url));
+    }
     const module = getModuleById(index, parts[3]);
-    if (parts.length === 4) return sendApiData(response, moduleDetail(index, module));
+    if (parts.length === 4) {
+      rejectUnknownQueryParams(url, []);
+      return sendApiData(response, moduleDetail(index, module));
+    }
     if (parts.length === 5 && parts[4] === 'dependencies') {
+      rejectUnknownQueryParams(url, []);
       return sendApiData(response, moduleRelationPayload(index, module));
     }
     if (parts.length === 5 && parts[4] === 'dependents') {
+      rejectUnknownQueryParams(url, []);
       return sendApiData(response, moduleDependentsPayload(index, module));
     }
     if (parts.length === 5 && parts[4] === 'functions') {
-      return sendApiData(response, moduleFunctionsPayload(index, module));
+      rejectUnknownQueryParams(url, MODULE_FUNCTION_QUERY_PARAMS);
+      return sendApiData(response, moduleFunctionsPayload(index, module, url));
     }
     if (parts.length === 5 && parts[4] === 'source') {
+      rejectUnknownQueryParams(url, SOURCE_QUERY_PARAMS);
       return sendApiData(response, sourceExcerpt(index, module, url));
     }
   }
   if (resource === 'source' && parts.length === 3) {
+    rejectUnknownQueryParams(url, SOURCE_BY_PATH_QUERY_PARAMS);
     const module = getModuleByPath(index, url.searchParams.get('path'));
     return sendApiData(response, sourceExcerpt(index, module, url));
   }
   if (resource === 'symbols') {
-    if (parts.length === 3) return sendApiData(response, symbolList(index, url));
+    if (parts.length === 3) {
+      rejectUnknownQueryParams(url, SYMBOL_LIST_QUERY_PARAMS);
+      return sendApiData(response, symbolList(index, url));
+    }
     if (parts.length === 4 && parts[3] === 'search') {
+      rejectUnknownQueryParams(url, SYMBOL_LIST_QUERY_PARAMS);
       return sendApiData(response, symbolList(index, url, { requireSearch: true }));
     }
     const symbol = getSymbolById(index, parts[3]);
-    if (parts.length === 4) return sendApiData(response, symbolDetail(symbol));
+    if (parts.length === 4) {
+      rejectUnknownQueryParams(url, []);
+      return sendApiData(response, symbolDetail(symbol));
+    }
     if (parts.length === 5 && (parts[4] === 'references' || parts[4] === 'callers')) {
+      rejectUnknownQueryParams(url, []);
       return sendApiData(response, symbolReferences(symbol));
     }
   }
   if (resource === 'functions') {
-    if (parts.length === 3) return sendApiData(response, functionList(index, url));
+    if (parts.length === 3) {
+      rejectUnknownQueryParams(url, FUNCTION_LIST_QUERY_PARAMS);
+      return sendApiData(response, functionList(index, url));
+    }
     if (parts.length === 4 && parts[3] === 'search') {
+      rejectUnknownQueryParams(url, FUNCTION_LIST_QUERY_PARAMS);
       return sendApiData(response, functionList(index, url, { requireSearch: true }));
     }
     const node = getFunctionById(index, parts[3]);
-    if (parts.length === 4) return sendApiData(response, functionDetail(index, node));
+    if (parts.length === 4) {
+      rejectUnknownQueryParams(url, []);
+      return sendApiData(response, functionDetail(index, node));
+    }
     if (parts.length === 5 && parts[4] === 'dependencies') {
+      rejectUnknownQueryParams(url, []);
       return sendApiData(response, functionDependenciesPayload(index, node));
     }
     if (parts.length === 5 && parts[4] === 'users') {
+      rejectUnknownQueryParams(url, []);
       return sendApiData(response, functionUsersPayload(index, node));
     }
   }
-  if (resource === 'query' && parts.length === 3) return sendApiData(response, queryPayload(index, url));
+  if (resource === 'query' && parts.length === 3) {
+    rejectUnknownQueryParams(url, QUERY_AGGREGATE_PARAMS);
+    return sendApiData(response, queryPayload(index, url));
+  }
 
   throw apiError(404, 'not_found', 'API route not found.');
 }

@@ -105,6 +105,11 @@ function resolveSpecifierExpression(expression, constants) {
   return '';
 }
 
+function isSupportedLocalSpecifier(specifier) {
+  const value = normalizeString(specifier).trim();
+  return value.startsWith('./') || value.startsWith('../') || value.startsWith('/');
+}
+
 function inferredNamedBinding(name, local = name) {
   const importedName = normalizeJsIdentifier(name);
   const localName = normalizeJsIdentifier(local);
@@ -227,6 +232,7 @@ export function extractImportRefs(source) {
   const assignedRequirePattern = new RegExp(`\\b(?:const|let|var)\\s+(\\{[^}]*\\}|[A-Za-z_$][A-Za-z0-9_$]*)\\s*=\\s*require\\s*\\(\\s*(${specifierExpression})\\s*\\)`, 'g');
   const requirePattern = new RegExp(`\\brequire\\s*\\(\\s*(${specifierExpression})\\s*\\)`, 'g');
   const lazyModuleCallPattern = /\b(?:use|load)[A-Za-z0-9_$]*Module(?:Once)?\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*|['"](?:\\.|[^'"])*['"])/g;
+  const dynamicWrapperPattern = new RegExp(`(?<![\\p{ID_Continue}$])importCreatorBrowserModule\\s*\\(\\s*(${specifierExpression})\\s*,\\s*(${specifierExpression})\\s*\\)`, 'gu');
 
   const mark = (specifier) => {
     const value = normalizeString(specifier).trim();
@@ -281,6 +287,22 @@ export function extractImportRefs(source) {
     if (!startsInCode(masked, match.index)) continue;
     const specifier = mark(resolveSpecifierExpression(match[1], constants));
     pushImportRef(refs, { specifier, kind: 'require' });
+  }
+  while ((match = dynamicWrapperPattern.exec(text))) {
+    if (!startsInCode(masked, match.index)) continue;
+    const previousIndex = previousSignificantIndex(masked, match.index);
+    if (previousIndex !== -1 && (masked[previousIndex] === '.' || masked[previousIndex] === '#')) continue;
+    const specifiers = [
+      resolveSpecifierExpression(match[1], constants),
+      resolveSpecifierExpression(match[2], constants),
+    ];
+    if (!specifiers.every(isSupportedLocalSpecifier)) continue;
+    for (const specifier of specifiers) {
+      pushImportRef(refs, {
+        specifier: mark(specifier),
+        kind: 'dynamic-wrapper',
+      });
+    }
   }
   while ((match = lazyModuleCallPattern.exec(text))) {
     if (!startsInCode(masked, match.index)) continue;
@@ -557,10 +579,21 @@ export function maskIgnorableSyntax(text) {
 
 function isNonReferenceIdentifierLocation(masked, startIndex, endIndex) {
   const previousIndex = previousSignificantIndex(masked, startIndex);
-  if (previousIndex !== -1 && (masked[previousIndex] === '.' || masked[previousIndex] === '#')) return true;
+  if (previousIndex !== -1 && masked[previousIndex] === '#') return true;
+  if (previousIndex !== -1 && masked[previousIndex] === '.' && !isSpreadTokenBefore(masked, previousIndex)) {
+    return true;
+  }
 
   const nextIndex = findNextNonWhitespace(masked, endIndex);
   return masked[nextIndex] === ':' && ['{', ','].includes(masked[previousIndex]);
+}
+
+function isSpreadTokenBefore(text, dotIndex) {
+  if (text[dotIndex] !== '.') return false;
+  const secondDotIndex = previousSignificantIndex(text, dotIndex);
+  if (text[secondDotIndex] !== '.') return false;
+  const firstDotIndex = previousSignificantIndex(text, secondDotIndex);
+  return text[firstDotIndex] === '.';
 }
 
 function identifierReferenceMatches(source, identifier) {
