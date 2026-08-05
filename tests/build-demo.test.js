@@ -38,15 +38,17 @@ test('buildDemoSite publishes a Bundless React app with its IronGlancer analysis
   assert.equal(output.entry, 'main.jsx');
   assert.deepEqual(
     output.importEdges.map((edge) => `${edge.source}->${edge.target}`),
-    ['App->Counter', 'App->FeatureList', 'main->App'],
+    ['App->BudgetSummary', 'App->PantryChecklist', 'App->RecommendationPanel', 'App->ShoppingList', 'main->App'],
   );
   assert.ok(output.importEdges.every((edge) => edge.loadKinds.includes('dynamic')));
   assert.deepEqual(
     output.jsxScripts.map((script) => script.path),
     [
       'App.jsx',
-      'Counter.jsx',
-      'FeatureList.jsx',
+      'components/BudgetSummary.jsx',
+      'components/PantryChecklist.jsx',
+      'components/RecommendationPanel.jsx',
+      'components/ShoppingList.jsx',
       'main.jsx',
     ],
   );
