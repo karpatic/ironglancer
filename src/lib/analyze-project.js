@@ -104,6 +104,26 @@ const PLATFORM_IMPORT_SPECIFIERS = new Set([
   'worker_threads',
   'zlib',
 ]);
+const BROWSER_PLATFORM_NAMESPACES = new Map([
+  ['window', 'browser:window'],
+  ['document', 'browser:document'],
+  ['navigator', 'browser:navigator'],
+  ['localStorage', 'browser:localStorage'],
+  ['sessionStorage', 'browser:sessionStorage'],
+  ['Intl', 'browser:Intl'],
+  ['URL', 'browser:URL'],
+  ['Math', 'browser:Math'],
+  ['console', 'browser:console'],
+]);
+const BROWSER_PLATFORM_IDENTIFIERS = new Map([
+  ['Date', 'browser:Date'],
+  ['fetch', 'browser:fetch'],
+  ['setTimeout', 'browser:timers'],
+  ['clearTimeout', 'browser:timers'],
+  ['setInterval', 'browser:timers'],
+  ['clearInterval', 'browser:timers'],
+  ['requestAnimationFrame', 'browser:animation-frame'],
+]);
 
 async function loadImportAliases(rootDir, entryRel = '') {
   const aliases = new Map();
@@ -3095,6 +3115,37 @@ function compactExternalReferenceEvidence({
   };
 }
 
+function compactBrowserPlatformReferenceEvidence({
+  importerRecord,
+  sourceDescriptor,
+  specifier,
+  importedName,
+  localName,
+  referenceLocations,
+}) {
+  const usages = compactReferenceUsages(importerRecord, referenceLocations);
+  const syntaxKinds = syntaxKindsForUsages(usages);
+  return {
+    category: 'platform',
+    resolution: 'platform',
+    unresolvedReason: null,
+    specifier,
+    loadKind: 'browser-global',
+    bindingKind: 'browser-global',
+    importedName,
+    localName,
+    modulePath: sourceDescriptor.node.modulePath,
+    functionId: sourceDescriptor.node.id,
+    functionStableId: sourceDescriptor.node.stableId || null,
+    functionName: sourceDescriptor.node.name,
+    referenceCount: Array.isArray(referenceLocations) ? referenceLocations.length : 0,
+    relationKind: relationKindForSyntaxKinds(syntaxKinds),
+    syntaxKinds,
+    usageLines: usageLinesForUsages(usages),
+    usages,
+  };
+}
+
 function compareExternalReferenceEvidence(a, b) {
   return compareLocale(a.category, b.category)
     || compareLocale(a.specifier, b.specifier)
@@ -3164,12 +3215,70 @@ function externalBindingReferenceGroups({ importerRecord, importerSpan, binding,
     : [];
 }
 
+function isMemberPropertyReference(record, location) {
+  const masked = maskIgnorableSyntax(record?.source);
+  return masked[previousNonWhitespaceIndex(masked, location?.index)] === '.';
+}
+
+function browserPlatformReferenceGroups({ importerRecord, importerSpan }) {
+  const groups = [];
+  for (const [namespaceName, specifier] of BROWSER_PLATFORM_NAMESPACES) {
+    for (const [memberName, referenceLocations] of namespaceMemberReferenceLocations(
+      importerRecord,
+      importerSpan,
+      namespaceName,
+    )) {
+      if (referenceLocations.length === 0) continue;
+      groups.push({
+        specifier,
+        importedName: memberName,
+        localName: `${namespaceName}.${memberName}`,
+        referenceLocations,
+      });
+    }
+  }
+
+  for (const [identifier, specifier] of BROWSER_PLATFORM_IDENTIFIERS) {
+    const referenceLocations = declarationReferenceLocations(importerRecord, importerSpan, identifier)
+      .filter((location) => !isMemberPropertyReference(importerRecord, location));
+    if (referenceLocations.length === 0) continue;
+    groups.push({
+      specifier,
+      importedName: identifier,
+      localName: identifier,
+      referenceLocations,
+    });
+  }
+  return groups;
+}
+
 function buildExternalFunctionReferenceEvidence(graph, { bySpanKey }) {
   const evidenceByFunctionId = new Map();
   for (const importerRecord of graph.modules.values()) {
     const importerSpans = declarationSpans(importerRecord)
       .filter((span) => ['function', 'arrow'].includes(span?.kind));
     if (importerSpans.length === 0) continue;
+
+    for (const importerSpan of importerSpans) {
+      const sourceDescriptor = bySpanKey.get(functionSpanKey(importerRecord, importerSpan));
+      if (!sourceDescriptor) continue;
+      for (const group of browserPlatformReferenceGroups({ importerRecord, importerSpan })) {
+        if (!evidenceByFunctionId.has(sourceDescriptor.node.id)) {
+          evidenceByFunctionId.set(sourceDescriptor.node.id, new Map());
+        }
+        mergeExternalReferenceEvidence(
+          evidenceByFunctionId.get(sourceDescriptor.node.id),
+          compactBrowserPlatformReferenceEvidence({
+            importerRecord,
+            sourceDescriptor,
+            specifier: group.specifier,
+            importedName: group.importedName,
+            localName: group.localName,
+            referenceLocations: group.referenceLocations,
+          }),
+        );
+      }
+    }
 
     for (const ref of Array.isArray(importerRecord.importRefs) ? importerRecord.importRefs : []) {
       const resolution = normalizeString(ref?.resolution).trim();
@@ -3465,6 +3574,47 @@ function buildMermaid(graph, importEdges, declarationImportMetrics, { reachableO
   return lines.join('\n');
 }
 
+function declarationSpanForFunctionNode(record, functionNode = {}) {
+  return declarationSpans(record)
+    .find((span) => (
+      ['function', 'arrow'].includes(span?.kind)
+      && span.kind === functionNode.kind
+      && span.name === functionNode.declarationName
+      && span.startLine === functionNode.startLine
+      && span.endLine === functionNode.endLine
+    )) || null;
+}
+
+function functionNodeModuleId(functionNode = {}) {
+  return compactStableId('mod', [functionNode.modulePath]);
+}
+
+function sourceDeclarationEntryForFunctionNode({
+  graph,
+  functionNode,
+  declarationImportMetrics,
+  declarationRelationships,
+}) {
+  const record = graph.modules.get(functionNode?.modulePath);
+  const span = declarationSpanForFunctionNode(record, functionNode);
+  if (!record || !span) return null;
+  return sourceDeclarationEntry({
+    moduleId: functionNodeModuleId(functionNode),
+    visibleName: functionNode.name,
+    record,
+    span,
+    declarationName: functionNode.declarationName || functionNode.name,
+    sourceOrigin: 'saved-function',
+    metrics: declarationImportMetricsFor(declarationImportMetrics, record, functionNode.declarationName || functionNode.name),
+    relationships: declarationRelationshipsFor(
+      declarationRelationships,
+      record,
+      functionNode.declarationName || functionNode.name,
+    ),
+    functionNode,
+  });
+}
+
 function buildSourceCode(graph, declarationImportMetrics, declarationRelationships, functionDependencyMap) {
   const jsxModules = jsxModuleRecords(graph, { reachableOnly: true });
   const classIds = buildClassIds(jsxModules);
@@ -3480,7 +3630,13 @@ function buildSourceCode(graph, declarationImportMetrics, declarationRelationshi
   const seen = new Set();
 
   const pushEntry = (entry) => {
-    const key = entry && `${entry.moduleId}\u0000${entry.sourceOrigin}\u0000${entry.name}`;
+    const key = entry && [
+      entry.moduleId,
+      entry.sourceOrigin,
+      entry.functionId || entry.name,
+      entry.startLine,
+      entry.endLine,
+    ].join('\u0000');
     if (!entry || seen.has(key)) return;
     seen.add(key);
     declarations.push(entry);
@@ -3510,6 +3666,22 @@ function buildSourceCode(graph, declarationImportMetrics, declarationRelationshi
         functionNode: functionNodeForDeclaration(functionNodes, record, span, component),
       }));
     }
+  }
+
+  const representedFunctionIds = new Set(declarations
+    .map((entry) => normalizeString(entry.functionId).trim())
+    .filter(Boolean));
+  for (const functionNode of Array.isArray(functionDependencyMap?.functions) ? functionDependencyMap.functions : []) {
+    if (representedFunctionIds.has(functionNode.id)) continue;
+    const entry = sourceDeclarationEntryForFunctionNode({
+      graph,
+      functionNode,
+      declarationImportMetrics,
+      declarationRelationships,
+    });
+    if (!entry) continue;
+    pushEntry(entry);
+    if (entry.functionId) representedFunctionIds.add(entry.functionId);
   }
 
   return { modules, declarations };

@@ -169,6 +169,7 @@ function analysisPayload(analysis) {
     jsxScripts: analysis.jsxScripts,
     mermaid: analysis.mermaid,
     importEdges: analysis.importEdges,
+    functionMap: functionDependencyPayload(analysis.functionDependencyMap),
     summary: analysis.summary,
   };
 }
