@@ -2,6 +2,7 @@
 import { realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
+import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 
 import { loadStaticAnalysisRun } from './lib/serve-static-site.js';
@@ -423,50 +424,31 @@ function createServer(options) {
 }
 
 function writeMessage(message) {
-  const body = JSON.stringify(message);
-  process.stdout.write(`Content-Length: ${Buffer.byteLength(body, 'utf8')}\r\n\r\n${body}`);
+  process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
-function headerEndIndex(buffer) {
-  return buffer.indexOf('\r\n\r\n');
-}
-
-function contentLengthFromHeader(header) {
-  const match = header.match(/content-length:\s*(\d+)/i);
-  return match ? Number(match[1]) : null;
-}
-
-function runStdioServer(options) {
+async function runStdioServer(options) {
   const server = createServer(options);
-  let buffer = Buffer.alloc(0);
-  process.stdin.on('data', async (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    while (true) {
-      const end = headerEndIndex(buffer);
-      if (end === -1) return;
-      const header = buffer.slice(0, end).toString('utf8');
-      const length = contentLengthFromHeader(header);
-      if (!Number.isInteger(length)) {
-        buffer = Buffer.alloc(0);
-        return;
-      }
-      const bodyStart = end + 4;
-      const bodyEnd = bodyStart + length;
-      if (buffer.length < bodyEnd) return;
-      const body = buffer.slice(bodyStart, bodyEnd).toString('utf8');
-      buffer = buffer.slice(bodyEnd);
-      try {
-        const response = await server.handle(JSON.parse(body));
-        if (response) writeMessage(response);
-      } catch (error) {
-        writeMessage({
-          jsonrpc: '2.0',
-          id: null,
-          error: { code: -32700, message: error?.message || String(error) },
-        });
-      }
-    }
+
+  const lines = createInterface({
+    input: process.stdin,
+    crlfDelay: Infinity,
+    terminal: false,
   });
+
+  for await (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const response = await server.handle(JSON.parse(line));
+      if (response) writeMessage(response);
+    } catch (error) {
+      writeMessage({
+        jsonrpc: '2.0',
+        id: null,
+        error: { code: -32700, message: error?.message || String(error) },
+      });
+    }
+  }
 }
 
 const options = parseArgs();
@@ -475,5 +457,10 @@ if (options.help) {
 } else {
   const isMain = process.argv[1]
     && pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url;
-  if (isMain) runStdioServer(options);
+  if (isMain) {
+    runStdioServer(options).catch((error) => {
+      process.stderr.write(`${error?.stack || error}\n`);
+      process.exitCode = 1;
+    });
+  }
 }

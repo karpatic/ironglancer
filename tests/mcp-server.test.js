@@ -10,16 +10,26 @@ import { generateStaticSite } from '../src/lib/generate-static-site.js';
 const fixtureRoot = path.resolve('tests/fixtures/sample-app');
 
 function encodeMcpMessage(message) {
-  const body = JSON.stringify(message);
-  return `Content-Length: ${Buffer.byteLength(body, 'utf8')}\r\n\r\n${body}`;
+  return `${JSON.stringify(message)}\n`;
+}
+
+function withTimeout(promise, message, ms = 2000) {
+  let timeout;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeout = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeout));
 }
 
 function createMcpClient(analysisDir) {
   const child = spawn(process.execPath, ['src/mcp-server.mjs', '--analysis-dir', analysisDir], {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
-  let buffer = Buffer.alloc(0);
+  let buffer = '';
   let stderr = '';
+  const exitPromise = new Promise((resolve) => {
+    child.once('exit', (code, signal) => resolve({ code, signal }));
+  });
   child.stderr.on('data', (chunk) => {
     stderr += chunk.toString('utf8');
   });
@@ -27,23 +37,17 @@ function createMcpClient(analysisDir) {
   const readMessage = () => new Promise((resolve, reject) => {
     const onExit = () => reject(new Error(stderr || 'MCP server exited before responding.'));
     const onData = (chunk) => {
-      buffer = Buffer.concat([buffer, chunk]);
-      const headerEnd = buffer.indexOf('\r\n\r\n');
-      if (headerEnd === -1) return;
-      const header = buffer.slice(0, headerEnd).toString('utf8');
-      const length = Number(header.match(/content-length:\s*(\d+)/i)?.[1]);
-      if (!Number.isInteger(length)) {
-        cleanup();
-        reject(new Error('MCP response missing Content-Length.'));
-        return;
-      }
-      const bodyStart = headerEnd + 4;
-      const bodyEnd = bodyStart + length;
-      if (buffer.length < bodyEnd) return;
-      const body = buffer.slice(bodyStart, bodyEnd).toString('utf8');
-      buffer = buffer.slice(bodyEnd);
+      buffer += chunk.toString('utf8');
+      const lineEnd = buffer.indexOf('\n');
+      if (lineEnd === -1) return;
+      const line = buffer.slice(0, lineEnd).replace(/\r$/, '');
+      buffer = buffer.slice(lineEnd + 1);
       cleanup();
-      resolve(JSON.parse(body));
+      try {
+        resolve(JSON.parse(line));
+      } catch (error) {
+        reject(new Error(`MCP response was not newline-delimited JSON: ${line}`));
+      }
     };
     const cleanup = () => {
       child.stdout.off('data', onData);
@@ -56,17 +60,22 @@ function createMcpClient(analysisDir) {
   return {
     child,
     async request(message) {
-      const response = readMessage();
+      const response = withTimeout(readMessage(), `MCP server did not respond to ${message.method}.`);
       child.stdin.write(encodeMcpMessage(message));
       return response;
     },
-    close() {
-      child.kill();
+    notify(message) {
+      child.stdin.write(encodeMcpMessage(message));
+    },
+    async close() {
+      if (child.exitCode !== null) return { code: child.exitCode, signal: child.signalCode };
+      child.stdin.end();
+      return withTimeout(exitPromise, stderr || 'MCP server did not exit after stdin closed.');
     },
   };
 }
 
-test('ironglancer MCP server exposes saved function placement tools over stdio', async () => {
+test('ironglancer MCP server exposes saved function placement tools over newline-delimited stdio', async () => {
   const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-mcp-'));
   await generateStaticSite({ rootDir: fixtureRoot, entry: 'src/app.jsx', outDir });
   const client = createMcpClient(outDir);
@@ -74,9 +83,18 @@ test('ironglancer MCP server exposes saved function placement tools over stdio',
   try {
     const initialized = await client.request({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
     assert.equal(initialized.result.serverInfo.name, 'ironglancer-mcp');
+    client.notify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} });
 
     const list = await client.request({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
-    assert.ok(list.result.tools.some((tool) => tool.name === 'ironglancer_investigate_function_placement'));
+    assert.deepEqual(list.result.tools.map((tool) => tool.name), [
+      'ironglancer_run_summary',
+      'ironglancer_search_functions',
+      'ironglancer_get_function',
+      'ironglancer_investigate_function_placement',
+      'ironglancer_source_excerpt',
+      'ironglancer_viewer_state',
+      'ironglancer_viewer_command',
+    ]);
 
     const search = await client.request({
       jsonrpc: '2.0',
@@ -103,6 +121,7 @@ test('ironglancer MCP server exposes saved function placement tools over stdio',
     const placementPayload = JSON.parse(placement.result.content[0].text);
     assert.equal(placementPayload.placement.groups.callees.projectLocal.length, 2);
   } finally {
-    client.close();
+    const exit = await client.close();
+    assert.deepEqual(exit, { code: 0, signal: null });
   }
 });
