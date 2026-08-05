@@ -7,6 +7,7 @@ What it does
 - resolves relative imports, root-relative imports, import-map aliases, and configurable URL route aliases
 - emits a dependency tree, Mermaid class diagram source, and a browser viewer
 - can stay running as a localhost-first read-only viewer and JSON API over the saved analysis
+- saves function placement/cohesion evidence for human and agent review without claiming runtime call-graph certainty
 - produces static output only: index.html, app.js, output.json, source-code.json, diagram.mmd, vendor/, .ironglancer-api/
 
 Install
@@ -25,6 +26,24 @@ Examples
 - ironglancer ./my-app/src/web/creator --entry app.jsx --route-alias /creator/=
 - ironglancer ./my-app --entry src/app.jsx --out ./ironglancer-site --serve
 - ironglancer ./my-app --serve --host 127.0.0.1 --port 0
+
+Standalone viewer
+- generate the static viewer: `ironglancer ./my-app --entry src/app.jsx --out ./ironglancer-site`
+- serve it with any local file server, or use IronGlancer's server: `ironglancer ./my-app --entry src/app.jsx --out ./ironglancer-site --serve`
+- the viewer works without any agent; clicking a function/source member shows recognized interior calls, static callers, package/platform/unresolved binding evidence, child-helper counts, and a placement review
+
+Standalone agent
+- generate once: `ironglancer ./my-app --entry src/app.jsx --out ./ironglancer-site`
+- run the packaged MCP server over that immutable saved analysis: `ironglancer-mcp --analysis-dir ./ironglancer-site`
+- Hermes example: `hermes mcp add ironglancer --command "ironglancer-mcp --analysis-dir /absolute/path/to/ironglancer-site"`
+- the MCP server does not need a browser or running viewer for analysis tools
+- MCP tools: `ironglancer_run_summary`, `ironglancer_search_functions`, `ironglancer_get_function`, `ironglancer_investigate_function_placement`, `ironglancer_source_excerpt`, `ironglancer_viewer_state`, `ironglancer_viewer_command`
+
+Connected Hermes + viewer
+- start the localhost viewer/API/bridge: `ironglancer ./my-app --entry src/app.jsx --out ./ironglancer-site --serve --host 127.0.0.1 --port 4173`
+- add Hermes with bridge access: `hermes mcp add ironglancer --command "ironglancer-mcp --analysis-dir /absolute/path/to/ironglancer-site --bridge-url http://127.0.0.1:4173/bridge/v1"`
+- MCP analysis tools read saved data directly; viewer tools only read structured viewer state or queue presentation commands such as `focusFunction`, `openFunction`, `highlightFunction`, `scrollToFunction`, and `clearHighlight`
+- `/bridge/v1` is localhost-first and unauthenticated by design; do not bind the server to an untrusted network if you use bridge commands
 
 Library usage
 ```js
@@ -47,6 +66,7 @@ Read-only API
 - the built-in server does not serve `.ironglancer-api/` as static files
 - symbol relation endpoints expose static import/export/reference relationships IronGlancer captures, not runtime call graphs or data lineage
 - function dependency endpoints expose static identifier usage inside declared function spans; direct call, optional-call, tagged-template, and JSX element syntax are labeled when visible, while generic references remain `reference`
+- function placement review distinguishes same-file, project-local, package, platform, and unresolved static evidence where IronGlancer can see lexical import-binding usage; it is a review aid, not runtime ownership proof or definitive dead-code detection
 - unknown API query parameters return HTTP 400 instead of being silently ignored
 - general list pagination uses `limit` and `offset`; explicit `limit` must be between 1 and 200, while `/modules/:id/functions` preserves its legacy all-functions result when both are omitted
 - legacy Base64URL `id` values remain accepted; module, function, symbol, import, and function-edge records also expose compact deterministic `stableId` join keys
@@ -84,6 +104,7 @@ Routes
 - `GET /api/v1/functions/:id`
 - `GET /api/v1/functions/:id/dependencies`
 - `GET /api/v1/functions/:id/users`
+- `GET /api/v1/functions/:id/placement`
 - `GET /api/v1/functions/:id/shortest-path?targetId=<function-id>&maxDepth=10`
 - `GET /api/v1/functions/:id/blast-radius?maxDepth=10&limit=200`
 - `GET /api/v1/search?q=RootApp&match=exact&types=function,occurrence`
@@ -96,6 +117,7 @@ curl 'http://127.0.0.1:4173/api/v1/modules?reachable=true&extension=.jsx'
 curl 'http://127.0.0.1:4173/api/v1/symbols/search?q=RootApp'
 curl 'http://127.0.0.1:4173/api/v1/functions/search?q=RootApp'
 curl 'http://127.0.0.1:4173/api/v1/functions?name=RootApp&dependencyCount=2'
+curl 'http://127.0.0.1:4173/api/v1/functions/<function-id>/placement'
 curl 'http://127.0.0.1:4173/api/v1/modules/<module-id>/functions?detail=summary&limit=25&offset=0'
 ```
 

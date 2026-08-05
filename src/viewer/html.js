@@ -117,6 +117,7 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
       }
       .diagram-canvas path.relation, .diagram-canvas path[data-edge="true"], .diagram-canvas g.edgeLabel { cursor:pointer; }
       .diagram-canvas .source-member-trigger { cursor:pointer; color:var(--accent); fill:var(--accent); font-weight:700; pointer-events:auto; }
+      .diagram-canvas .source-member-trigger.is-agent-highlighted { fill:#b42318; color:#b42318; text-decoration:underline; }
       .diagram-canvas .source-member-metrics {
         display:inline-flex;
         gap:3px;
@@ -204,6 +205,7 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
       }
       .source-dialog-relationship-list { display:grid; gap:5px; margin:0; padding:0; list-style:none; }
       .source-dialog-relationship-list li { font-size:.86rem; overflow-wrap:anywhere; }
+      .source-dialog-relationship-list li.is-placement-summary { font-weight:700; }
       .source-dialog-none { margin:0; color:var(--muted); font-size:.86rem; }
       .source-dialog pre {
         max-height:58vh;

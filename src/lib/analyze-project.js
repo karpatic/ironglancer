@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 
 import {
   extractDeclarationSpans,
@@ -60,7 +61,49 @@ const FUNCTION_DEPENDENCY_LIMITATIONS = [
   'Usage syntax is labeled as call, optional-call, tagged-template, jsx-element, or reference from nearby source syntax; reference entries are not claimed to be definite runtime calls.',
   'Imported targets are limited to statically resolved local imports, dynamic imports, require calls, exact supported Faculty browser import wrappers, and supported lazy-module patterns with resolvable bindings.',
   'Same-module targets are limited to named function declarations and named arrow-function variable declarations discovered in the same file; dynamic property dispatch, aliasing through arbitrary values, and unresolved re-exports are outside this map.',
+  'Placement review is deterministic static affinity evidence; it is a review aid, not a runtime ownership proof or definitive dead-code detector.',
 ];
+const PLATFORM_IMPORT_SPECIFIERS = new Set([
+  'assert',
+  'buffer',
+  'child_process',
+  'cluster',
+  'console',
+  'constants',
+  'crypto',
+  'dgram',
+  'diagnostics_channel',
+  'dns',
+  'domain',
+  'events',
+  'fs',
+  'http',
+  'http2',
+  'https',
+  'inspector',
+  'module',
+  'net',
+  'os',
+  'path',
+  'perf_hooks',
+  'process',
+  'punycode',
+  'querystring',
+  'readline',
+  'repl',
+  'stream',
+  'string_decoder',
+  'timers',
+  'tls',
+  'trace_events',
+  'tty',
+  'url',
+  'util',
+  'v8',
+  'vm',
+  'worker_threads',
+  'zlib',
+]);
 
 async function loadImportAliases(rootDir, entryRel = '') {
   const aliases = new Map();
@@ -1664,6 +1707,7 @@ function sourceDeclarationEntry({
   sourceOrigin,
   metrics = emptyDeclarationImportMetrics(),
   relationships = emptyDeclarationRelationships(),
+  functionNode = null,
 }) {
   const code = declarationSnippet(record, span);
   if (!moduleId || !visibleName || !record?.rel || !code) return null;
@@ -1686,6 +1730,12 @@ function sourceDeclarationEntry({
       ? relationships.importedFunctionUses
       : [],
     importedBy: Array.isArray(relationships.importedBy) ? relationships.importedBy : [],
+    ...(functionNode ? {
+      functionId: functionNode.id,
+      functionStableId: functionNode.stableId || null,
+      functionScopePath: functionNode.scopePath || '',
+      placement: functionNode.placement || null,
+    } : {}),
   };
 }
 
@@ -2505,7 +2555,40 @@ function importedScriptMembersForJsx(record, graph, declarationImportMetrics) {
   return Array.from(members.values()).sort((a, b) => compareLocale(a.name, b.name));
 }
 
-function importedScriptSourceDeclarationsForJsx(record, graph, moduleId, declarationImportMetrics, declarationRelationships) {
+function functionNodeForDeclaration(functionNodesByDeclarationKey, record, span, declarationName) {
+  const key = [
+    normalizeString(record?.rel).trim(),
+    normalizeString(declarationName || span?.name).trim(),
+    normalizeString(span?.kind).trim(),
+    span?.startLine,
+    span?.endLine,
+  ].join('\u0000');
+  return functionNodesByDeclarationKey.get(key) || null;
+}
+
+function functionNodesByDeclarationKey(functionDependencyMap = {}) {
+  const nodes = new Map();
+  for (const node of Array.isArray(functionDependencyMap.functions) ? functionDependencyMap.functions : []) {
+    const key = [
+      normalizeString(node.modulePath).trim(),
+      normalizeString(node.declarationName || node.name).trim(),
+      normalizeString(node.kind).trim(),
+      node.startLine,
+      node.endLine,
+    ].join('\u0000');
+    if (key && !nodes.has(key)) nodes.set(key, node);
+  }
+  return nodes;
+}
+
+function importedScriptSourceDeclarationsForJsx(
+  record,
+  graph,
+  moduleId,
+  declarationImportMetrics,
+  declarationRelationships,
+  functionNodes,
+) {
   const declarations = new Map();
   for (const candidate of importedScriptCandidatesForJsx(record, graph, declarationImportMetrics)) {
     const { name, targetRecord, binding, declarationName, metrics } = candidate;
@@ -2521,6 +2604,7 @@ function importedScriptSourceDeclarationsForJsx(record, graph, moduleId, declara
       sourceOrigin: 'imported-script-member',
       metrics,
       relationships: declarationRelationshipsFor(declarationRelationships, targetRecord, declarationName),
+      functionNode: functionNodeForDeclaration(functionNodes, targetRecord, span, declarationName),
     });
     if (entry && !declarations.has(entry.name)) declarations.set(entry.name, entry);
   }
@@ -2609,6 +2693,33 @@ function buildImportEdges(graph, { reachableOnly = false } = {}) {
 
 function encodedStaticId(value) {
   return Buffer.from(normalizeString(value), 'utf8').toString('base64url');
+}
+
+function compactStableId(prefix, parts) {
+  const digest = createHash('sha256')
+    .update(parts.map((part) => normalizeString(part)).join('\u0000'))
+    .digest('hex')
+    .slice(0, 16);
+  return `${prefix}_${digest}`;
+}
+
+function functionStableIdForNode(node = {}) {
+  return compactStableId('fn', [
+    node.modulePath,
+    node.scopePath,
+    node.name,
+    node.kind,
+  ]);
+}
+
+function withCollisionSafeStableIds(items, stableIdForItem) {
+  const counts = new Map();
+  return items.map((item) => {
+    const baseId = stableIdForItem(item);
+    const ordinal = (counts.get(baseId) || 0) + 1;
+    counts.set(baseId, ordinal);
+    return { ...item, stableId: ordinal === 1 ? baseId : `${baseId}_${ordinal}` };
+  });
 }
 
 function legacyFunctionSpanKey(record, span) {
@@ -2938,19 +3049,381 @@ function buildImportedFunctionEdges(graph, { bySpanKey }) {
   return edgeMap;
 }
 
+function externalSpecifierCategory(specifier) {
+  const raw = normalizeString(specifier).trim();
+  const withoutNodePrefix = raw.startsWith('node:') ? raw.slice('node:'.length) : raw;
+  return raw.startsWith('node:') || PLATFORM_IMPORT_SPECIFIERS.has(withoutNodePrefix)
+    ? 'platform'
+    : 'package';
+}
+
+function placementExternalReferenceCategory(ref = {}) {
+  const resolution = normalizeString(ref.resolution).trim();
+  if (resolution === 'unresolved') return 'unresolved';
+  return externalSpecifierCategory(ref.specifier);
+}
+
+function compactExternalReferenceEvidence({
+  importerRecord,
+  sourceDescriptor,
+  ref,
+  binding,
+  localName,
+  importedName,
+  referenceLocations,
+}) {
+  const usages = compactReferenceUsages(importerRecord, referenceLocations);
+  const syntaxKinds = syntaxKindsForUsages(usages);
+  return {
+    category: placementExternalReferenceCategory(ref),
+    resolution: normalizeString(ref.resolution).trim() || 'external',
+    unresolvedReason: normalizeString(ref.unresolvedReason).trim() || null,
+    specifier: normalizeString(ref.specifier).trim(),
+    loadKind: normalizeString(ref.kind).trim() || 'import',
+    bindingKind: normalizeString(binding?.kind || 'named').trim() || 'named',
+    importedName: normalizeString(importedName || binding?.imported).trim(),
+    localName: normalizeString(localName || binding?.local).trim(),
+    modulePath: sourceDescriptor.node.modulePath,
+    functionId: sourceDescriptor.node.id,
+    functionStableId: sourceDescriptor.node.stableId || null,
+    functionName: sourceDescriptor.node.name,
+    referenceCount: Array.isArray(referenceLocations) ? referenceLocations.length : 0,
+    relationKind: relationKindForSyntaxKinds(syntaxKinds),
+    syntaxKinds,
+    usageLines: usageLinesForUsages(usages),
+    usages,
+  };
+}
+
+function compareExternalReferenceEvidence(a, b) {
+  return compareLocale(a.category, b.category)
+    || compareLocale(a.specifier, b.specifier)
+    || compareLocale(a.localName, b.localName)
+    || compareLocale(a.importedName, b.importedName)
+    || compareLocale(a.bindingKind, b.bindingKind);
+}
+
+function mergeExternalReferenceEvidence(bucket, evidence) {
+  const key = [
+    evidence.category,
+    evidence.resolution,
+    evidence.specifier,
+    evidence.loadKind,
+    evidence.bindingKind,
+    evidence.importedName,
+    evidence.localName,
+  ].join('\u0000');
+  if (!bucket.has(key)) {
+    bucket.set(key, evidence);
+    return;
+  }
+  const existing = bucket.get(key);
+  existing.referenceCount += evidence.referenceCount;
+  const usages = [...existing.usages, ...evidence.usages]
+    .filter((usage, index, all) => (
+      all.findIndex((candidate) => (
+        candidate.line === usage.line && candidate.syntax === usage.syntax
+      )) === index
+    ))
+    .sort((a, b) => a.line - b.line || compareLocale(a.syntax, b.syntax));
+  existing.usages = usages;
+  existing.usageLines = usageLinesForUsages(usages);
+  existing.syntaxKinds = syntaxKindsForUsages(usages);
+  existing.relationKind = relationKindForSyntaxKinds(existing.syntaxKinds);
+}
+
+function externalBindingReferenceGroups({ importerRecord, importerSpan, binding, ref }) {
+  const bindingKind = normalizeString(binding?.kind || 'named').trim() || 'named';
+  if (bindingKind === 'namespace') {
+    return Array.from(namespaceMemberReferenceLocations(
+      importerRecord,
+      importerSpan,
+      binding.local,
+      { binding, ref },
+    ), ([memberName, referenceLocations]) => ({
+      localName: `${binding.local}.${memberName}`,
+      importedName: memberName,
+      referenceLocations,
+    })).filter((group) => group.referenceLocations.length > 0);
+  }
+
+  const localName = normalizeIdentifier(binding?.local);
+  if (!localName) return [];
+  const referenceLocations = declarationReferenceLocations(
+    importerRecord,
+    importerSpan,
+    localName,
+    { binding, ref },
+  );
+  return referenceLocations.length > 0
+    ? [{
+      localName,
+      importedName: normalizeString(binding?.imported).trim(),
+      referenceLocations,
+    }]
+    : [];
+}
+
+function buildExternalFunctionReferenceEvidence(graph, { bySpanKey }) {
+  const evidenceByFunctionId = new Map();
+  for (const importerRecord of graph.modules.values()) {
+    const importerSpans = declarationSpans(importerRecord)
+      .filter((span) => ['function', 'arrow'].includes(span?.kind));
+    if (importerSpans.length === 0) continue;
+
+    for (const ref of Array.isArray(importerRecord.importRefs) ? importerRecord.importRefs : []) {
+      const resolution = normalizeString(ref?.resolution).trim();
+      if (resolution !== 'external' && resolution !== 'unresolved') continue;
+      for (const binding of Array.isArray(ref.bindings) ? ref.bindings : []) {
+        if (!binding?.local) continue;
+        for (const importerSpan of importerSpans) {
+          const sourceDescriptor = bySpanKey.get(functionSpanKey(importerRecord, importerSpan));
+          if (!sourceDescriptor) continue;
+          for (const group of externalBindingReferenceGroups({ importerRecord, importerSpan, binding, ref })) {
+            if (!evidenceByFunctionId.has(sourceDescriptor.node.id)) {
+              evidenceByFunctionId.set(sourceDescriptor.node.id, new Map());
+            }
+            mergeExternalReferenceEvidence(
+              evidenceByFunctionId.get(sourceDescriptor.node.id),
+              compactExternalReferenceEvidence({
+                importerRecord,
+                sourceDescriptor,
+                ref,
+                binding,
+                localName: group.localName,
+                importedName: group.importedName,
+                referenceLocations: group.referenceLocations,
+              }),
+            );
+          }
+        }
+      }
+    }
+  }
+
+  return new Map(Array.from(evidenceByFunctionId, ([functionId, bucket]) => [
+    functionId,
+    Array.from(bucket.values()).sort(compareExternalReferenceEvidence),
+  ]));
+}
+
+function compactPlacementFunctionNode(node = {}) {
+  return {
+    id: node.id,
+    stableId: node.stableId || null,
+    modulePath: node.modulePath,
+    name: node.name,
+    kind: node.kind,
+    component: Boolean(node.component),
+    exported: Boolean(node.exported),
+    startLine: node.startLine,
+    endLine: node.endLine,
+    lineCount: node.lineCount,
+  };
+}
+
+function compactPlacementEdge(edge = {}, functionById = new Map()) {
+  const target = functionById.get(edge.targetId);
+  const source = functionById.get(edge.sourceId);
+  return {
+    id: edge.id,
+    scope: edge.scope,
+    relationKind: edge.relationKind,
+    syntaxKinds: edge.syntaxKinds,
+    usageLines: edge.usageLines,
+    referenceCount: edge.referenceCount,
+    source: source ? compactPlacementFunctionNode(source) : null,
+    target: target ? compactPlacementFunctionNode(target) : null,
+    ...(edge.import ? { import: edge.import } : {}),
+  };
+}
+
+function categoryCount(evidence, category) {
+  return evidence.filter((item) => item.category === category).length;
+}
+
+function hasCallableSyntax(edges, references) {
+  return [...edges, ...references]
+    .some((item) => (Array.isArray(item.syntaxKinds) ? item.syntaxKinds : [])
+      .some((kind) => kind !== 'reference'));
+}
+
+function transitiveInternalHelpersFor(node, sameFileEdgesBySourceId, functionById) {
+  const results = [];
+  const visited = new Set([node.id]);
+  const queue = [{ id: node.id, depth: 0 }];
+  while (queue.length > 0) {
+    const current = queue.shift();
+    for (const edge of sameFileEdgesBySourceId.get(current.id) || []) {
+      const target = functionById.get(edge.targetId);
+      if (!target || visited.has(target.id)) continue;
+      visited.add(target.id);
+      if (target.modulePath === node.modulePath && !target.exported) {
+        results.push({ depth: current.depth + 1, node: target, edge });
+        queue.push({ id: target.id, depth: current.depth + 1 });
+      }
+    }
+  }
+  return results.sort((a, b) => a.depth - b.depth || compareFunctionNode(a.node, b.node));
+}
+
+function placementAssessment({ node, evidence, sameFileDependencies, projectLocalDependencies, sameFileUsers, projectLocalUsers }) {
+  const sameFileEvidence = sameFileDependencies.length + sameFileUsers.length;
+  const projectLocalEvidence = projectLocalDependencies.length + projectLocalUsers.length;
+  const packageEvidence = categoryCount(evidence, 'package');
+  const platformEvidence = categoryCount(evidence, 'platform');
+  const unresolvedEvidence = categoryCount(evidence, 'unresolved');
+  const allEdges = [
+    ...sameFileDependencies,
+    ...projectLocalDependencies,
+    ...sameFileUsers,
+    ...projectLocalUsers,
+  ];
+  const hasCallableEvidence = hasCallableSyntax(allEdges, evidence);
+  const rationale = [];
+  let assessment = 'static-isolated';
+  let summary = 'No saved direct caller, callee, or import-binding reference evidence was found for this function.';
+
+  if (node.exported || node.component) {
+    assessment = 'public-entry-surface';
+    summary = 'This function is exported or component-shaped, so placement should consider the module public surface as well as local helpers.';
+    rationale.push(node.exported ? 'exported declaration' : 'component-shaped declaration');
+  } else if (projectLocalEvidence > sameFileEvidence && projectLocalEvidence > 0) {
+    assessment = 'review-for-extraction';
+    summary = 'Cross-file static evidence outweighs same-file affinity; this function is a candidate for placement review.';
+  } else if (sameFileEvidence > 0 && projectLocalEvidence > 0) {
+    assessment = 'mixed-affinity';
+    summary = 'Both same-file and project-local static evidence point at this function; review nearby callers and imported relationships together.';
+  } else if (sameFileEvidence > 0) {
+    assessment = 'keep-near-current-file';
+    summary = 'Same-file static caller/callee evidence dominates, suggesting this function currently belongs near its surrounding file context.';
+  } else if (projectLocalEvidence > 0) {
+    assessment = 'review-for-extraction';
+    summary = 'Only cross-file caller/callee evidence was found, so the current file placement deserves review.';
+  } else if (packageEvidence + platformEvidence > 0) {
+    assessment = 'external-adapter';
+    summary = 'The function mostly shows package/platform import-binding use; placement depends on whether it is adapting those APIs for this file.';
+  }
+
+  if (sameFileEvidence > 0) rationale.push(`${sameFileEvidence} same-file caller/callee edge${sameFileEvidence === 1 ? '' : 's'}`);
+  if (projectLocalEvidence > 0) rationale.push(`${projectLocalEvidence} project-local cross-file edge${projectLocalEvidence === 1 ? '' : 's'}`);
+  if (packageEvidence > 0) rationale.push(`${packageEvidence} package binding reference${packageEvidence === 1 ? '' : 's'}`);
+  if (platformEvidence > 0) rationale.push(`${platformEvidence} platform binding reference${platformEvidence === 1 ? '' : 's'}`);
+  if (unresolvedEvidence > 0) rationale.push(`${unresolvedEvidence} unresolved import-binding reference${unresolvedEvidence === 1 ? '' : 's'}`);
+  if (rationale.length === 0) rationale.push('no direct static affinity evidence');
+
+  const resolvedEvidence = projectLocalEvidence + sameFileEvidence + packageEvidence + platformEvidence;
+  const confidence = unresolvedEvidence > 0 || !hasCallableEvidence
+    ? 'low'
+    : resolvedEvidence >= 3 ? 'high' : 'medium';
+
+  return {
+    assessment,
+    confidence,
+    summary,
+    rationale,
+  };
+}
+
+function buildFunctionPlacementReview({ functions, edges, externalReferencesByFunctionId }) {
+  const functionById = new Map(functions.map((node) => [node.id, node]));
+  const dependenciesByFunctionId = new Map();
+  const usersByFunctionId = new Map();
+  const sameFileEdgesBySourceId = new Map();
+  for (const edge of edges) {
+    if (!dependenciesByFunctionId.has(edge.sourceId)) dependenciesByFunctionId.set(edge.sourceId, []);
+    if (!usersByFunctionId.has(edge.targetId)) usersByFunctionId.set(edge.targetId, []);
+    dependenciesByFunctionId.get(edge.sourceId).push(edge);
+    usersByFunctionId.get(edge.targetId).push(edge);
+    if (edge.scope === 'same-module') {
+      if (!sameFileEdgesBySourceId.has(edge.sourceId)) sameFileEdgesBySourceId.set(edge.sourceId, []);
+      sameFileEdgesBySourceId.get(edge.sourceId).push(edge);
+    }
+  }
+
+  for (const node of functions) {
+    const dependencies = dependenciesByFunctionId.get(node.id) || [];
+    const users = usersByFunctionId.get(node.id) || [];
+    const sameFileDependencies = dependencies.filter((edge) => edge.scope === 'same-module');
+    const projectLocalDependencies = dependencies.filter((edge) => edge.scope === 'imported');
+    const sameFileUsers = users.filter((edge) => edge.scope === 'same-module');
+    const projectLocalUsers = users.filter((edge) => edge.scope === 'imported');
+    const externalReferences = externalReferencesByFunctionId.get(node.id) || [];
+    const directInternalHelpers = sameFileDependencies
+      .map((edge) => functionById.get(edge.targetId))
+      .filter((target) => target && target.modulePath === node.modulePath && !target.exported)
+      .sort(compareFunctionNode);
+    const transitiveInternalHelpers = transitiveInternalHelpersFor(node, sameFileEdgesBySourceId, functionById);
+    const evidence = {
+      sameFileCalleeCount: sameFileDependencies.length,
+      projectLocalCalleeCount: projectLocalDependencies.length,
+      packageCalleeCount: categoryCount(externalReferences, 'package'),
+      platformCalleeCount: categoryCount(externalReferences, 'platform'),
+      unresolvedCalleeCount: categoryCount(externalReferences, 'unresolved'),
+      sameFileCallerCount: sameFileUsers.length,
+      projectLocalCallerCount: projectLocalUsers.length,
+      internalHelperCount: directInternalHelpers.length,
+      transitiveInternalHelperCount: transitiveInternalHelpers.length,
+      transitiveInternalHelperLineCount: transitiveInternalHelpers
+        .reduce((total, item) => total + (item.node.lineCount || 0), 0),
+    };
+    node.placement = {
+      assessment: placementAssessment({
+        node,
+        evidence: externalReferences,
+        sameFileDependencies,
+        projectLocalDependencies,
+        sameFileUsers,
+        projectLocalUsers,
+      }),
+      evidence,
+      groups: {
+        callees: {
+          sameFile: sameFileDependencies.map((edge) => compactPlacementEdge(edge, functionById)),
+          projectLocal: projectLocalDependencies.map((edge) => compactPlacementEdge(edge, functionById)),
+          package: externalReferences.filter((item) => item.category === 'package'),
+          platform: externalReferences.filter((item) => item.category === 'platform'),
+          unresolved: externalReferences.filter((item) => item.category === 'unresolved'),
+        },
+        callers: {
+          sameFile: sameFileUsers.map((edge) => compactPlacementEdge(edge, functionById)),
+          projectLocal: projectLocalUsers.map((edge) => compactPlacementEdge(edge, functionById)),
+        },
+        internalHelpers: directInternalHelpers.map(compactPlacementFunctionNode),
+        transitiveInternalHelpers: transitiveInternalHelpers.map((item) => ({
+          depth: item.depth,
+          function: compactPlacementFunctionNode(item.node),
+          via: compactPlacementEdge(item.edge, functionById),
+        })),
+      },
+    };
+  }
+}
+
 function buildFunctionDependencyMap(graph) {
   const descriptorIndex = functionNodeDescriptors(graph);
+  const functions = withCollisionSafeStableIds(
+    descriptorIndex.descriptors
+      .map((descriptor) => descriptor.node)
+      .sort(compareFunctionNode),
+    functionStableIdForNode,
+  );
+  const nodeById = new Map(functions.map((node) => [node.id, node]));
+  for (const descriptor of descriptorIndex.descriptors) {
+    const stableNode = nodeById.get(descriptor.node.id);
+    if (stableNode) descriptor.node = stableNode;
+  }
   const sameModuleEdges = buildSameModuleFunctionEdges(descriptorIndex);
   const importedEdges = buildImportedFunctionEdges(graph, descriptorIndex);
   const edges = [
     ...sameModuleEdges.values(),
     ...importedEdges.values(),
   ].sort(compareFunctionEdge);
+  const externalReferencesByFunctionId = buildExternalFunctionReferenceEvidence(graph, descriptorIndex);
+  buildFunctionPlacementReview({ functions, edges, externalReferencesByFunctionId });
   return {
     limitations: FUNCTION_DEPENDENCY_LIMITATIONS,
-    functions: descriptorIndex.descriptors
-      .map((descriptor) => descriptor.node)
-      .sort(compareFunctionNode),
+    functions,
     edges,
   };
 }
@@ -2992,9 +3465,10 @@ function buildMermaid(graph, importEdges, declarationImportMetrics, { reachableO
   return lines.join('\n');
 }
 
-function buildSourceCode(graph, declarationImportMetrics, declarationRelationships) {
+function buildSourceCode(graph, declarationImportMetrics, declarationRelationships, functionDependencyMap) {
   const jsxModules = jsxModuleRecords(graph, { reachableOnly: true });
   const classIds = buildClassIds(jsxModules);
+  const functionNodes = functionNodesByDeclarationKey(functionDependencyMap);
   const modules = moduleRecords(graph)
     .map((record) => ({
       path: record.rel,
@@ -3020,6 +3494,7 @@ function buildSourceCode(graph, declarationImportMetrics, declarationRelationshi
       moduleId,
       declarationImportMetrics,
       declarationRelationships,
+      functionNodes,
     )) {
       pushEntry(entry);
     }
@@ -3032,6 +3507,7 @@ function buildSourceCode(graph, declarationImportMetrics, declarationRelationshi
         sourceOrigin: 'current-file-declaration',
         metrics: declarationImportMetricsFor(declarationImportMetrics, record, component),
         relationships: declarationRelationshipsFor(declarationRelationships, record, component),
+        functionNode: functionNodeForDeclaration(functionNodes, record, span, component),
       }));
     }
   }
@@ -3246,6 +3722,7 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
     graph,
     reachableDeclarationImportMetrics,
     declarationRelationships,
+    functionDependencyMap,
   );
   const treeText = buildTreeText(graph);
   const jsxTreeText = buildJsxTreeText(reachableJsxScripts);

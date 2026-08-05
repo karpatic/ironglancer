@@ -13,7 +13,7 @@ const execFile = promisify(execFileCallback);
 const packageMeta = require('../../package.json');
 const viewerAppUrl = new URL('../viewer/app.js', import.meta.url);
 const API_VERSION = 'v1';
-const SCHEMA_VERSION = '1.1.0';
+const SCHEMA_VERSION = '1.2.0';
 const API_DATA_DIR = '.ironglancer-api';
 
 const CREDENTIAL_VALUE_PATTERNS = [

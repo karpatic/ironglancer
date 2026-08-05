@@ -238,6 +238,51 @@ test('analyzeProject resolves imported aliases to the exact exported declaration
   assert.equal(importedEdge.import.localName, 'Alias');
 });
 
+test('analyzeProject adds deterministic function placement evidence', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import { useMemo } from 'react';",
+      "import { projectHelper } from './project.js';",
+      "import { missingThing } from './missing.js';",
+      '',
+      'export function App() {',
+      '  return useMemo(() => projectHelper() + localHelper() + missingThing(), []);',
+      '}',
+      '',
+      'function localHelper() {',
+      '  return nestedHelper();',
+      '}',
+      '',
+      'function nestedHelper() {',
+      '  return 1;',
+      '}',
+    ].join('\n'),
+    'src/project.js': [
+      'export function projectHelper() {',
+      '  return 2;',
+      '}',
+    ].join('\n'),
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+  const app = result.functionDependencyMap.functions.find((node) => node.name === 'App');
+
+  assert.ok(app);
+  assert.match(app.stableId, /^fn_[a-f0-9]{16}$/);
+  assert.equal(app.placement.assessment.assessment, 'public-entry-surface');
+  assert.equal(app.placement.evidence.sameFileCalleeCount, 1);
+  assert.equal(app.placement.evidence.projectLocalCalleeCount, 1);
+  assert.equal(app.placement.evidence.packageCalleeCount, 1);
+  assert.equal(app.placement.evidence.unresolvedCalleeCount, 1);
+  assert.equal(app.placement.evidence.transitiveInternalHelperCount, 2);
+  assert.deepEqual(app.placement.groups.callees.package.map((item) => item.specifier), ['react']);
+  assert.deepEqual(app.placement.groups.callees.unresolved.map((item) => item.specifier), ['./missing.js']);
+  assert.deepEqual(
+    app.placement.groups.transitiveInternalHelpers.map((item) => `${item.depth}:${item.function.name}`),
+    ['1:localHelper', '2:nestedHelper'],
+  );
+});
+
 test('analyzeProject resolves import-map package prefix aliases with longest-prefix expansion', async () => {
   const rootDir = await writeTempProject({
     'index.html': [

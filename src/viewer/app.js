@@ -48,9 +48,22 @@ const svgNamespace = 'http://www.w3.org/2000/svg';
 const sourceMetricsSuffixPattern = /\s+\[lines:\s*\d+\s*\|\s*refs:\s*\d+\s*\|\s*importers:\s*\d+\]\s*$/i;
 let sourceMemberTargetCounter = 0;
 let sourceMemberTargets = new Map();
+let highlightedSourceRecord = null;
+let viewerBridge = emptyViewerBridge();
 
 function emptySourceDeclarationLookup() {
-  return { byName: new Map(), groups: new Map() };
+  return { byName: new Map(), byFunctionId: new Map(), byFunctionStableId: new Map(), groups: new Map() };
+}
+
+function emptyViewerBridge() {
+  return {
+    enabled: false,
+    url: '',
+    clientId: '',
+    stateRevision: 0,
+    commandRevision: 0,
+    snapshot: null,
+  };
 }
 
 function statCard(label, value) {
@@ -244,17 +257,25 @@ function sourceNavigationGroup(declaration) {
 
 function sourceDeclarationLookupFromPayload(sourcePayload = {}) {
   const byName = new Map();
+  const byFunctionId = new Map();
+  const byFunctionStableId = new Map();
   const groups = new Map();
   for (const declaration of Array.isArray(sourcePayload?.declarations) ? sourcePayload.declarations : []) {
     const moduleId = typeof declaration.moduleId === 'string' ? declaration.moduleId : '';
     const name = typeof declaration.name === 'string' ? declaration.name : '';
     if (moduleId && name && !byName.has(sourceKey(moduleId, name))) byName.set(sourceKey(moduleId, name), declaration);
+    const functionId = typeof declaration.functionId === 'string' ? declaration.functionId : '';
+    const functionStableId = typeof declaration.functionStableId === 'string' ? declaration.functionStableId : '';
+    if (functionId && !byFunctionId.has(functionId)) byFunctionId.set(functionId, declaration);
+    if (functionStableId && !byFunctionStableId.has(functionStableId)) {
+      byFunctionStableId.set(functionStableId, declaration);
+    }
     const group = sourceNavigationGroup(declaration);
     if (!group) continue;
     if (!groups.has(group)) groups.set(group, []);
     groups.get(group).push(declaration);
   }
-  return { byName, groups };
+  return { byName, byFunctionId, byFunctionStableId, groups };
 }
 
 function sourcePayloadMatchesOutput(payload = {}, sourcePayload = {}) {
@@ -613,6 +634,100 @@ function sourceImportedByRelationshipText(relationship = {}, selectedDeclaration
   return parts.join(' ');
 }
 
+function placementFunctionText(ref = {}) {
+  const name = String(ref.name || '').trim();
+  const modulePath = String(ref.modulePath || '').trim();
+  const line = ref.startLine || '?';
+  return callableLabel(name) + (modulePath ? ' in ' + modulePath + ':' + line : '');
+}
+
+function placementEdgeText(edge = {}, direction = 'callee') {
+  const ref = direction === 'caller' ? edge.source : edge.target;
+  const syntax = Array.isArray(edge.syntaxKinds) && edge.syntaxKinds.length > 0
+    ? edge.syntaxKinds.join(', ')
+    : 'static reference';
+  return placementFunctionText(ref) + ' at line ' + (Array.isArray(edge.usageLines) ? edge.usageLines.join(', ') : '?')
+    + ' [' + syntax + ']';
+}
+
+function placementExternalText(item = {}) {
+  const localName = String(item.localName || item.importedName || item.specifier || '').trim();
+  const specifier = String(item.specifier || '').trim();
+  const syntax = Array.isArray(item.syntaxKinds) && item.syntaxKinds.length > 0
+    ? item.syntaxKinds.join(', ')
+    : 'static reference';
+  const reason = item.category === 'unresolved' && item.unresolvedReason ? ' (' + item.unresolvedReason + ')' : '';
+  return callableLabel(localName) + ' from ' + (specifier || item.category || 'external')
+    + reason
+    + ' at line '
+    + (Array.isArray(item.usageLines) ? item.usageLines.join(', ') : '?')
+    + ' [' + syntax + ']';
+}
+
+function placementAssessmentItems(declaration = {}) {
+  const placement = declaration.placement || {};
+  const assessment = placement.assessment || {};
+  const evidence = placement.evidence || {};
+  if (!assessment.assessment) return [];
+  const items = [
+    {
+      text: assessment.assessment + ' (' + (assessment.confidence || 'low') + ')',
+      summary: true,
+    },
+  ];
+  if (assessment.summary) items.push({ text: assessment.summary });
+  const helperCount = evidence.transitiveInternalHelperCount || evidence.internalHelperCount || 0;
+  const helperLines = evidence.transitiveInternalHelperLineCount || 0;
+  items.push({
+    text: 'Callers same-file '
+      + (evidence.sameFileCallerCount || 0)
+      + ', project-local '
+      + (evidence.projectLocalCallerCount || 0)
+      + '; callees same-file '
+      + (evidence.sameFileCalleeCount || 0)
+      + ', project-local '
+      + (evidence.projectLocalCalleeCount || 0)
+      + '; external '
+      + ((evidence.packageCalleeCount || 0) + (evidence.platformCalleeCount || 0))
+      + '; unresolved '
+      + (evidence.unresolvedCalleeCount || 0)
+      + '; internal helpers '
+      + helperCount
+      + (helperLines ? ' across ' + helperLines + ' lines' : ''),
+  });
+  for (const rationale of Array.isArray(assessment.rationale) ? assessment.rationale : []) {
+    items.push({ text: rationale });
+  }
+  return items;
+}
+
+function placementRelationshipItems(declaration = {}, groupName, direction = 'callee') {
+  const placement = declaration.placement || {};
+  const groups = placement.groups || {};
+  if (groupName === 'direct-callees') {
+    const callees = groups.callees || {};
+    return [
+      ...(Array.isArray(callees.sameFile) ? callees.sameFile : []).map((edge) => placementEdgeText(edge, 'callee')),
+      ...(Array.isArray(callees.projectLocal) ? callees.projectLocal : []).map((edge) => placementEdgeText(edge, 'callee')),
+      ...(Array.isArray(callees.package) ? callees.package : []).map(placementExternalText),
+      ...(Array.isArray(callees.platform) ? callees.platform : []).map(placementExternalText),
+      ...(Array.isArray(callees.unresolved) ? callees.unresolved : []).map(placementExternalText),
+    ];
+  }
+  if (groupName === 'callers') {
+    const callers = groups.callers || {};
+    return [
+      ...(Array.isArray(callers.sameFile) ? callers.sameFile : []).map((edge) => placementEdgeText(edge, 'caller')),
+      ...(Array.isArray(callers.projectLocal) ? callers.projectLocal : []).map((edge) => placementEdgeText(edge, 'caller')),
+    ];
+  }
+  if (groupName === 'helpers') {
+    return (Array.isArray(groups.transitiveInternalHelpers) ? groups.transitiveInternalHelpers : [])
+      .map((item) => 'depth ' + item.depth + ': ' + placementFunctionText(item.function));
+  }
+  return [];
+}
+
 function renderSourceDialogRelationshipSection(title, relationships, formatter) {
   const section = document.createElement('section');
   section.className = 'source-dialog-relationship-section';
@@ -633,7 +748,12 @@ function renderSourceDialogRelationshipSection(title, relationships, formatter) 
   list.className = 'source-dialog-relationship-list';
   for (const relationship of items) {
     const item = document.createElement('li');
-    item.textContent = formatter(relationship);
+    if (relationship && typeof relationship === 'object' && relationship.summary) {
+      item.className = 'is-placement-summary';
+      item.textContent = relationship.text;
+    } else {
+      item.textContent = formatter(relationship);
+    }
     list.appendChild(item);
   }
   section.appendChild(list);
@@ -644,6 +764,26 @@ function renderSourceDialogRelationships(declaration) {
   if (!sourceDialogRelationshipsEl) return;
   sourceDialogRelationshipsEl.textContent = '';
   sourceDialogRelationshipsEl.append(
+    renderSourceDialogRelationshipSection(
+      'Placement Review',
+      placementAssessmentItems(declaration),
+      (item) => (item && typeof item === 'object' ? item.text : String(item || '')),
+    ),
+    renderSourceDialogRelationshipSection(
+      'Recognized Interior Calls',
+      placementRelationshipItems(declaration, 'direct-callees'),
+      (item) => String(item || ''),
+    ),
+    renderSourceDialogRelationshipSection(
+      'Recognized Callers',
+      placementRelationshipItems(declaration, 'callers'),
+      (item) => String(item || ''),
+    ),
+    renderSourceDialogRelationshipSection(
+      'Internal Helpers',
+      placementRelationshipItems(declaration, 'helpers'),
+      (item) => String(item || ''),
+    ),
     renderSourceDialogRelationshipSection(
       'Imported Functions Used',
       declaration?.importedFunctionUses,
@@ -685,6 +825,7 @@ function showSourceDialog(declaration, restoreFocusEl) {
     sourceDialogEl.setAttribute('open', '');
   }
   if (sourceDialogCloseBtn && typeof sourceDialogCloseBtn.focus === 'function') sourceDialogCloseBtn.focus();
+  sendViewerBridgeState('open-source');
 }
 
 function navigateSourceDialog(direction) {
@@ -697,6 +838,7 @@ function navigateSourceDialog(direction) {
     index: nextIndex,
   };
   renderSourceDialogDeclaration(declaration);
+  sendViewerBridgeState('navigate-source');
 }
 
 function closeSourceDialog() {
@@ -711,6 +853,7 @@ function closeSourceDialog() {
     sourceDialogEl.removeAttribute('open');
   }
   if (restoreFocusEl && typeof restoreFocusEl.focus === 'function') restoreFocusEl.focus();
+  sendViewerBridgeState('close-source');
 }
 
 function addKeyboardActivation(element, callback) {
@@ -734,6 +877,8 @@ function addSourceActivation(element, declaration) {
 
   element.classList.add('source-member-trigger');
   element.setAttribute('data-source-member-target-id', record.id);
+  if (declaration.functionId) element.setAttribute('data-ironglancer-function-id', declaration.functionId);
+  if (declaration.functionStableId) element.setAttribute('data-ironglancer-function-stable-id', declaration.functionStableId);
   element.setAttribute('tabindex', '0');
   element.setAttribute('role', 'button');
   element.setAttribute('focusable', 'true');
@@ -747,6 +892,221 @@ function addSourceActivation(element, declaration) {
   };
   addKeyboardActivation(element, activate);
   addSourceHitTarget(record, activate);
+}
+
+function sourceRecordForDeclaration(declaration) {
+  if (!declaration) return null;
+  const functionId = String(declaration.functionId || '').trim();
+  const functionStableId = String(declaration.functionStableId || '').trim();
+  return Array.from(sourceMemberTargets.values())
+    .find((record) => (
+      record.declaration === declaration
+      || (functionStableId && record.declaration?.functionStableId === functionStableId)
+      || (functionId && record.declaration?.functionId === functionId)
+    )) || null;
+}
+
+function clearSourceHighlight() {
+  if (!highlightedSourceRecord) return;
+  highlightedSourceRecord.element?.classList?.remove('is-agent-highlighted');
+  highlightedSourceRecord.hitTarget?.classList?.remove('is-agent-highlighted');
+  highlightedSourceRecord = null;
+}
+
+function highlightSourceRecord(record) {
+  clearSourceHighlight();
+  if (!record) return false;
+  highlightedSourceRecord = record;
+  record.element?.classList?.add('is-agent-highlighted');
+  record.hitTarget?.classList?.add('is-agent-highlighted');
+  return true;
+}
+
+function scrollSourceRecordIntoView(record) {
+  const element = record?.element;
+  if (!element) return false;
+  if (typeof element.scrollIntoView === 'function') {
+    element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'smooth' });
+    return true;
+  }
+  return true;
+}
+
+function randomClientId() {
+  const cryptoApi = typeof crypto === 'object' ? crypto : null;
+  if (cryptoApi && typeof cryptoApi.randomUUID === 'function') return cryptoApi.randomUUID();
+  return 'viewer-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+}
+
+function canUseViewerBridge() {
+  return typeof window === 'object'
+    && window.location
+    && /^https?:$/.test(window.location.protocol)
+    && typeof fetch === 'function';
+}
+
+function declarationSnapshot(declaration) {
+  if (!declaration) return null;
+  return {
+    functionId: declaration.functionId || null,
+    functionStableId: declaration.functionStableId || null,
+    modulePath: declaration.modulePath || null,
+    name: declaration.name || declaration.declarationName || null,
+    startLine: declaration.startLine || null,
+    endLine: declaration.endLine || null,
+  };
+}
+
+function currentViewerState(reason) {
+  return {
+    clientId: viewerBridge.clientId,
+    revision: ++viewerBridge.stateRevision,
+    reason,
+    snapshot: viewerBridge.snapshot,
+    openSource: declarationSnapshot(sourceDialogState.declaration),
+    highlighted: declarationSnapshot(highlightedSourceRecord?.declaration),
+    viewport: {
+      zoom,
+      scrollLeft: viewportEl.scrollLeft,
+      scrollTop: viewportEl.scrollTop,
+    },
+  };
+}
+
+async function postViewerBridgeJson(pathname, payload) {
+  if (!viewerBridge.enabled) return null;
+  const response = await fetch(new URL(pathname, viewerBridge.url), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return response.ok ? response.json() : null;
+}
+
+function sendViewerBridgeState(reason) {
+  if (!viewerBridge.enabled) return;
+  postViewerBridgeJson('state', currentViewerState(reason)).catch(() => {});
+}
+
+function declarationForViewerCommand(command = {}) {
+  const targetStableId = String(command.targetStableId || command.functionStableId || '').trim();
+  const targetId = String(command.targetId || command.functionId || '').trim();
+  if (targetStableId) {
+    const declaration = sourceDeclarationLookup.byFunctionStableId.get(targetStableId);
+    if (declaration) return declaration;
+  }
+  if (targetId) {
+    const declaration = sourceDeclarationLookup.byFunctionId.get(targetId);
+    if (declaration) return declaration;
+  }
+  const modulePath = String(command.modulePath || '').trim();
+  const name = String(command.name || command.functionName || '').trim();
+  const line = Number(command.startLine || command.line || 0);
+  if (!modulePath || !name) return null;
+  return Array.from(sourceDeclarationLookup.byFunctionId.values())
+    .find((declaration) => (
+      declaration.modulePath === modulePath
+      && (declaration.name === name || declaration.declarationName === name)
+      && (!line || declaration.startLine === line)
+    )) || null;
+}
+
+function applyViewerBridgeCommand(command = {}) {
+  const type = String(command.type || command.command || '').trim();
+  if (type === 'clearHighlight') {
+    clearSourceHighlight();
+    sendViewerBridgeState('clear-highlight');
+    return { applied: true, message: 'highlight cleared' };
+  }
+
+  const declaration = declarationForViewerCommand(command);
+  const record = sourceRecordForDeclaration(declaration);
+  if (!declaration || !record) return { applied: false, message: 'target function is not visible in this viewer snapshot' };
+
+  if (type === 'openFunction' || type === 'openSource') {
+    highlightSourceRecord(record);
+    scrollSourceRecordIntoView(record);
+    showSourceDialog(declaration, record.element);
+    return { applied: true, message: 'source opened' };
+  }
+  if (type === 'focusFunction') {
+    highlightSourceRecord(record);
+    scrollSourceRecordIntoView(record);
+    sendViewerBridgeState('focus-function');
+    return { applied: true, message: 'function focused' };
+  }
+  if (type === 'highlightFunction') {
+    highlightSourceRecord(record);
+    sendViewerBridgeState('highlight-function');
+    return { applied: true, message: 'function highlighted' };
+  }
+  if (type === 'scrollToFunction') {
+    scrollSourceRecordIntoView(record);
+    sendViewerBridgeState('scroll-function');
+    return { applied: true, message: 'function scrolled into view' };
+  }
+  return { applied: false, message: 'unknown presentation command' };
+}
+
+async function acknowledgeViewerBridgeCommand(commandRecord, result) {
+  await postViewerBridgeJson('ack', {
+    clientId: viewerBridge.clientId,
+    commandId: commandRecord.commandId,
+    commandRevision: commandRecord.revision,
+    status: result.applied ? 'applied' : 'error',
+    message: result.message,
+    stateRevision: viewerBridge.stateRevision,
+  });
+}
+
+async function pollViewerBridgeCommands() {
+  if (!viewerBridge.enabled) return;
+  try {
+    const url = new URL('commands', viewerBridge.url);
+    url.searchParams.set('clientId', viewerBridge.clientId);
+    url.searchParams.set('afterRevision', String(viewerBridge.commandRevision));
+    const response = await fetch(url);
+    if (response.ok) {
+      const payload = await response.json();
+      const records = Array.isArray(payload?.data?.commands) ? payload.data.commands : [];
+      for (const record of records) {
+        viewerBridge.commandRevision = Math.max(viewerBridge.commandRevision, record.revision || 0);
+        const result = applyViewerBridgeCommand(record.command || {});
+        await acknowledgeViewerBridgeCommand(record, result).catch(() => {});
+      }
+    }
+  } catch {
+    // The bridge is best-effort and presentation-only.
+  } finally {
+    if (viewerBridge.enabled) setTimeout(pollViewerBridgeCommands, 750);
+  }
+}
+
+async function initViewerBridge(payload = {}) {
+  if (!canUseViewerBridge()) return;
+  const bridgeUrl = new URL('/bridge/v1/', window.location.href);
+  const snapshot = {
+    buildId: payload.meta?.buildId || null,
+    sourceCodeHash: payload.meta?.sourceCodeHash || null,
+    generatedAt: payload.meta?.generatedAt || null,
+    entry: payload.entry || null,
+  };
+  try {
+    const response = await fetch(bridgeUrl);
+    if (!response.ok) return;
+    viewerBridge = {
+      enabled: true,
+      url: bridgeUrl.href,
+      clientId: randomClientId(),
+      stateRevision: 0,
+      commandRevision: 0,
+      snapshot,
+    };
+    sendViewerBridgeState('ready');
+    pollViewerBridgeCommands();
+  } catch {
+    viewerBridge = emptyViewerBridge();
+  }
 }
 
 function wireSourceMembers() {
@@ -1132,6 +1492,7 @@ async function main() {
   );
   const { svg } = await mermaid.render('ironglancer-diagram-' + Date.now(), payload.mermaid);
   prepareSvgForInteraction(svg, payload.importEdges);
+  initViewerBridge(payload);
 }
 
 downloadBtn.addEventListener('click', () => {

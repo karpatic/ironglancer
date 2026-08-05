@@ -7,7 +7,7 @@ import { maskIgnorableSyntax } from './import-parser.js';
 import { compareLocale, isWithinPath, normalizeString, toPosixPath } from './utils.js';
 
 const API_VERSION = 'v1';
-const DEFAULT_SCHEMA_VERSION = '1.1.0';
+const DEFAULT_SCHEMA_VERSION = '1.2.0';
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 4173;
 const DEFAULT_PAGE_LIMIT = 50;
@@ -21,6 +21,17 @@ const MAX_GRAPH_VISITED = 10_000;
 const DEFAULT_BLAST_LIMIT = 200;
 const MAX_BLAST_LIMIT = 1_000;
 const API_DATA_DIR = '.ironglancer-api';
+const BRIDGE_VERSION = 'v1';
+const MAX_BRIDGE_BODY_BYTES = 64_000;
+const MAX_BRIDGE_COMMANDS = 200;
+const VIEWER_COMMAND_TYPES = new Set([
+  'focusFunction',
+  'openFunction',
+  'openSource',
+  'highlightFunction',
+  'scrollToFunction',
+  'clearHighlight',
+]);
 const PAGINATION_QUERY_PARAMS = ['limit', 'offset'];
 const MODULE_LIST_QUERY_PARAMS = [
   'search', 'q', 'extension', 'reachable', 'jsx', 'sort', 'order', 'fields', ...PAGINATION_QUERY_PARAMS,
@@ -74,6 +85,7 @@ const SYMBOL_LIST_QUERY_PARAMS = [
   ...PAGINATION_QUERY_PARAMS,
 ];
 const FUNCTION_DETAIL_QUERY_PARAMS = ['include'];
+const FUNCTION_PLACEMENT_QUERY_PARAMS = [];
 const QUERY_AGGREGATE_PARAMS = ['modulePath', 'path', 'symbol', 'q', ...PAGINATION_QUERY_PARAMS];
 const UNIFIED_SEARCH_QUERY_PARAMS = ['q', 'match', 'types', 'modulePath', ...PAGINATION_QUERY_PARAMS];
 const UNIFIED_SEARCH_TYPES = ['module', 'function', 'symbol', 'occurrence'];
@@ -90,7 +102,9 @@ const MODULE_SUMMARY_FIELDS = [
 const FUNCTION_SUMMARY_FIELDS = [
   'id', 'stableId', 'moduleId', 'moduleStableId', 'modulePath', 'name', 'declarationName', 'kind', 'component',
   'reachable', 'exported', 'exportedNames', 'exportKinds', 'declarationType', 'standalone',
-  'declarationLine', 'declarationColumn', 'startLine', 'endLine', 'lineCount', 'dependencyCount', 'userCount', 'sourceAvailable',
+  'declarationLine', 'declarationColumn', 'startLine', 'endLine', 'lineCount', 'dependencyCount', 'userCount',
+  'placementAssessment', 'placementConfidence', 'sameFileCalleeCount', 'projectLocalCalleeCount',
+  'sameFileCallerCount', 'projectLocalCallerCount', 'sourceAvailable',
 ];
 const SYMBOL_SUMMARY_FIELDS = [
   'id', 'stableId', 'moduleId', 'modulePath', 'name', 'declarationName', 'kind', 'sourceOrigin', 'startLine', 'endLine',
@@ -107,6 +121,7 @@ const FUNCTION_DEPENDENCY_LIMITATIONS = [
   'Usage syntax is labeled as call, optional-call, tagged-template, jsx-element, or reference from nearby source syntax; reference entries are not claimed to be definite runtime calls.',
   'Imported targets are limited to statically resolved local imports, dynamic imports, require calls, exact supported Faculty browser import wrappers, and supported lazy-module patterns with resolvable bindings.',
   'Same-module targets are limited to named function declarations and named arrow-function variable declarations discovered in the same file; dynamic property dispatch, aliasing through arbitrary values, and unresolved re-exports are outside this map.',
+  'Placement review is deterministic static affinity evidence; it is a review aid, not a runtime ownership proof or definitive dead-code detector.',
 ];
 
 class ApiError extends Error {
@@ -123,11 +138,12 @@ function apiError(status, code, message, details) {
   return new ApiError(status, code, message, details);
 }
 
-function jsonPayload(response, status, payload, { contentType = 'application/json; charset=utf-8' } = {}) {
+function jsonPayload(response, status, payload, { contentType = 'application/json; charset=utf-8', headers = {} } = {}) {
   const body = JSON.stringify(payload, null, 2) + '\n';
   response.writeHead(status, {
     'content-type': contentType,
     'cache-control': 'no-store',
+    ...headers,
   });
   response.end(body);
 }
@@ -153,6 +169,34 @@ function sendApiError(response, error) {
       ...(error?.details === undefined ? {} : { details: error.details }),
     },
   });
+}
+
+function bridgeHeaders(extra = {}) {
+  return {
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET,POST,OPTIONS',
+    'access-control-allow-headers': 'content-type',
+    ...extra,
+  };
+}
+
+function sendBridgeData(response, data, status = 200) {
+  jsonPayload(response, status, { ok: true, data }, { headers: bridgeHeaders() });
+}
+
+function sendBridgeError(response, error) {
+  const status = Number.isInteger(error?.status) ? error.status : 500;
+  const code = typeof error?.code === 'string' ? error.code : 'bridge_error';
+  const message = typeof error?.message === 'string' ? error.message : 'Bridge error.';
+  jsonPayload(response, status, {
+    ok: false,
+    error: { status, code, message },
+  }, { headers: bridgeHeaders() });
+}
+
+function sendBridgeOptions(response) {
+  response.writeHead(204, bridgeHeaders());
+  response.end();
 }
 
 async function readJsonFile(filePath) {
@@ -512,6 +556,129 @@ function normalizeUsageLines(value, usages) {
   return Array.from(new Set(lines.filter(Boolean))).sort((a, b) => a - b);
 }
 
+function normalizeStringList(value) {
+  return Array.isArray(value)
+    ? Array.from(new Set(value.map((item) => normalizeString(item).trim()).filter(Boolean))).sort(compareLocale)
+    : [];
+}
+
+function normalizePlacementAssessment(value = {}) {
+  return {
+    assessment: normalizeString(value.assessment).trim() || 'unknown',
+    confidence: normalizeString(value.confidence).trim() || 'low',
+    summary: normalizeString(value.summary).trim(),
+    rationale: normalizeStringList(value.rationale),
+  };
+}
+
+function normalizePlacementEvidence(value = {}) {
+  const int = (name) => (Number.isInteger(value?.[name]) && value[name] >= 0 ? value[name] : 0);
+  return {
+    sameFileCalleeCount: int('sameFileCalleeCount'),
+    projectLocalCalleeCount: int('projectLocalCalleeCount'),
+    packageCalleeCount: int('packageCalleeCount'),
+    platformCalleeCount: int('platformCalleeCount'),
+    unresolvedCalleeCount: int('unresolvedCalleeCount'),
+    sameFileCallerCount: int('sameFileCallerCount'),
+    projectLocalCallerCount: int('projectLocalCallerCount'),
+    internalHelperCount: int('internalHelperCount'),
+    transitiveInternalHelperCount: int('transitiveInternalHelperCount'),
+    transitiveInternalHelperLineCount: int('transitiveInternalHelperLineCount'),
+  };
+}
+
+function normalizePlacementFunctionRef(value = {}) {
+  const ref = {
+    id: normalizeString(value.id).trim(),
+    stableId: normalizeString(value.stableId).trim() || null,
+    modulePath: normalizeString(value.modulePath).trim(),
+    name: normalizeString(value.name).trim(),
+    kind: normalizeString(value.kind || 'function').trim() || 'function',
+    component: Boolean(value.component),
+    exported: Boolean(value.exported),
+    startLine: Number.isInteger(value.startLine) ? value.startLine : null,
+    endLine: Number.isInteger(value.endLine) ? value.endLine : null,
+    lineCount: Number.isInteger(value.lineCount) ? value.lineCount : null,
+  };
+  return ref.id || ref.stableId || (ref.modulePath && ref.name) ? ref : null;
+}
+
+function normalizePlacementEdgeRef(value = {}) {
+  const syntaxKinds = normalizeStringList(value.syntaxKinds);
+  return {
+    id: normalizeString(value.id).trim(),
+    scope: normalizeString(value.scope).trim(),
+    relationKind: normalizeString(value.relationKind).trim(),
+    syntaxKinds,
+    usageLines: normalizeUsageLines(value.usageLines, value.usages),
+    referenceCount: Number.isInteger(value.referenceCount) ? value.referenceCount : 0,
+    source: normalizePlacementFunctionRef(value.source),
+    target: normalizePlacementFunctionRef(value.target),
+    ...(value.import && typeof value.import === 'object' ? { import: normalizeFunctionImportInfo(value.import) } : {}),
+  };
+}
+
+function normalizePlacementExternalRef(value = {}) {
+  const usages = normalizeUsages(value.usages);
+  const rawSyntaxKinds = Array.isArray(value.syntaxKinds) && value.syntaxKinds.length > 0
+    ? value.syntaxKinds
+    : usages.map((usage) => usage.syntax);
+  const syntaxKinds = normalizeStringList(rawSyntaxKinds);
+  return {
+    category: ['package', 'platform', 'unresolved'].includes(value.category) ? value.category : 'package',
+    resolution: ['external', 'unresolved'].includes(value.resolution) ? value.resolution : 'external',
+    unresolvedReason: normalizeString(value.unresolvedReason).trim() || null,
+    specifier: normalizeString(value.specifier).trim(),
+    loadKind: normalizeString(value.loadKind || 'import').trim() || 'import',
+    bindingKind: normalizeString(value.bindingKind || 'named').trim() || 'named',
+    importedName: normalizeString(value.importedName).trim(),
+    localName: normalizeString(value.localName).trim(),
+    modulePath: normalizeString(value.modulePath).trim(),
+    functionId: normalizeString(value.functionId).trim(),
+    functionStableId: normalizeString(value.functionStableId).trim() || null,
+    functionName: normalizeString(value.functionName).trim(),
+    referenceCount: Number.isInteger(value.referenceCount) ? value.referenceCount : normalizeUsageLines(value.usageLines, usages).length,
+    relationKind: normalizeString(value.relationKind).trim(),
+    syntaxKinds,
+    usageLines: normalizeUsageLines(value.usageLines, usages),
+    usages,
+  };
+}
+
+function normalizePlacementReview(value = {}) {
+  if (!value || typeof value !== 'object') return null;
+  const groups = value.groups && typeof value.groups === 'object' ? value.groups : {};
+  const callees = groups.callees && typeof groups.callees === 'object' ? groups.callees : {};
+  const callers = groups.callers && typeof groups.callers === 'object' ? groups.callers : {};
+  return {
+    assessment: normalizePlacementAssessment(value.assessment),
+    evidence: normalizePlacementEvidence(value.evidence),
+    groups: {
+      callees: {
+        sameFile: (Array.isArray(callees.sameFile) ? callees.sameFile : []).map(normalizePlacementEdgeRef),
+        projectLocal: (Array.isArray(callees.projectLocal) ? callees.projectLocal : []).map(normalizePlacementEdgeRef),
+        package: (Array.isArray(callees.package) ? callees.package : []).map(normalizePlacementExternalRef),
+        platform: (Array.isArray(callees.platform) ? callees.platform : []).map(normalizePlacementExternalRef),
+        unresolved: (Array.isArray(callees.unresolved) ? callees.unresolved : []).map(normalizePlacementExternalRef),
+      },
+      callers: {
+        sameFile: (Array.isArray(callers.sameFile) ? callers.sameFile : []).map(normalizePlacementEdgeRef),
+        projectLocal: (Array.isArray(callers.projectLocal) ? callers.projectLocal : []).map(normalizePlacementEdgeRef),
+      },
+      internalHelpers: (Array.isArray(groups.internalHelpers) ? groups.internalHelpers : [])
+        .map(normalizePlacementFunctionRef)
+        .filter(Boolean),
+      transitiveInternalHelpers: (Array.isArray(groups.transitiveInternalHelpers) ? groups.transitiveInternalHelpers : [])
+        .map((item) => ({
+          depth: Number.isInteger(item?.depth) ? item.depth : 0,
+          function: normalizePlacementFunctionRef(item?.function),
+          via: normalizePlacementEdgeRef(item?.via),
+        }))
+        .filter((item) => item.function),
+    },
+  };
+}
+
 function normalizeFunctionNode(node = {}) {
   const normalized = {
     id: normalizeString(node.id).trim(),
@@ -536,6 +703,7 @@ function normalizeFunctionNode(node = {}) {
     startLine: Number.isInteger(node.startLine) ? node.startLine : null,
     endLine: Number.isInteger(node.endLine) ? node.endLine : null,
     lineCount: Number.isInteger(node.lineCount) ? node.lineCount : null,
+    placement: normalizePlacementReview(node.placement),
   };
   if (!normalized.id) normalized.id = functionIdForDeclaration(normalized);
   return normalized;
@@ -658,6 +826,7 @@ function createSymbolSummary(declaration) {
 }
 
 function createFunctionSummary(index, node) {
+  const evidence = node.placement?.evidence || {};
   return {
     id: node.id,
     stableId: node.stableId,
@@ -681,6 +850,12 @@ function createFunctionSummary(index, node) {
     lineCount: node.lineCount,
     dependencyCount: (index.dependenciesByFunctionId.get(node.id) || []).length,
     userCount: (index.usersByFunctionId.get(node.id) || []).length,
+    placementAssessment: node.placement?.assessment?.assessment || null,
+    placementConfidence: node.placement?.assessment?.confidence || null,
+    sameFileCalleeCount: evidence.sameFileCalleeCount || 0,
+    projectLocalCalleeCount: evidence.projectLocalCalleeCount || 0,
+    sameFileCallerCount: evidence.sameFileCallerCount || 0,
+    projectLocalCallerCount: evidence.projectLocalCallerCount || 0,
     sourceAvailable: index.sourceModuleByPath.has(node.modulePath),
   };
 }
@@ -889,11 +1064,232 @@ export async function loadStaticAnalysisRun({ outDir } = {}) {
   };
 }
 
+function createViewerBridge(index) {
+  return {
+    snapshot: {
+      buildId: index.output?.meta?.buildId || null,
+      sourceCodeHash: index.output?.meta?.sourceCodeHash || null,
+      generatedAt: index.output?.meta?.generatedAt || null,
+      entry: index.output?.entry || index.output?.meta?.entry || null,
+    },
+    stateByClientId: new Map(),
+    latestState: null,
+    commands: [],
+    acknowledgements: [],
+    commandRevision: 0,
+    commandOrdinal: 0,
+  };
+}
+
+async function readRequestJson(request) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > MAX_BRIDGE_BODY_BYTES) {
+      throw apiError(413, 'bridge_body_too_large', 'Bridge request body is too large.');
+    }
+    chunks.push(chunk);
+  }
+  const text = Buffer.concat(chunks).toString('utf8').trim();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw apiError(400, 'invalid_json', 'Bridge request body must be valid JSON.');
+  }
+}
+
+function bridgeDiscovery(bridge) {
+  return {
+    bridgeVersion: BRIDGE_VERSION,
+    snapshot: bridge.snapshot,
+    semantics: {
+      trustBoundary: 'The viewer bridge is intended for localhost use. It has no authentication and accepts presentation-only commands; do not expose it on an untrusted network.',
+      analysisSeparation: 'Analysis queries remain under read-only /api/v1. Bridge commands under /bridge/v1 can only change viewer presentation state.',
+      state: 'Viewer state uses stable IDs when available, the saved analysis build identity, and monotonic viewer revisions.',
+    },
+    routes: [
+      { method: 'GET', path: '/bridge/v1' },
+      { method: 'GET', path: '/bridge/v1/state' },
+      { method: 'POST', path: '/bridge/v1/state' },
+      { method: 'GET', path: '/bridge/v1/commands?clientId=<viewer-client>&afterRevision=0' },
+      { method: 'POST', path: '/bridge/v1/commands' },
+      { method: 'POST', path: '/bridge/v1/ack' },
+    ],
+    commands: Array.from(VIEWER_COMMAND_TYPES).sort(compareLocale),
+  };
+}
+
+function bridgeStatePayload(bridge) {
+  return {
+    bridgeVersion: BRIDGE_VERSION,
+    snapshot: bridge.snapshot,
+    latestState: bridge.latestState,
+    commandRevision: bridge.commandRevision,
+    acknowledgements: bridge.acknowledgements.slice(-25),
+  };
+}
+
+function normalizeBridgeClientId(value) {
+  const clientId = normalizeString(value).trim();
+  if (!clientId) throw apiError(400, 'missing_client_id', 'Bridge clientId is required.');
+  return clientId;
+}
+
+function updateBridgeViewerState(bridge, payload = {}) {
+  const clientId = normalizeBridgeClientId(payload.clientId);
+  const revision = Number(payload.revision);
+  if (!Number.isInteger(revision) || revision < 0) {
+    throw apiError(400, 'invalid_revision', 'Viewer state revision must be a non-negative integer.');
+  }
+  const previous = bridge.stateByClientId.get(clientId);
+  const accepted = !previous || revision >= previous.revision;
+  if (accepted) {
+    const state = {
+      clientId,
+      revision,
+      receivedAt: new Date().toISOString(),
+      reason: normalizeString(payload.reason).trim() || null,
+      snapshot: payload.snapshot && typeof payload.snapshot === 'object' ? payload.snapshot : null,
+      openSource: payload.openSource && typeof payload.openSource === 'object' ? payload.openSource : null,
+      highlighted: payload.highlighted && typeof payload.highlighted === 'object' ? payload.highlighted : null,
+      viewport: payload.viewport && typeof payload.viewport === 'object' ? payload.viewport : null,
+    };
+    bridge.stateByClientId.set(clientId, state);
+    bridge.latestState = state;
+  }
+  return {
+    accepted,
+    latestState: bridge.latestState,
+  };
+}
+
+function queueBridgeCommand(bridge, payload = {}) {
+  const rawCommand = payload.command && typeof payload.command === 'object' ? payload.command : payload;
+  const type = normalizeString(rawCommand.type || rawCommand.command).trim();
+  if (!VIEWER_COMMAND_TYPES.has(type)) {
+    throw apiError(400, 'invalid_bridge_command', `Bridge command type must be one of: ${Array.from(VIEWER_COMMAND_TYPES).sort(compareLocale).join(', ')}.`);
+  }
+  const command = {
+    ...rawCommand,
+    type,
+  };
+  delete command.command;
+  const record = {
+    commandId: normalizeString(payload.commandId).trim() || `vcmd_${++bridge.commandOrdinal}`,
+    revision: ++bridge.commandRevision,
+    createdAt: new Date().toISOString(),
+    command,
+  };
+  bridge.commands.push(record);
+  if (bridge.commands.length > MAX_BRIDGE_COMMANDS) bridge.commands.splice(0, bridge.commands.length - MAX_BRIDGE_COMMANDS);
+  return record;
+}
+
+function bridgeCommandsSince(bridge, url) {
+  const clientId = normalizeBridgeClientId(url.searchParams.get('clientId'));
+  const afterRevision = parseIntegerParam(url.searchParams, 'afterRevision', 0, {
+    min: 0,
+    max: Number.MAX_SAFE_INTEGER,
+  });
+  const acknowledged = new Set(bridge.acknowledgements
+    .filter((ack) => ack.clientId === clientId && ack.status === 'applied')
+    .map((ack) => ack.commandId));
+  return {
+    clientId,
+    afterRevision,
+    commands: bridge.commands
+      .filter((record) => record.revision > afterRevision && !acknowledged.has(record.commandId)),
+  };
+}
+
+function acknowledgeBridgeCommand(bridge, payload = {}) {
+  const clientId = normalizeBridgeClientId(payload.clientId);
+  const commandId = normalizeString(payload.commandId).trim();
+  if (!commandId) throw apiError(400, 'missing_command_id', 'Bridge commandId is required.');
+  const status = normalizeString(payload.status).trim() || 'applied';
+  const ack = {
+    clientId,
+    commandId,
+    commandRevision: Number.isInteger(payload.commandRevision) ? payload.commandRevision : null,
+    stateRevision: Number.isInteger(payload.stateRevision) ? payload.stateRevision : null,
+    status,
+    message: normalizeString(payload.message).trim() || null,
+    receivedAt: new Date().toISOString(),
+  };
+  bridge.acknowledgements.push(ack);
+  if (bridge.acknowledgements.length > MAX_BRIDGE_COMMANDS) {
+    bridge.acknowledgements.splice(0, bridge.acknowledgements.length - MAX_BRIDGE_COMMANDS);
+  }
+  return ack;
+}
+
+async function handleBridgeRequest({ request, response, bridge }) {
+  if (request.method === 'OPTIONS') {
+    sendBridgeOptions(response);
+    return;
+  }
+  const url = new URL(request.url || '/', 'http://127.0.0.1');
+  const parts = url.pathname.split('/').filter(Boolean);
+  if (parts[0] !== 'bridge' || parts[1] !== BRIDGE_VERSION) {
+    throw apiError(404, 'bridge_not_found', 'Bridge route not found.');
+  }
+  try {
+    if (request.method === 'GET' && parts.length === 2) {
+      rejectUnknownQueryParams(url, []);
+      sendBridgeData(response, bridgeDiscovery(bridge));
+      return;
+    }
+    if (parts.length === 3 && parts[2] === 'state') {
+      if (request.method === 'GET') {
+        rejectUnknownQueryParams(url, []);
+        sendBridgeData(response, bridgeStatePayload(bridge));
+        return;
+      }
+      if (request.method === 'POST') {
+        rejectUnknownQueryParams(url, []);
+        sendBridgeData(response, updateBridgeViewerState(bridge, await readRequestJson(request)));
+        return;
+      }
+    }
+    if (parts.length === 3 && parts[2] === 'commands') {
+      if (request.method === 'GET') {
+        rejectUnknownQueryParams(url, ['clientId', 'afterRevision']);
+        sendBridgeData(response, bridgeCommandsSince(bridge, url));
+        return;
+      }
+      if (request.method === 'POST') {
+        rejectUnknownQueryParams(url, []);
+        sendBridgeData(response, { command: queueBridgeCommand(bridge, await readRequestJson(request)) }, 201);
+        return;
+      }
+    }
+    if (parts.length === 3 && parts[2] === 'ack' && request.method === 'POST') {
+      rejectUnknownQueryParams(url, []);
+      sendBridgeData(response, { acknowledgement: acknowledgeBridgeCommand(bridge, await readRequestJson(request)) });
+      return;
+    }
+    throw apiError(404, 'bridge_not_found', 'Bridge route not found.');
+  } catch (error) {
+    if (error instanceof ApiError) {
+      sendBridgeError(response, error);
+      return;
+    }
+    sendBridgeError(response, apiError(500, 'bridge_error', 'Bridge error.'));
+  }
+}
+
 export async function createStaticAnalysisRequestHandler({ outDir } = {}) {
   const { outDir: resolvedOutDir, index } = await loadStaticAnalysisRun({ outDir });
+  const bridge = createViewerBridge(index);
   const handler = async (request, response) => {
     try {
       const pathname = decodedStaticPathname(request.url);
+      if (pathname === '/bridge/v1' || pathname?.startsWith('/bridge/v1/')) {
+        await handleBridgeRequest({ request, response, bridge });
+        return;
+      }
       if (pathname === '/api/v1' || pathname?.startsWith('/api/v1/')) {
         handleApiRequest({ request, response, index, outDir: resolvedOutDir });
         return;
@@ -938,6 +1334,7 @@ function routeEntries() {
     { method: 'GET', path: '/api/v1/functions/:id', description: 'Return one function with outgoing static dependencies and reverse users.' },
     { method: 'GET', path: '/api/v1/functions/:id/dependencies', description: 'Return outgoing static function dependencies for one function.' },
     { method: 'GET', path: '/api/v1/functions/:id/users', description: 'Return reverse static users for one function.' },
+    { method: 'GET', path: '/api/v1/functions/:id/placement', description: 'Return deterministic static placement/cohesion evidence for one function.' },
     { method: 'GET', path: '/api/v1/functions/:id/shortest-path', description: 'Return a bounded shortest static dependency path to a target function.' },
     { method: 'GET', path: '/api/v1/functions/:id/blast-radius', description: 'Return bounded direct and transitive static users affected by one function.' },
     { method: 'GET', path: '/api/v1/search', description: 'Unified module, function, symbol, and exact lexical-occurrence search.' },
@@ -1119,6 +1516,9 @@ function apiSchema(index) {
         query: SHORTEST_PATH_QUERY_PARAMS,
         responseSchema: '#/$defs/shortestPathResult',
       },
+      '/api/v1/functions/:id/placement': {
+        query: FUNCTION_PLACEMENT_QUERY_PARAMS,
+      },
       '/api/v1/modules/:id/blast-radius': {
         query: BLAST_RADIUS_QUERY_PARAMS,
         responseSchema: '#/$defs/blastRadiusResult',
@@ -1163,6 +1563,7 @@ function discovery(index) {
       '/api/v1/search?q=CreatorShell&match=exact&types=function,occurrence',
       '/api/v1/modules/<module-id>/shortest-path?targetId=<module-id>&maxDepth=10',
       '/api/v1/functions/<function-id>/blast-radius?maxDepth=10&limit=200',
+      '/api/v1/functions/<function-id>/placement',
       '/api/v1/query?modulePath=src/app.jsx&symbol=RootApp',
     ],
     semantics: {
@@ -1562,10 +1963,22 @@ function functionDetail(index, node, url) {
   return {
     function: createFunctionSummary(index, node),
     staticAnalysis: functionDependencySemantics(index),
+    placement: functionPlacementPayload(index, node).placement,
     dependencies: (index.dependenciesByFunctionId.get(node.id) || [])
       .map((edge) => functionEdgePayload(index, edge, includes)),
     users: (index.usersByFunctionId.get(node.id) || [])
       .map((edge) => functionEdgePayload(index, edge, includes)),
+  };
+}
+
+function functionPlacementPayload(index, node) {
+  return {
+    function: createFunctionSummary(index, node),
+    staticAnalysis: {
+      ...functionDependencySemantics(index),
+      placement: 'Placement review is a deterministic summary of saved lexical evidence. It helps prioritize human review; it does not prove runtime ownership, execution, or dead code.',
+    },
+    placement: node.placement || null,
   };
 }
 
@@ -2328,6 +2741,10 @@ function handleApiRequest({ request, response, index, outDir }) {
     if (parts.length === 5 && parts[4] === 'users') {
       rejectUnknownQueryParams(url, FUNCTION_DETAIL_QUERY_PARAMS);
       return sendApiData(response, functionUsersPayload(index, node, url));
+    }
+    if (parts.length === 5 && parts[4] === 'placement') {
+      rejectUnknownQueryParams(url, FUNCTION_PLACEMENT_QUERY_PARAMS);
+      return sendApiData(response, functionPlacementPayload(index, node));
     }
     if (parts.length === 5 && parts[4] === 'shortest-path') {
       rejectUnknownQueryParams(url, SHORTEST_PATH_QUERY_PARAMS);

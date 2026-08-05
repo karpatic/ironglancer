@@ -356,14 +356,15 @@ async function generateTestSite({ rootDir = fixtureRoot, entry = 'src/app.jsx', 
   const outDir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
   const result = await generateStaticSite({ rootDir, entry, outDir });
   const readJson = async (fileName) => JSON.parse(await fs.readFile(path.join(outDir, fileName), 'utf8'));
-  const [html, appJs, payload, sourcePayload, moduleSourcePayload] = await Promise.all([
+  const [html, appJs, payload, sourcePayload, moduleSourcePayload, functionMapPayload] = await Promise.all([
     fs.readFile(path.join(outDir, 'index.html'), 'utf8'),
     fs.readFile(path.join(outDir, 'app.js'), 'utf8'),
     readJson('output.json'),
     readJson('source-code.json'),
     readJson(path.join('.ironglancer-api', 'source-modules.json')),
+    readJson(path.join('.ironglancer-api', 'function-map.json')),
   ]);
-  return { outDir, html, appJs, payload, sourcePayload, moduleSourcePayload, result };
+  return { outDir, html, appJs, payload, sourcePayload, moduleSourcePayload, functionMapPayload, result };
 }
 
 function createFakeMermaidEdge(document, { source, target, labelText = 'import' }) {
@@ -442,7 +443,15 @@ async function runGeneratedViewerWithClass({ classOptions, ...viewerOptions }) {
 }
 
 test('generateStaticSite writes a static viewer bundle', async () => {
-  const { outDir, html, appJs, payload: output, sourcePayload: sourceOutput, result } = await generateTestSite();
+  const {
+    outDir,
+    html,
+    appJs,
+    payload: output,
+    sourcePayload: sourceOutput,
+    functionMapPayload,
+    result,
+  } = await generateTestSite();
 
   assert.equal(result.entryRel, 'src/app.jsx');
   const files = await fs.readdir(outDir);
@@ -491,7 +500,7 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.match(output.meta.buildId, /^[a-f0-9]{64}$/);
   assert.match(output.meta.sourceCodeHash, /^[a-f0-9]{64}$/);
   assert.equal(output.meta.apiVersion, 'v1');
-  assert.equal(output.meta.schemaVersion, '1.1.0');
+  assert.equal(output.meta.schemaVersion, '1.2.0');
   assert.equal(output.meta.rootDir, fixtureRoot);
   assert.equal(output.meta.entry, 'src/app.jsx');
   const { stdout: expectedGitCommit } = await execFile('git', ['-C', fixtureRoot, 'rev-parse', 'HEAD']);
@@ -508,6 +517,12 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.equal(helperSource.startLine, 1);
   assert.equal(helperSource.endLine, 3);
   assert.equal(helperSource.code, "export function helper() {\n  return 'helper';\n}");
+  assert.match(helperSource.functionStableId, /^fn_[a-f0-9]{16}$/);
+  assert.equal(helperSource.placement.assessment.assessment, 'public-entry-surface');
+  assert.equal(helperSource.placement.evidence.projectLocalCallerCount, 1);
+  const helperFunction = functionMapPayload.functions.find((item) => item.stableId === helperSource.functionStableId);
+  assert.ok(helperFunction, 'expected source declaration to reference a saved function-map node');
+  assert.equal(helperFunction.placement.evidence.projectLocalCallerCount, 1);
   assert.ok(!sourceOutput.declarations.some((item) => item.name === 'theme'));
   assert.ok(!sourceOutput.declarations.some((item) => item.name === 'remoteLib'));
 

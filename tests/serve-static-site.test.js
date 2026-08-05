@@ -33,10 +33,13 @@ class MockResponse {
 
 let activeHandler = null;
 
-async function requestUrl(url, { method = 'GET' } = {}) {
+async function requestUrl(url, { method = 'GET', body = '' } = {}) {
   const request = {
     method,
     url: typeof url === 'string' ? url : `${url.pathname}${url.search}`,
+    async *[Symbol.asyncIterator]() {
+      if (body) yield Buffer.from(body, 'utf8');
+    },
   };
   const response = new MockResponse();
   await activeHandler(request, response);
@@ -158,6 +161,16 @@ test('static analysis server exposes viewer files and a versioned cached API', a
     assert.ok(firstLinkedEdge.targetLink.href.startsWith('/api/v1/functions/fn_'));
     assert.equal('source' in firstLinkedEdge, false);
     assert.equal('target' in firstLinkedEdge, false);
+    assert.equal(linkedFunction.body.data.function.placementAssessment, 'public-entry-surface');
+    assert.equal(linkedFunction.body.data.placement.evidence.projectLocalCalleeCount, 2);
+
+    const placementOnly = await fetchJson(new URL(
+      `/api/v1/functions/${dependencyFilteredFunctions.body.data.items[0].stableId}/placement`,
+      serviceUrl,
+    ));
+    assert.equal(placementOnly.response.status, 200);
+    assert.equal(placementOnly.body.data.placement.assessment.assessment, 'public-entry-surface');
+    assert.equal(placementOnly.body.data.placement.groups.callees.projectLocal.length, 2);
 
     const userFilteredFunctions = await fetchJson(new URL('/api/v1/functions?userCount=1', serviceUrl));
     assert.equal(userFilteredFunctions.response.status, 200);
@@ -640,6 +653,76 @@ test('import stable IDs ignore named-binding order', async () => {
   } finally {
     activeHandler = null;
     await fs.rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test('viewer bridge stores structured state and presentation command acknowledgements', async () => {
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-bridge-'));
+  await generateStaticSite({ rootDir: fixtureRoot, entry: 'src/app.jsx', outDir });
+  activeHandler = await createStaticAnalysisRequestHandler({ outDir });
+
+  try {
+    const discovery = await fetchJson('/bridge/v1');
+    assert.equal(discovery.response.status, 200);
+    assert.equal(discovery.body.data.bridgeVersion, 'v1');
+    assert.match(discovery.body.data.semantics.trustBoundary, /localhost/);
+
+    const stateResponse = await requestUrl('/bridge/v1/state', {
+      method: 'POST',
+      body: JSON.stringify({
+        clientId: 'viewer-test',
+        revision: 1,
+        reason: 'ready',
+        snapshot: { buildId: discovery.body.data.snapshot.buildId },
+        openSource: {
+          functionStableId: 'fn_test',
+          modulePath: 'src/app.jsx',
+          name: 'RootApp',
+          startLine: 7,
+        },
+        viewport: { zoom: 1, scrollLeft: 0, scrollTop: 0 },
+      }),
+    });
+    assert.equal(stateResponse.status, 200);
+    assert.equal((await stateResponse.json()).data.accepted, true);
+
+    const queued = await requestUrl('/bridge/v1/commands', {
+      method: 'POST',
+      body: JSON.stringify({
+        command: {
+          type: 'openFunction',
+          targetStableId: 'fn_test',
+        },
+      }),
+    });
+    assert.equal(queued.status, 201);
+    const queuedBody = await queued.json();
+    assert.equal(queuedBody.data.command.revision, 1);
+
+    const commands = await fetchJson('/bridge/v1/commands?clientId=viewer-test&afterRevision=0');
+    assert.equal(commands.response.status, 200);
+    assert.equal(commands.body.data.commands.length, 1);
+    assert.equal(commands.body.data.commands[0].command.type, 'openFunction');
+
+    const ack = await requestUrl('/bridge/v1/ack', {
+      method: 'POST',
+      body: JSON.stringify({
+        clientId: 'viewer-test',
+        commandId: queuedBody.data.command.commandId,
+        commandRevision: queuedBody.data.command.revision,
+        status: 'applied',
+        message: 'source opened',
+        stateRevision: 2,
+      }),
+    });
+    assert.equal(ack.status, 200);
+    assert.equal((await ack.json()).data.acknowledgement.status, 'applied');
+
+    const state = await fetchJson('/bridge/v1/state');
+    assert.equal(state.body.data.latestState.clientId, 'viewer-test');
+    assert.equal(state.body.data.acknowledgements.at(-1).commandId, queuedBody.data.command.commandId);
+  } finally {
+    activeHandler = null;
   }
 });
 
