@@ -634,11 +634,63 @@ function sourceImportedByRelationshipText(relationship = {}, selectedDeclaration
   return parts.join(' ');
 }
 
+function createElement(tagName, className = '', text = '') {
+  const element = document.createElement(tagName);
+  if (className) element.className = className;
+  if (text !== '') element.textContent = text;
+  return element;
+}
+
+function placementToken(value, fallback = 'unknown') {
+  return (String(value || '').trim() || fallback)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    || fallback;
+}
+
+function titleCaseToken(value, fallback = 'Unknown') {
+  const raw = String(value || '').trim();
+  if (!raw) return fallback;
+  return raw
+    .split(/[-_\s]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function compactCount(value) {
+  const count = Number(value);
+  return Number.isInteger(count) && count > 0 ? count : 0;
+}
+
 function placementFunctionText(ref = {}) {
   const name = String(ref.name || '').trim();
   const modulePath = String(ref.modulePath || '').trim();
   const line = ref.startLine || '?';
   return callableLabel(name) + (modulePath ? ' in ' + modulePath + ':' + line : '');
+}
+
+function placementFunctionLocation(ref = {}) {
+  const modulePath = String(ref.modulePath || '').trim();
+  if (!modulePath) return '';
+  return modulePath + ':' + (ref.startLine || '?');
+}
+
+function placementUsageLineText(lines) {
+  const usageLines = (Array.isArray(lines) ? lines : [])
+    .map((line) => Number(line))
+    .filter((line) => Number.isInteger(line) && line > 0);
+  if (usageLines.length === 0) return '';
+  return 'L' + usageLines.slice(0, 3).join(', ');
+}
+
+function placementSyntaxLabels(syntaxKinds) {
+  const kinds = Array.isArray(syntaxKinds) ? syntaxKinds : [];
+  return kinds
+    .map((kind) => String(kind || '').trim())
+    .filter(Boolean)
+    .slice(0, 3);
 }
 
 function placementEdgeText(edge = {}, direction = 'callee') {
@@ -664,137 +716,360 @@ function placementExternalText(item = {}) {
     + ' [' + syntax + ']';
 }
 
-function placementAssessmentItems(declaration = {}) {
-  const placement = declaration.placement || {};
-  const assessment = placement.assessment || {};
-  const evidence = placement.evidence || {};
-  if (!assessment.assessment) return [];
-  const items = [
+function sourceDeclarationForPlacementRef(ref = {}) {
+  const stableId = String(ref.stableId || '').trim();
+  const id = String(ref.id || '').trim();
+  if (stableId) {
+    const declaration = sourceDeclarationLookup.byFunctionStableId.get(stableId);
+    if (declaration) return declaration;
+  }
+  if (id) {
+    const declaration = sourceDeclarationLookup.byFunctionId.get(id);
+    if (declaration) return declaration;
+  }
+  const modulePath = String(ref.modulePath || '').trim();
+  const name = String(ref.name || '').trim();
+  const line = Number(ref.startLine || 0);
+  if (!modulePath || !name) return null;
+  return Array.from(sourceDeclarationLookup.byFunctionId.values())
+    .find((declaration) => (
+      declaration.modulePath === modulePath
+      && (declaration.name === name || declaration.declarationName === name)
+      && (!line || declaration.startLine === line)
+    )) || null;
+}
+
+function placementSignalMetrics(declaration = {}) {
+  const evidence = declaration.placement?.evidence || {};
+  const externalCount = compactCount(evidence.packageCalleeCount) + compactCount(evidence.platformCalleeCount);
+  return [
     {
-      text: assessment.assessment + ' (' + (assessment.confidence || 'low') + ')',
-      summary: true,
+      id: 'same-file-caller',
+      label: 'Same-file callers',
+      shortLabel: 'Callers',
+      scope: 'same file',
+      count: compactCount(evidence.sameFileCallerCount),
+      tone: 'same-file',
+    },
+    {
+      id: 'project-local-caller',
+      label: 'Cross-file callers',
+      shortLabel: 'Callers',
+      scope: 'cross file',
+      count: compactCount(evidence.projectLocalCallerCount),
+      tone: 'project-local',
+    },
+    {
+      id: 'same-file-callee',
+      label: 'Same-file callees',
+      shortLabel: 'Callees',
+      scope: 'same file',
+      count: compactCount(evidence.sameFileCalleeCount),
+      tone: 'same-file',
+    },
+    {
+      id: 'project-local-callee',
+      label: 'Cross-file callees',
+      shortLabel: 'Callees',
+      scope: 'cross file',
+      count: compactCount(evidence.projectLocalCalleeCount),
+      tone: 'project-local',
+    },
+    {
+      id: 'external-callee',
+      label: 'Package/platform calls',
+      shortLabel: 'External',
+      scope: 'package/platform',
+      count: externalCount,
+      tone: 'external',
+    },
+    {
+      id: 'internal-helper',
+      label: 'Helper cluster',
+      shortLabel: 'Helpers',
+      scope: compactCount(evidence.transitiveInternalHelperLineCount) + ' lines',
+      count: compactCount(evidence.transitiveInternalHelperCount || evidence.internalHelperCount),
+      tone: 'helper',
+    },
+    {
+      id: 'unresolved-callee',
+      label: 'Unresolved calls',
+      shortLabel: 'Unknown',
+      scope: 'needs check',
+      count: compactCount(evidence.unresolvedCalleeCount),
+      tone: 'unresolved',
     },
   ];
-  if (assessment.summary) items.push({ text: assessment.summary });
-  const helperCount = evidence.transitiveInternalHelperCount || evidence.internalHelperCount || 0;
-  const helperLines = evidence.transitiveInternalHelperLineCount || 0;
-  items.push({
-    text: 'Callers same-file '
-      + (evidence.sameFileCallerCount || 0)
-      + ', project-local '
-      + (evidence.projectLocalCallerCount || 0)
-      + '; callees same-file '
-      + (evidence.sameFileCalleeCount || 0)
-      + ', project-local '
-      + (evidence.projectLocalCalleeCount || 0)
-      + '; external '
-      + ((evidence.packageCalleeCount || 0) + (evidence.platformCalleeCount || 0))
-      + '; unresolved '
-      + (evidence.unresolvedCalleeCount || 0)
-      + '; internal helpers '
-      + helperCount
-      + (helperLines ? ' across ' + helperLines + ' lines' : ''),
-  });
-  for (const rationale of Array.isArray(assessment.rationale) ? assessment.rationale : []) {
-    items.push({ text: rationale });
-  }
-  return items;
 }
 
-function placementRelationshipItems(declaration = {}, groupName, direction = 'callee') {
-  const placement = declaration.placement || {};
-  const groups = placement.groups || {};
-  if (groupName === 'direct-callees') {
-    const callees = groups.callees || {};
-    return [
-      ...(Array.isArray(callees.sameFile) ? callees.sameFile : []).map((edge) => placementEdgeText(edge, 'callee')),
-      ...(Array.isArray(callees.projectLocal) ? callees.projectLocal : []).map((edge) => placementEdgeText(edge, 'callee')),
-      ...(Array.isArray(callees.package) ? callees.package : []).map(placementExternalText),
-      ...(Array.isArray(callees.platform) ? callees.platform : []).map(placementExternalText),
-      ...(Array.isArray(callees.unresolved) ? callees.unresolved : []).map(placementExternalText),
-    ];
+function renderPlacementSignalStrip(declaration = {}) {
+  const metrics = placementSignalMetrics(declaration);
+  const maxCount = Math.max(1, ...metrics.map((metric) => metric.count));
+  const strip = createElement('div', 'placement-signal-strip');
+  for (const metric of metrics) {
+    const signal = createElement('div', 'placement-signal is-' + metric.tone);
+    signal.setAttribute('data-signal', metric.id);
+    signal.setAttribute('aria-label', metric.label + ': ' + metric.count);
+
+    const top = createElement('div', 'placement-signal-top');
+    const count = createElement('strong', '', String(metric.count));
+    const label = createElement('span', '', metric.shortLabel);
+    top.append(count, label);
+
+    const scope = createElement('span', 'placement-signal-scope', metric.scope);
+    const meter = createElement('div', 'placement-signal-meter');
+    const fill = createElement('span');
+    fill.style.width = Math.round((metric.count / maxCount) * 100) + '%';
+    meter.appendChild(fill);
+
+    signal.append(top, scope, meter);
+    strip.appendChild(signal);
   }
-  if (groupName === 'callers') {
-    const callers = groups.callers || {};
-    return [
-      ...(Array.isArray(callers.sameFile) ? callers.sameFile : []).map((edge) => placementEdgeText(edge, 'caller')),
-      ...(Array.isArray(callers.projectLocal) ? callers.projectLocal : []).map((edge) => placementEdgeText(edge, 'caller')),
-    ];
-  }
-  if (groupName === 'helpers') {
-    return (Array.isArray(groups.transitiveInternalHelpers) ? groups.transitiveInternalHelpers : [])
-      .map((item) => 'depth ' + item.depth + ': ' + placementFunctionText(item.function));
-  }
-  return [];
+  return strip;
 }
 
-function renderSourceDialogRelationshipSection(title, relationships, formatter) {
-  const section = document.createElement('section');
-  section.className = 'source-dialog-relationship-section';
-  const heading = document.createElement('h3');
-  heading.textContent = title;
-  section.appendChild(heading);
+function placementEdgeTile(edge = {}, direction = 'callee', tone = 'same-file') {
+  const ref = direction === 'caller' ? edge.source : edge.target;
+  const location = placementFunctionLocation(ref);
+  const usage = placementUsageLineText(edge.usageLines);
+  const referenceCount = compactCount(edge.referenceCount);
+  const chips = [
+    tone === 'project-local' ? 'cross file' : 'same file',
+    referenceCount > 0 ? referenceCount + ' refs' : '',
+    usage,
+    ...placementSyntaxLabels(edge.syntaxKinds),
+  ].filter(Boolean);
+  return {
+    kind: 'function',
+    tone,
+    title: callableLabel(ref?.name || ''),
+    meta: location || 'local function',
+    detail: placementEdgeText(edge, direction),
+    chips,
+    ref,
+  };
+}
 
-  const items = Array.isArray(relationships) ? relationships : [];
+function placementExternalTile(item = {}, tone = 'external') {
+  const localName = String(item.localName || item.importedName || item.specifier || '').trim();
+  const specifier = String(item.specifier || '').trim();
+  const usage = placementUsageLineText(item.usageLines);
+  const chips = [
+    tone === 'unresolved' ? 'unresolved' : titleCaseToken(item.category, 'external').toLowerCase(),
+    usage,
+    ...placementSyntaxLabels(item.syntaxKinds),
+  ].filter(Boolean);
+  return {
+    kind: 'external',
+    tone,
+    title: callableLabel(localName || specifier || item.category),
+    meta: specifier || String(item.unresolvedReason || '').trim() || 'external binding',
+    detail: placementExternalText(item),
+    chips,
+    ref: null,
+  };
+}
+
+function placementHelperTile(item = {}) {
+  const ref = item.function || item;
+  const location = placementFunctionLocation(ref);
+  const depth = compactCount(item.depth);
+  return {
+    kind: 'function',
+    tone: 'helper',
+    title: callableLabel(ref?.name || ''),
+    meta: location || 'same-file helper',
+    detail: 'depth ' + depth + ': ' + placementFunctionText(ref),
+    chips: ['depth ' + depth, compactCount(ref?.lineCount) + ' lines'].filter(Boolean),
+    ref,
+  };
+}
+
+function placementRelationshipGroups(declaration = {}) {
+  const groups = declaration.placement?.groups || {};
+  const callers = groups.callers || {};
+  const callees = groups.callees || {};
+  return {
+    callers: [
+      ...(Array.isArray(callers.sameFile) ? callers.sameFile : []).map((edge) => placementEdgeTile(edge, 'caller', 'same-file')),
+      ...(Array.isArray(callers.projectLocal) ? callers.projectLocal : []).map((edge) => placementEdgeTile(edge, 'caller', 'project-local')),
+    ],
+    calls: [
+      ...(Array.isArray(callees.sameFile) ? callees.sameFile : []).map((edge) => placementEdgeTile(edge, 'callee', 'same-file')),
+      ...(Array.isArray(callees.projectLocal) ? callees.projectLocal : []).map((edge) => placementEdgeTile(edge, 'callee', 'project-local')),
+    ],
+    helpers: (Array.isArray(groups.transitiveInternalHelpers) ? groups.transitiveInternalHelpers : [])
+      .map(placementHelperTile),
+    external: [
+      ...(Array.isArray(callees.package) ? callees.package : []).map((item) => placementExternalTile(item, 'external')),
+      ...(Array.isArray(callees.platform) ? callees.platform : []).map((item) => placementExternalTile(item, 'platform')),
+      ...(Array.isArray(callees.unresolved) ? callees.unresolved : []).map((item) => placementExternalTile(item, 'unresolved')),
+    ],
+  };
+}
+
+function renderPlacementChip(text, tone = '') {
+  return createElement('span', 'placement-chip' + (tone ? ' is-' + tone : ''), text);
+}
+
+function renderPlacementTile(item = {}) {
+  const declaration = item.ref ? sourceDeclarationForPlacementRef(item.ref) : null;
+  const tile = createElement(declaration ? 'button' : 'div', 'placement-relationship-tile is-' + placementToken(item.tone));
+  tile.setAttribute('data-kind', item.kind || 'relationship');
+  if (item.detail) tile.setAttribute('title', item.detail);
+  if (declaration) {
+    tile.type = 'button';
+    tile.setAttribute('aria-label', 'Open source for ' + (item.title || declaration.name));
+    tile.addEventListener('click', () => showSourceDialog(declaration, sourceDialogRestoreFocusEl || tile));
+  }
+
+  const title = createElement('div', 'placement-relationship-title', item.title || 'Unknown');
+  const meta = createElement('div', 'placement-relationship-meta', item.meta || '');
+  const chips = createElement('div', 'placement-chip-row');
+  for (const chipText of Array.isArray(item.chips) ? item.chips : []) {
+    chips.appendChild(renderPlacementChip(chipText, item.tone));
+  }
+  tile.append(title, meta, chips);
+  return tile;
+}
+
+function renderPlacementLane({ id, title, items, emptyLabel }) {
+  const section = createElement('section', 'placement-lane');
+  section.setAttribute('data-lane', id);
+  section.setAttribute('data-count', String(items.length));
+
+  const header = createElement('div', 'placement-lane-header');
+  header.append(
+    createElement('h3', '', title),
+    createElement('span', 'placement-lane-count', String(items.length)),
+  );
+  section.appendChild(header);
+
   if (items.length === 0) {
-    const empty = document.createElement('p');
-    empty.className = 'source-dialog-none';
-    empty.textContent = 'None';
-    section.appendChild(empty);
+    section.appendChild(createElement('p', 'placement-empty', emptyLabel));
     return section;
   }
 
-  const list = document.createElement('ul');
-  list.className = 'source-dialog-relationship-list';
-  for (const relationship of items) {
-    const item = document.createElement('li');
-    if (relationship && typeof relationship === 'object' && relationship.summary) {
-      item.className = 'is-placement-summary';
-      item.textContent = relationship.text;
-    } else {
-      item.textContent = formatter(relationship);
-    }
-    list.appendChild(item);
+  const visibleItems = items.slice(0, 4);
+  const hiddenItems = items.slice(4);
+  const grid = createElement('div', 'placement-relationship-grid');
+  for (const item of visibleItems) grid.appendChild(renderPlacementTile(item));
+  section.appendChild(grid);
+
+  if (hiddenItems.length > 0) {
+    const more = createElement('details', 'placement-more');
+    const summary = createElement('summary', '', '+' + hiddenItems.length + ' more');
+    const moreGrid = createElement('div', 'placement-relationship-grid');
+    for (const item of hiddenItems) moreGrid.appendChild(renderPlacementTile(item));
+    more.append(summary, moreGrid);
+    section.appendChild(more);
   }
-  section.appendChild(list);
+
   return section;
+}
+
+function renderPlacementTracePill(text) {
+  const pill = createElement('span', 'placement-trace-pill');
+  pill.textContent = text;
+  pill.setAttribute('title', text);
+  return pill;
+}
+
+function renderPlacementTraceSection(declaration = {}) {
+  const used = (Array.isArray(declaration.importedFunctionUses) ? declaration.importedFunctionUses : [])
+    .map(sourceUseRelationshipText);
+  const importedBy = (Array.isArray(declaration.importedBy) ? declaration.importedBy : [])
+    .map((relationship) => sourceImportedByRelationshipText(relationship, declaration));
+  if (used.length === 0 && importedBy.length === 0) return null;
+
+  const section = createElement('section', 'placement-trace');
+  const header = createElement('div', 'placement-trace-header');
+  header.append(
+    createElement('h3', '', 'Import Trace'),
+    createElement('span', 'placement-lane-count', String(used.length + importedBy.length)),
+  );
+  const body = createElement('div', 'placement-trace-body');
+  for (const item of [...used, ...importedBy].slice(0, 8)) {
+    body.appendChild(renderPlacementTracePill(item));
+  }
+  if (used.length + importedBy.length > 8) {
+    body.appendChild(renderPlacementTracePill('+' + ((used.length + importedBy.length) - 8) + ' more'));
+  }
+  section.append(header, body);
+  return section;
+}
+
+function renderPlacementOverview(declaration = {}) {
+  const placement = declaration.placement || {};
+  const assessment = placement.assessment || {};
+  const assessmentToken = placementToken(assessment.assessment, 'unreviewed');
+  const confidenceToken = placementToken(assessment.confidence, 'low');
+  const overview = createElement('section', 'placement-overview');
+
+  const topline = createElement('div', 'placement-topline');
+  const summaryGroup = createElement('div', 'placement-summary-group');
+  const badge = createElement(
+    'div',
+    'placement-assessment-badge is-' + assessmentToken + ' is-confidence-' + confidenceToken,
+  );
+  badge.setAttribute('data-assessment', assessment.assessment || '');
+  badge.setAttribute('data-confidence', assessment.confidence || 'low');
+  badge.append(
+    createElement('span', 'placement-assessment-label', titleCaseToken(assessment.assessment, 'Unreviewed')),
+    createElement('span', 'placement-assessment-confidence', titleCaseToken(assessment.confidence, 'Low') + ' confidence'),
+  );
+  summaryGroup.appendChild(badge);
+  if (assessment.summary) summaryGroup.appendChild(createElement('p', 'placement-summary', assessment.summary));
+
+  const rationale = createElement('div', 'placement-rationale-strip');
+  for (const item of (Array.isArray(assessment.rationale) ? assessment.rationale : []).slice(0, 4)) {
+    rationale.appendChild(renderPlacementChip(item));
+  }
+  if (rationale.children.length === 0) rationale.appendChild(renderPlacementChip('no saved rationale'));
+
+  topline.append(summaryGroup, rationale);
+  overview.append(topline, renderPlacementSignalStrip(declaration));
+  return overview;
 }
 
 function renderSourceDialogRelationships(declaration) {
   if (!sourceDialogRelationshipsEl) return;
   sourceDialogRelationshipsEl.textContent = '';
-  sourceDialogRelationshipsEl.append(
-    renderSourceDialogRelationshipSection(
-      'Placement Review',
-      placementAssessmentItems(declaration),
-      (item) => (item && typeof item === 'object' ? item.text : String(item || '')),
-    ),
-    renderSourceDialogRelationshipSection(
-      'Recognized Interior Calls',
-      placementRelationshipItems(declaration, 'direct-callees'),
-      (item) => String(item || ''),
-    ),
-    renderSourceDialogRelationshipSection(
-      'Recognized Callers',
-      placementRelationshipItems(declaration, 'callers'),
-      (item) => String(item || ''),
-    ),
-    renderSourceDialogRelationshipSection(
-      'Internal Helpers',
-      placementRelationshipItems(declaration, 'helpers'),
-      (item) => String(item || ''),
-    ),
-    renderSourceDialogRelationshipSection(
-      'Imported Functions Used',
-      declaration?.importedFunctionUses,
-      sourceUseRelationshipText,
-    ),
-    renderSourceDialogRelationshipSection(
-      'Imported By',
-      declaration?.importedBy,
-      (relationship) => sourceImportedByRelationshipText(relationship, declaration),
-    ),
+
+  const relationshipGroups = placementRelationshipGroups(declaration);
+  const surface = createElement('div', 'placement-surface');
+  const lanes = createElement('div', 'placement-lane-grid');
+  lanes.append(
+    renderPlacementLane({
+      id: 'callers',
+      title: 'Callers',
+      items: relationshipGroups.callers,
+      emptyLabel: 'No direct static callers saved.',
+    }),
+    renderPlacementLane({
+      id: 'calls',
+      title: 'Callees',
+      items: relationshipGroups.calls,
+      emptyLabel: 'No direct local callees saved.',
+    }),
+    renderPlacementLane({
+      id: 'helpers',
+      title: 'Helper Cluster',
+      items: relationshipGroups.helpers,
+      emptyLabel: 'No same-file helper chain found.',
+    }),
+    renderPlacementLane({
+      id: 'external',
+      title: 'Adapters',
+      items: relationshipGroups.external,
+      emptyLabel: 'No package, platform, or unresolved calls saved.',
+    }),
   );
+
+  const traceSection = renderPlacementTraceSection(declaration);
+  surface.append(renderPlacementOverview(declaration), lanes);
+  if (traceSection) surface.appendChild(traceSection);
+  sourceDialogRelationshipsEl.appendChild(surface);
 }
 
 function renderSourceDialogDeclaration(declaration) {

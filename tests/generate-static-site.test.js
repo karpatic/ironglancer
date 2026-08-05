@@ -886,6 +886,28 @@ test('generated viewer renders source member metrics as compact badges from sour
   assert.equal(document.getElementById('source-dialog').open, true);
   assert.equal(document.getElementById('source-dialog-title').textContent, 'AlphaLocal');
   assert.equal(document.getElementById('source-dialog-path').textContent, 'src/shared.js:1-3');
+  const relationships = document.getElementById('source-dialog-relationships');
+  const assessmentBadge = relationships.querySelector('div.placement-assessment-badge');
+  assert.ok(assessmentBadge, 'expected placement assessment badge');
+  assert.equal(assessmentBadge.getAttribute('data-assessment'), alphaDeclaration.placement.assessment.assessment);
+  const callerSignal = relationships.querySelector('div.placement-signal[data-signal="project-local-caller"]');
+  assert.ok(callerSignal, 'expected project-local caller signal');
+  assert.equal(
+    callerSignal.querySelector('strong').textContent,
+    String(alphaDeclaration.placement.evidence.projectLocalCallerCount),
+  );
+  const callersLane = relationships.querySelector('section.placement-lane[data-lane="callers"]');
+  assert.ok(callersLane, 'expected caller relationship lane');
+  assert.equal(
+    callersLane.getAttribute('data-count'),
+    String(
+      alphaDeclaration.placement.evidence.sameFileCallerCount
+        + alphaDeclaration.placement.evidence.projectLocalCallerCount,
+    ),
+  );
+  if (alphaDeclaration.placement.evidence.projectLocalCallerCount > 0) {
+    assert.ok(callersLane.querySelector('button.placement-relationship-tile[data-kind="function"]'));
+  }
 });
 
 test('generated viewer navigates imported script member source within its rendered sibling group', async () => {
