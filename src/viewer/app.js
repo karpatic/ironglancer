@@ -34,6 +34,13 @@ const jsxTreeEl = document.getElementById('jsx-tree');
 const treeEl = document.getElementById('tree');
 const mermaidEl = document.getElementById('mermaid');
 const moduleDiagramEl = document.getElementById('module-diagram');
+const moduleDiagramViewportEl = document.getElementById('module-diagram-viewport');
+const moduleDiagramZoomStatusEl = document.getElementById('module-diagram-zoom-status');
+const moduleDiagramZoomInBtn = document.getElementById('module-diagram-zoom-in-btn');
+const moduleDiagramZoomOutBtn = document.getElementById('module-diagram-zoom-out-btn');
+const moduleDiagramFitBtn = document.getElementById('module-diagram-fit-btn');
+const moduleDiagramResetViewBtn = document.getElementById('module-diagram-reset-view-btn');
+const selectedImportEl = document.getElementById('selected-import');
 const downloadBtn = document.getElementById('download-svg-btn');
 const networkStatusEl = document.getElementById('network-status');
 const networkViewportEl = document.getElementById('function-network-viewport');
@@ -47,10 +54,13 @@ const networkResetSelectionBtn = document.getElementById('network-reset-selectio
 const fileLegendEl = document.getElementById('file-legend');
 const selectedFunctionEl = document.getElementById('selected-function');
 const sourceDialogEl = document.getElementById('source-dialog');
+const sourceDialogBodyEl = sourceDialogEl.querySelector('.source-dialog-body');
 const sourceDialogTitleEl = document.getElementById('source-dialog-title');
 const sourceDialogPathEl = document.getElementById('source-dialog-path');
 const sourceDialogInsightEl = document.getElementById('source-dialog-insight');
 const sourceDialogNeighborhoodEl = document.getElementById('source-dialog-neighborhood');
+const sourceDialogConnectionsEl = document.getElementById('source-dialog-connections');
+const sourceDialogConnectionsSummaryEl = document.getElementById('source-dialog-connections-summary');
 const sourceDialogRelationshipsEl = document.getElementById('source-dialog-relationships');
 const sourceDialogCodeEl = document.getElementById('source-dialog-code');
 const sourceDialogPreviousBtn = document.getElementById('source-dialog-previous');
@@ -70,6 +80,7 @@ let edgesByTargetId = new Map();
 let declarationsByFunctionId = new Map();
 let declarationsByFunctionStableId = new Map();
 let declarationsByModule = new Map();
+let declarationsByModuleIdAndName = new Map();
 let fileColorByPath = new Map();
 let networkLayout = null;
 let networkZoom = 1;
@@ -78,11 +89,23 @@ let networkBaseHeight = 0;
 let networkDragState = null;
 let networkPinchState = null;
 const activePointers = new Map();
+let moduleDiagramSvgEl = null;
+let moduleDiagramZoom = 1;
+let moduleDiagramBaseWidth = 0;
+let moduleDiagramBaseHeight = 0;
+let moduleDiagramDragState = null;
+let moduleDiagramPinchState = null;
+const moduleDiagramPointers = new Map();
+let expandedImportEdge = null;
+let sourceMemberTargetCounter = 0;
+let sourceMemberTargets = new Map();
+let highlightedSourceRecord = null;
 let selectedFunctionId = '';
 let activeRelationFilter = 'all';
 let sourceDialogState = { functionId: '', group: [], index: -1 };
 let sourceDialogRestoreFocusEl = null;
 let viewerBridge = emptyViewerBridge();
+const sourceMetricsSuffixPattern = /\s+\[lines:\s*\d+\s*\|\s*refs:\s*\d+\s*\|\s*importers:\s*\d+\]\s*$/i;
 
 function emptyViewerBridge() {
   return {
@@ -220,17 +243,27 @@ function sourcePayloadMatchesOutput(payload = {}, source = {}) {
   return ['buildId', 'sourceCodeHash'].every((key) => outputMeta[key] && outputMeta[key] === sourceMeta[key]);
 }
 
+function sourceKey(moduleId, name) {
+  return moduleId + '\u0000' + name;
+}
+
 function buildDeclarationIndexes(payload = {}) {
   declarationsByFunctionId = new Map();
   declarationsByFunctionStableId = new Map();
   declarationsByModule = new Map();
+  declarationsByModuleIdAndName = new Map();
   for (const declaration of safeArray(payload.declarations)) {
     const functionId = String(declaration.functionId || '').trim();
     const stableId = String(declaration.functionStableId || '').trim();
+    const moduleId = String(declaration.moduleId || '').trim();
     const modulePath = String(declaration.modulePath || '').trim();
+    const name = String(declaration.name || declaration.declarationName || '').trim();
     if (functionId && !declarationsByFunctionId.has(functionId)) declarationsByFunctionId.set(functionId, declaration);
     if (stableId && !declarationsByFunctionStableId.has(stableId)) {
       declarationsByFunctionStableId.set(stableId, declaration);
+    }
+    if (moduleId && name && !declarationsByModuleIdAndName.has(sourceKey(moduleId, name))) {
+      declarationsByModuleIdAndName.set(sourceKey(moduleId, name), declaration);
     }
     if (modulePath) {
       if (!declarationsByModule.has(modulePath)) declarationsByModule.set(modulePath, []);
@@ -267,7 +300,15 @@ function functionNodeForDeclaration(declaration = {}) {
   if (id && functionById.has(id)) return functionById.get(id);
   const stableId = String(declaration.functionStableId || '').trim();
   if (stableId && functionByStableId.has(stableId)) return functionByStableId.get(stableId);
-  return null;
+  const modulePath = String(declaration.modulePath || '').trim();
+  const name = String(declaration.name || declaration.declarationName || '').trim();
+  const line = Number(declaration.startLine || 0);
+  if (!modulePath || !name) return null;
+  return functions.find((node) => (
+    node.modulePath === modulePath
+    && (node.name === name || node.declarationName === name)
+    && (!line || node.startLine === line)
+  )) || null;
 }
 
 function indexFunctions() {
@@ -352,57 +393,220 @@ function scaledNodeRadius(node, minLines, maxLines) {
   return minRadius + (Math.sqrt(Math.max(0, Math.min(1, ratio))) * (maxRadius - minRadius));
 }
 
+function stableHash(value) {
+  let hash = 2166136261;
+  const text = String(value || '');
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function seededUnit(value) {
+  return stableHash(value) / 4294967296;
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function moduleClusterCenters(fileOrder, width, height) {
+  const visibleFileOrder = fileOrder.filter((modulePath) => functions.some((node) => node.modulePath === modulePath));
+  const centers = new Map();
+  const centerX = width / 2;
+  const centerY = height / 2;
+  if (visibleFileOrder.length <= 1) {
+    if (visibleFileOrder[0]) centers.set(visibleFileOrder[0], { x: centerX, y: centerY });
+    return centers;
+  }
+
+  const radiusX = Math.max(260, width * 0.32);
+  const radiusY = Math.max(180, height * 0.28);
+  visibleFileOrder.forEach((modulePath, index) => {
+    const angle = (-Math.PI / 2) + ((Math.PI * 2 * index) / visibleFileOrder.length);
+    centers.set(modulePath, {
+      x: centerX + Math.cos(angle) * radiusX,
+      y: centerY + Math.sin(angle) * radiusY,
+    });
+  });
+  return centers;
+}
+
+function networkInitialPosition(node, index, count, clusterCenter, width, height) {
+  const seed = node.stableId || node.id || (node.modulePath + ':' + node.name + ':' + index);
+  const moduleSeed = node.modulePath + ':' + index;
+  const spiralAngle = (Math.PI * 2 * index) / Math.max(1, count);
+  const jitterAngle = seededUnit(seed + ':angle') * Math.PI * 2;
+  const jitterRadius = 28 + seededUnit(seed + ':radius') * 95;
+  return {
+    x: clamp(
+      clusterCenter.x + Math.cos(jitterAngle) * jitterRadius + Math.cos(spiralAngle) * 36,
+      80,
+      width - 80,
+    ),
+    y: clamp(
+      clusterCenter.y + Math.sin(jitterAngle) * jitterRadius + Math.sin(spiralAngle) * 36
+        + (seededUnit(moduleSeed) - 0.5) * 34,
+      80,
+      height - 80,
+    ),
+  };
+}
+
+function simulateForceLayout(layoutNodes, layoutEdges, clusterCenters, width, height) {
+  const nodes = Array.from(layoutNodes.values());
+  if (nodes.length === 0) return;
+  const center = { x: width / 2, y: height / 2 };
+  const iterations = clamp(Math.round(520 - nodes.length * 2.2), 220, 520);
+  const edgeStrength = nodes.length > 90 ? 0.018 : 0.026;
+  const repelStrength = nodes.length > 90 ? 5600 : 7200;
+  const clusterStrength = nodes.length > 90 ? 0.006 : 0.009;
+  const centerStrength = 0.0025;
+
+  for (let tick = 0; tick < iterations; tick += 1) {
+    const cooling = 1 - (tick / iterations);
+    for (const item of nodes) {
+      item.vx = (item.vx || 0) * 0.78;
+      item.vy = (item.vy || 0) * 0.78;
+    }
+
+    for (let index = 0; index < nodes.length; index += 1) {
+      const a = nodes[index];
+      for (let next = index + 1; next < nodes.length; next += 1) {
+        const b = nodes[next];
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let distanceSq = dx * dx + dy * dy;
+        if (distanceSq < 0.01) {
+          const seed = seededUnit(a.node.id + ':' + b.node.id);
+          dx = Math.cos(seed * Math.PI * 2) * 0.1;
+          dy = Math.sin(seed * Math.PI * 2) * 0.1;
+          distanceSq = dx * dx + dy * dy;
+        }
+        const distance = Math.sqrt(distanceSq);
+        const minDistance = a.radius + b.radius + 30;
+        const collisionBoost = distance < minDistance ? (minDistance - distance) * 0.38 : 0;
+        const force = ((repelStrength / Math.max(90, distanceSq)) + collisionBoost) * cooling;
+        const ux = dx / distance;
+        const uy = dy / distance;
+        a.vx -= ux * force;
+        a.vy -= uy * force;
+        b.vx += ux * force;
+        b.vy += uy * force;
+      }
+    }
+
+    for (const edge of layoutEdges) {
+      const source = layoutNodes.get(edge.sourceId);
+      const target = layoutNodes.get(edge.targetId);
+      if (!source || !target || source === target) continue;
+      const dx = target.x - source.x;
+      const dy = target.y - source.y;
+      const distance = Math.max(1, Math.hypot(dx, dy));
+      const sameFile = source.node.modulePath === target.node.modulePath;
+      const desired = source.radius + target.radius + (sameFile ? 74 : 118);
+      const force = (distance - desired) * edgeStrength;
+      const ux = dx / distance;
+      const uy = dy / distance;
+      source.vx += ux * force;
+      source.vy += uy * force;
+      target.vx -= ux * force;
+      target.vy -= uy * force;
+    }
+
+    for (const item of nodes) {
+      const cluster = clusterCenters.get(item.node.modulePath) || center;
+      item.vx += (cluster.x - item.x) * clusterStrength * cooling;
+      item.vy += (cluster.y - item.y) * clusterStrength * cooling;
+      item.vx += (center.x - item.x) * centerStrength;
+      item.vy += (center.y - item.y) * centerStrength;
+      item.x = clamp(item.x + item.vx, item.radius + 28, width - item.radius - 28);
+      item.y = clamp(item.y + item.vy, item.radius + 28, height - item.radius - 44);
+    }
+  }
+}
+
+function expandNetworkSpread(layoutNodes) {
+  const nodes = Array.from(layoutNodes.values());
+  if (nodes.length <= 1) return;
+  const minX = Math.min(...nodes.map((item) => item.x));
+  const maxX = Math.max(...nodes.map((item) => item.x));
+  const minY = Math.min(...nodes.map((item) => item.y));
+  const maxY = Math.max(...nodes.map((item) => item.y));
+  const currentWidth = Math.max(1, maxX - minX);
+  const currentHeight = Math.max(1, maxY - minY);
+  const desiredWidth = clamp(Math.sqrt(nodes.length) * 122, 620, 980);
+  const desiredHeight = clamp(Math.sqrt(nodes.length) * 84, 430, 660);
+  const scaleX = Math.max(1, desiredWidth / currentWidth);
+  const scaleY = Math.max(1, desiredHeight / currentHeight);
+  if (scaleX <= 1.01 && scaleY <= 1.01) return;
+
+  const centerX = (minX + maxX) / 2;
+  const centerY = (minY + maxY) / 2;
+  for (const item of nodes) {
+    item.x = centerX + (item.x - centerX) * scaleX;
+    item.y = centerY + (item.y - centerY) * scaleY;
+  }
+}
+
+function normalizeNetworkBounds(layoutNodes) {
+  const nodes = Array.from(layoutNodes.values());
+  if (nodes.length === 0) {
+    networkBaseWidth = 900;
+    networkBaseHeight = 420;
+    return { width: networkBaseWidth, height: networkBaseHeight };
+  }
+
+  const labelPadding = 72;
+  const minX = Math.min(...nodes.map((item) => item.x - item.radius - labelPadding));
+  const maxX = Math.max(...nodes.map((item) => item.x + item.radius + labelPadding));
+  const minY = Math.min(...nodes.map((item) => item.y - item.radius - 42));
+  const maxY = Math.max(...nodes.map((item) => item.y + item.radius + 54));
+  const padding = 72;
+  const width = Math.max(920, Math.ceil(maxX - minX + padding * 2));
+  const height = Math.max(560, Math.ceil(maxY - minY + padding * 2));
+  for (const item of nodes) {
+    item.x = item.x - minX + padding;
+    item.y = item.y - minY + padding;
+  }
+  networkBaseWidth = width;
+  networkBaseHeight = height;
+  return { width, height };
+}
+
 function layoutFunctionNetwork() {
   const fileOrder = buildModuleOrder();
   assignFileColors(fileOrder);
   renderFileLegend(fileOrder);
 
-  const nodesByFile = new Map(fileOrder.map((modulePath) => [modulePath, []]));
-  for (const node of functions) {
-    if (!nodesByFile.has(node.modulePath)) nodesByFile.set(node.modulePath, []);
-    nodesByFile.get(node.modulePath).push(node);
-  }
-  for (const list of nodesByFile.values()) list.sort(sortFunctions);
-
   const lineCounts = functions.map(lineCountFor).filter((count) => count > 0);
   const minLines = lineCounts.length ? Math.min(...lineCounts) : 1;
   const maxLines = lineCounts.length ? Math.max(...lineCounts) : 1;
-  const visibleFileOrder = fileOrder.filter((modulePath) => (nodesByFile.get(modulePath) || []).length > 0);
-  const columnGap = 245;
-  const laneWidth = 205;
-  const rowGap = 66;
-  const marginX = 110;
-  const marginY = 78;
-  const maxRows = Math.max(1, ...visibleFileOrder.map((modulePath) => nodesByFile.get(modulePath).length));
-  const width = Math.max(920, marginX * 2 + Math.max(1, visibleFileOrder.length - 1) * columnGap + laneWidth);
-  const height = Math.max(560, marginY * 2 + (maxRows - 1) * rowGap + 100);
+  const count = Math.max(1, functions.length);
+  const width = Math.max(1040, Math.ceil(Math.sqrt(count) * 195));
+  const height = Math.max(680, Math.ceil(Math.sqrt(count) * 155));
   const nodes = new Map();
-  const lanes = [];
+  const clusterCenters = moduleClusterCenters(fileOrder, width, height);
 
-  visibleFileOrder.forEach((modulePath, fileIndex) => {
-    const x = marginX + fileIndex * columnGap;
-    lanes.push({
-      modulePath,
-      x: x - laneWidth / 2,
-      y: 34,
-      width: laneWidth,
-      height: height - 68,
-    });
-    const list = nodesByFile.get(modulePath) || [];
-    list.forEach((node, index) => {
-      nodes.set(node.id, {
-        node,
-        x,
-        y: marginY + index * rowGap,
-        radius: scaledNodeRadius(node, minLines, maxLines),
-        color: fileColorByPath.get(node.modulePath) || '#64748b',
-      });
+  functions.forEach((node, index) => {
+    const cluster = clusterCenters.get(node.modulePath) || { x: width / 2, y: height / 2 };
+    const position = networkInitialPosition(node, index, functions.length, cluster, width, height);
+    nodes.set(node.id, {
+      node,
+      x: position.x,
+      y: position.y,
+      vx: 0,
+      vy: 0,
+      radius: scaledNodeRadius(node, minLines, maxLines),
+      color: fileColorByPath.get(node.modulePath) || '#64748b',
     });
   });
 
-  networkBaseWidth = width;
-  networkBaseHeight = height;
-  networkLayout = { width, height, lanes, nodes };
+  simulateForceLayout(nodes, edges, clusterCenters, width, height);
+  expandNetworkSpread(nodes);
+  const bounds = normalizeNetworkBounds(nodes);
+  networkLayout = { width: bounds.width, height: bounds.height, nodes };
 }
 
 function edgeEndpoint(source, target, sourceRadius, targetRadius) {
@@ -422,29 +626,27 @@ function edgePath(edge) {
   const target = networkLayout.nodes.get(edge.targetId);
   if (!source || !target) return '';
   if (edge.sourceId === edge.targetId) {
-    const r = source.radius + 20;
+    const r = source.radius + 34;
     return [
       'M', source.x + source.radius, source.y,
       'C', source.x + r, source.y - r,
-      source.x + r, source.y + r,
-      source.x + source.radius, source.y + 2,
+      source.x - r, source.y - r,
+      source.x - source.radius, source.y,
     ].join(' ');
   }
   const endpoints = edgeEndpoint(source, target, source.radius, target.radius);
-  if (source.node.modulePath === target.node.modulePath) {
-    const curveX = Math.max(source.x, target.x) + 72;
-    return [
-      'M', endpoints.startX, endpoints.startY,
-      'C', curveX, endpoints.startY,
-      curveX, endpoints.endY,
-      endpoints.endX, endpoints.endY,
-    ].join(' ');
-  }
-  const middleX = (endpoints.startX + endpoints.endX) / 2;
+  const dx = endpoints.endX - endpoints.startX;
+  const dy = endpoints.endY - endpoints.startY;
+  const length = Math.max(1, Math.hypot(dx, dy));
+  const bendSeed = seededUnit(edge.id || (edge.sourceId + ':' + edge.targetId));
+  const bendSign = bendSeed < 0.5 ? -1 : 1;
+  const sameFile = source.node.modulePath === target.node.modulePath;
+  const offset = bendSign * Math.min(80, Math.max(18, length * (sameFile ? 0.16 : 0.1)));
+  const middleX = (endpoints.startX + endpoints.endX) / 2 - (dy / length) * offset;
+  const middleY = (endpoints.startY + endpoints.endY) / 2 + (dx / length) * offset;
   return [
     'M', endpoints.startX, endpoints.startY,
-    'C', middleX, endpoints.startY,
-    middleX, endpoints.endY,
+    'Q', middleX, middleY,
     endpoints.endX, endpoints.endY,
   ].join(' ');
 }
@@ -506,28 +708,6 @@ function renderFunctionNetwork() {
   marker.appendChild(markerPath);
   defs.appendChild(marker);
   networkSvgEl.appendChild(defs);
-
-  const laneGroup = createSvgElement('g', { class: 'file-lanes' });
-  for (const lane of networkLayout.lanes) {
-    laneGroup.appendChild(createSvgElement('rect', {
-      class: 'file-lane',
-      x: lane.x,
-      y: lane.y,
-      width: lane.width,
-      height: lane.height,
-      rx: 10,
-    }));
-    const label = createSvgElement('text', {
-      class: 'file-lane-label',
-      x: lane.x + 12,
-      y: lane.y + 22,
-    });
-    label.textContent = shortLabel(lane.modulePath, 25);
-    label.appendChild(createSvgElement('title'));
-    label.querySelector('title').textContent = lane.modulePath;
-    laneGroup.appendChild(label);
-  }
-  networkSvgEl.appendChild(laneGroup);
 
   const edgeGroup = createSvgElement('g', { class: 'network-edges' });
   for (const edge of edges) {
@@ -655,6 +835,626 @@ function scrollFunctionIntoView(functionId) {
   networkViewportEl.scrollLeft = Math.max(0, (layoutNode.x * networkZoom) - networkViewportEl.clientWidth / 2);
   networkViewportEl.scrollTop = Math.max(0, (layoutNode.y * networkZoom) - networkViewportEl.clientHeight / 2);
   return true;
+}
+
+function hasClass(element, className) {
+  if (!element) return false;
+  if (element.classList && typeof element.classList.contains === 'function') {
+    return element.classList.contains(className);
+  }
+  return (' ' + (element.getAttribute?.('class') || '') + ' ').includes(' ' + className + ' ');
+}
+
+function updateModuleDiagramZoomStatus() {
+  moduleDiagramZoomStatusEl.textContent = 'Zoom ' + Math.round(moduleDiagramZoom * 100) + '%';
+}
+
+function setModuleDiagramSvgSizeForZoom() {
+  if (!moduleDiagramSvgEl || !moduleDiagramBaseWidth || !moduleDiagramBaseHeight) return;
+  moduleDiagramSvgEl.style.width = (moduleDiagramBaseWidth * moduleDiagramZoom) + 'px';
+  moduleDiagramSvgEl.style.height = (moduleDiagramBaseHeight * moduleDiagramZoom) + 'px';
+  updateModuleDiagramZoomStatus();
+}
+
+function centerModuleDiagram() {
+  moduleDiagramViewportEl.scrollLeft = Math.max(0, (moduleDiagramViewportEl.scrollWidth - moduleDiagramViewportEl.clientWidth) / 2);
+  moduleDiagramViewportEl.scrollTop = Math.max(0, (moduleDiagramViewportEl.scrollHeight - moduleDiagramViewportEl.clientHeight) / 2);
+}
+
+function setModuleDiagramZoom(nextZoom, anchorClientX = null, anchorClientY = null) {
+  if (!moduleDiagramSvgEl || !moduleDiagramBaseWidth || !moduleDiagramBaseHeight) return;
+  const clamped = clamp(nextZoom, 0.2, 4);
+  if (Math.abs(clamped - moduleDiagramZoom) < 0.001) return;
+
+  const rect = moduleDiagramViewportEl.getBoundingClientRect();
+  const anchorX = anchorClientX == null ? rect.left + moduleDiagramViewportEl.clientWidth / 2 : anchorClientX;
+  const anchorY = anchorClientY == null ? rect.top + moduleDiagramViewportEl.clientHeight / 2 : anchorClientY;
+  const localX = anchorX - rect.left + moduleDiagramViewportEl.scrollLeft;
+  const localY = anchorY - rect.top + moduleDiagramViewportEl.scrollTop;
+  const ratioX = localX / Math.max(0.001, moduleDiagramZoom);
+  const ratioY = localY / Math.max(0.001, moduleDiagramZoom);
+
+  moduleDiagramZoom = clamped;
+  setModuleDiagramSvgSizeForZoom();
+  moduleDiagramViewportEl.scrollLeft = Math.max(0, ratioX * moduleDiagramZoom - (anchorX - rect.left));
+  moduleDiagramViewportEl.scrollTop = Math.max(0, ratioY * moduleDiagramZoom - (anchorY - rect.top));
+  sendViewerBridgeState('zoom-file-diagram');
+}
+
+function fitModuleDiagramToViewport() {
+  if (!moduleDiagramSvgEl || !moduleDiagramBaseWidth || !moduleDiagramBaseHeight) return;
+  const availableWidth = Math.max(100, moduleDiagramViewportEl.clientWidth - 34);
+  const availableHeight = Math.max(100, moduleDiagramViewportEl.clientHeight - 34);
+  moduleDiagramZoom = clamp(Math.min(1, availableWidth / moduleDiagramBaseWidth, availableHeight / moduleDiagramBaseHeight), 0.2, 4);
+  setModuleDiagramSvgSizeForZoom();
+  centerModuleDiagram();
+  sendViewerBridgeState('fit-file-diagram');
+}
+
+function resetModuleDiagramView() {
+  if (!moduleDiagramSvgEl) return;
+  moduleDiagramZoom = 1;
+  setModuleDiagramSvgSizeForZoom();
+  centerModuleDiagram();
+  sendViewerBridgeState('reset-file-diagram-view');
+}
+
+function edgeTargetBasename(edge = {}) {
+  const targetPath = typeof edge.targetPath === 'string' ? edge.targetPath : '';
+  const target = targetPath || (typeof edge.target === 'string' ? edge.target : '');
+  return target.split(/[\\/]/).filter(Boolean).at(-1) || target;
+}
+
+function prefixLineCount(label, lineCount) {
+  return Number.isInteger(lineCount) && lineCount > 0 ? lineCount + ' ' + label : label;
+}
+
+function formatNamedImportBinding(binding = {}) {
+  const imported = typeof binding.imported === 'string' ? binding.imported : '';
+  const local = typeof binding.local === 'string' ? binding.local : '';
+  if (!imported && !local) return '';
+  const callable = (local || imported) + '()';
+  const label = !imported || imported === local ? callable : imported + ' as ' + callable;
+  return prefixLineCount(label, binding.lineCount);
+}
+
+function edgeImportLabels(edge = {}) {
+  const labels = [];
+  const targetLabel = edgeTargetBasename(edge);
+  for (const binding of safeArray(edge.imports)) {
+    const kind = typeof binding?.kind === 'string' ? binding.kind : 'named';
+    if (kind === 'named') {
+      labels.push(formatNamedImportBinding(binding));
+    } else if (targetLabel) {
+      labels.push(prefixLineCount(targetLabel, edge.targetLineCount));
+    }
+  }
+  if (labels.length === 0 && targetLabel) labels.push(prefixLineCount(targetLabel, edge.targetLineCount));
+  return Array.from(new Set(labels)).filter(Boolean);
+}
+
+function edgeDataIdPrefix(source, target) {
+  return 'id_' + source + '_' + target + '_';
+}
+
+function findEdgeLabelGroup(label, dataId) {
+  const groups = Array.from(label.querySelectorAll('g.label[data-id]'));
+  return groups.find((group) => group.getAttribute('data-id') === dataId) || groups[0] || null;
+}
+
+function findRenderedEdgeLabel(labels, dataId) {
+  for (const label of labels) {
+    const labelGroup = findEdgeLabelGroup(label, dataId);
+    if (labelGroup && labelGroup.getAttribute('data-id') === dataId) return { label, labelGroup };
+  }
+  return { label: null, labelGroup: null };
+}
+
+function originalEdgeLabelContent(labelGroup) {
+  return Array.from(labelGroup.children)
+    .find((child) => !hasClass(child, 'edge-import-label')) || null;
+}
+
+function renderEmptySelectedImport() {
+  selectedImportEl.textContent = '';
+  selectedImportEl.appendChild(createElement('p', 'empty-note', 'No import edge selected.'));
+}
+
+function appendSelectedImportRow(parent, label, value) {
+  const row = createElement('div', 'selected-import-row');
+  row.append(createElement('span', '', label), createElement('code', '', value || 'none'));
+  parent.appendChild(row);
+}
+
+function renderSelectedImport(edge, labels) {
+  selectedImportEl.textContent = '';
+  const title = createElement('h3', '', (edge.source || 'unknown') + ' -> ' + (edge.target || 'unknown'));
+  const rows = createElement('div', 'selected-import-rows');
+  appendSelectedImportRow(rows, 'Source', edge.sourcePath || edge.source);
+  appendSelectedImportRow(rows, 'Target', edge.targetPath || edge.target);
+  appendSelectedImportRow(rows, 'Load', safeArray(edge.loadKinds).join(', ') || 'unknown');
+  const listTitle = createElement('h4', '', 'Direct Imports');
+  const list = createElement('ul', 'selected-import-list');
+  for (const label of labels) {
+    const item = createElement('li', '', label);
+    list.appendChild(item);
+  }
+  selectedImportEl.append(title, rows, listTitle, list);
+}
+
+function collapseExpandedEdge() {
+  if (!expandedImportEdge) return;
+  const { customLabel, label, originalContent, originalDisplay, path } = expandedImportEdge;
+  if (customLabel && typeof customLabel.remove === 'function') customLabel.remove();
+  if (originalContent) originalContent.style.display = originalDisplay;
+  if (label) label.classList.remove('is-expanded');
+  if (path) path.classList.remove('is-selected');
+  expandedImportEdge = null;
+  renderEmptySelectedImport();
+}
+
+function expandEdgeLabel(edge, path, label, labelGroup) {
+  collapseExpandedEdge();
+  const originalContent = labelGroup && originalEdgeLabelContent(labelGroup);
+  if (!labelGroup || !originalContent) return;
+  const labels = edgeImportLabels(edge);
+  const lines = labels.length > 0 ? labels : [edge.targetPath || edge.target || 'module import'];
+  const width = Math.min(460, Math.max(120, Math.ceil(Math.max(...lines.map((line) => line.length)) * 7.2) + 24));
+  const height = 12 + (lines.length * 20);
+  const customLabel = createSvgElement('g', { class: 'edge-import-label' });
+  const rect = createSvgElement('rect', {
+    x: -width / 2,
+    y: -height / 2,
+    width,
+    height,
+    rx: 7,
+  });
+  const text = createSvgElement('text', { x: 0, y: (-height / 2) + 18, 'text-anchor': 'middle' });
+  lines.forEach((line, index) => {
+    const tspan = createSvgElement('tspan', { x: 0, dy: index > 0 ? 20 : null });
+    tspan.textContent = line;
+    text.appendChild(tspan);
+  });
+  customLabel.append(rect, text);
+  const originalDisplay = originalContent.style.display;
+  originalContent.style.display = 'none';
+  labelGroup.appendChild(customLabel);
+  label.classList.add('is-expanded');
+  path.classList.add('is-selected');
+  expandedImportEdge = { customLabel, label, originalContent, originalDisplay, path };
+  renderSelectedImport(edge, lines);
+  sendViewerBridgeState('select-import-edge');
+}
+
+function addEdgeActivation(element, callback) {
+  element.setAttribute('tabindex', '0');
+  element.setAttribute('role', 'button');
+  addKeyboardActivation(element, callback);
+}
+
+function sourceLabelBase(labelText) {
+  return (typeof labelText === 'string' ? labelText : '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^\\?[+#~-]\s*/, '')
+    .replace(sourceMetricsSuffixPattern, '')
+    .replace(/^\d+\s+/, '')
+    .replace(/\s+:\s*$/, '')
+    .trim();
+}
+
+function sourceMemberName(label) {
+  let text = sourceLabelBase(label.textContent);
+  const parametersIndex = text.indexOf('(');
+  if (parametersIndex !== -1) text = text.slice(0, parametersIndex);
+  return text.trim();
+}
+
+function addModuleIdCandidate(candidates, value) {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!raw) return;
+  const classIdMatch = raw.match(/(?:^|-)classId-(.+?)(?:-\d+)?$/);
+  if (classIdMatch) {
+    candidates.push(classIdMatch[1]);
+    return;
+  }
+  const classVariantMatch = raw.match(/^(?:class|flowchart)-(.+?)(?:-\d+)?$/);
+  if (classVariantMatch) {
+    candidates.push(classVariantMatch[1]);
+    return;
+  }
+  candidates.push(raw);
+}
+
+function sourceModuleIdCandidatesFromElement(element) {
+  const candidates = [];
+  if (!element || typeof element.getAttribute !== 'function') return candidates;
+  addModuleIdCandidate(candidates, element.getAttribute('data-id'));
+  addModuleIdCandidate(candidates, element.getAttribute('data-node-id'));
+  addModuleIdCandidate(candidates, element.getAttribute('data-class-id'));
+  addModuleIdCandidate(candidates, element.getAttribute('id'));
+  return Array.from(new Set(candidates));
+}
+
+function sourceDeclarationForLabel(label) {
+  const name = sourceMemberName(label);
+  if (!name) return null;
+  let current = label;
+  while (current && current !== moduleDiagramSvgEl) {
+    for (const moduleId of sourceModuleIdCandidatesFromElement(current)) {
+      const declaration = declarationsByModuleIdAndName.get(sourceKey(moduleId, name));
+      if (declaration) return declaration;
+    }
+    current = current.parentNode;
+  }
+  return null;
+}
+
+function svgNumber(value) {
+  if (!Number.isFinite(value)) return '0';
+  return String(Number(value.toFixed(3)));
+}
+
+function validSourceHitBox(box) {
+  return box
+    && Number.isFinite(box.x)
+    && Number.isFinite(box.y)
+    && Number.isFinite(box.width)
+    && Number.isFinite(box.height)
+    && box.width > 0
+    && box.height > 0;
+}
+
+function sourceHitBoxFromAttributes(element) {
+  if (!element || typeof element.getAttribute !== 'function') return null;
+  const box = {
+    x: Number.parseFloat(element.getAttribute('x')),
+    y: Number.parseFloat(element.getAttribute('y')),
+    width: Number.parseFloat(element.getAttribute('width')),
+    height: Number.parseFloat(element.getAttribute('height')),
+  };
+  return validSourceHitBox(box) ? box : null;
+}
+
+function sourceHitTargetReference(element) {
+  let current = element;
+  while (current && current !== moduleDiagramSvgEl) {
+    if (typeof current.getBBox === 'function') {
+      try {
+        const box = current.getBBox();
+        if (validSourceHitBox(box)) return { element: current, box };
+      } catch {
+        // Mermaid can expose getBBox before every nested label has finished layout.
+      }
+    }
+    const attributeBox = sourceHitBoxFromAttributes(current);
+    if (attributeBox) return { element: current, box: attributeBox };
+    current = current.parentNode;
+  }
+  return null;
+}
+
+function sourceMemberRecordForElement(element) {
+  let current = element;
+  while (current && current !== moduleDiagramViewportEl) {
+    if (typeof current.getAttribute === 'function') {
+      const targetId = current.getAttribute('data-source-member-target-id');
+      if (targetId && sourceMemberTargets.has(targetId)) return sourceMemberTargets.get(targetId);
+    }
+    current = current.parentNode;
+  }
+  return null;
+}
+
+function sourceClientRectForRecord(record) {
+  if (!record?.element || typeof record.element.getBoundingClientRect !== 'function') return null;
+  const rawRect = record.element.getBoundingClientRect();
+  if (!rawRect) return null;
+  const left = Number(rawRect.left);
+  const top = Number(rawRect.top);
+  const width = Number.isFinite(rawRect.width) ? Number(rawRect.width) : Number(rawRect.right) - left;
+  const height = Number.isFinite(rawRect.height) ? Number(rawRect.height) : Number(rawRect.bottom) - top;
+  if (!Number.isFinite(left) || !Number.isFinite(top) || !Number.isFinite(width) || !Number.isFinite(height)) return null;
+  if (width <= 0 || height <= 0) return null;
+  return {
+    left,
+    top,
+    right: Number.isFinite(rawRect.right) ? Number(rawRect.right) : left + width,
+    bottom: Number.isFinite(rawRect.bottom) ? Number(rawRect.bottom) : top + height,
+    width,
+    height,
+  };
+}
+
+function sourcePointInsideRecord(record, clientX, clientY) {
+  const rect = sourceClientRectForRecord(record);
+  if (!rect) return null;
+  return clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom;
+}
+
+function sourceElementsFromPoint(clientX, clientY) {
+  if (typeof document.elementsFromPoint !== 'function') return [];
+  try {
+    return Array.from(document.elementsFromPoint(clientX, clientY) || []);
+  } catch {
+    return [];
+  }
+}
+
+function sourceVisibleRecordFromPointStack(elements, clientX, clientY) {
+  for (const element of elements) {
+    if (hasClass(element, 'source-member-hit-target')) continue;
+    const record = sourceMemberRecordForElement(element);
+    if (!record) continue;
+    const containsPoint = sourcePointInsideRecord(record, clientX, clientY);
+    if (containsPoint !== false) return record;
+  }
+  return null;
+}
+
+function sourceCandidateRecordsFromPointStack(elements, fallbackRecord) {
+  const records = [];
+  const seen = new Set();
+  const addRecord = (record) => {
+    if (!record || seen.has(record.id)) return;
+    seen.add(record.id);
+    records.push(record);
+  };
+  for (const element of elements) addRecord(sourceMemberRecordForElement(element));
+  addRecord(fallbackRecord);
+  return records;
+}
+
+function sourceRecordDistanceFromPoint(record, clientX, clientY) {
+  const rect = sourceClientRectForRecord(record);
+  if (!rect) return { vertical: Number.POSITIVE_INFINITY, horizontal: Number.POSITIVE_INFINITY };
+  const centerY = rect.top + rect.height / 2;
+  const vertical = Math.abs(clientY - centerY);
+  const horizontal = clientX < rect.left ? rect.left - clientX : (clientX > rect.right ? clientX - rect.right : 0);
+  return { vertical, horizontal };
+}
+
+function nearestSourceRecordForPoint(records, clientX, clientY) {
+  return records
+    .map((record) => ({
+      record,
+      distance: sourceRecordDistanceFromPoint(record, clientX, clientY),
+    }))
+    .sort((a, b) => a.distance.vertical - b.distance.vertical
+      || a.distance.horizontal - b.distance.horizontal
+      || a.record.order - b.record.order
+      || String(a.record.declaration?.name || '').localeCompare(String(b.record.declaration?.name || '')))[0]?.record || null;
+}
+
+function sourceActivationRecordForEvent(event, fallbackRecord) {
+  const targetRecord = sourceMemberRecordForElement(event?.currentTarget)
+    || sourceMemberRecordForElement(event?.target)
+    || fallbackRecord;
+  const clientX = Number(event?.clientX);
+  const clientY = Number(event?.clientY);
+  if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return targetRecord;
+
+  const pointElements = sourceElementsFromPoint(clientX, clientY);
+  const visibleRecord = sourceVisibleRecordFromPointStack(pointElements, clientX, clientY);
+  if (visibleRecord) return visibleRecord;
+
+  const candidates = sourceCandidateRecordsFromPointStack(pointElements, targetRecord);
+  return nearestSourceRecordForPoint(candidates, clientX, clientY) || targetRecord;
+}
+
+function addSourceHitTarget(record, activate) {
+  const reference = sourceHitTargetReference(record.element);
+  const parent = reference?.element?.parentNode;
+  if (!parent) return;
+  const { x, y, width, height } = reference.box;
+  const hitTarget = createSvgElement('path', {
+    class: 'source-member-hit-target',
+    'data-source-member-target-id': record.id,
+    d: 'M' + svgNumber(x) + ' ' + svgNumber(y + height / 2) + 'H' + svgNumber(x + width),
+    'aria-hidden': 'true',
+    focusable: 'false',
+    'vector-effect': 'non-scaling-stroke',
+  });
+  hitTarget.addEventListener('click', activate);
+  record.hitTarget = hitTarget;
+  parent.appendChild(hitTarget);
+}
+
+function renderDeclarationFallbackDialog(declaration, restoreFocusEl = null) {
+  sourceDialogState = { functionId: '', group: [], index: -1 };
+  sourceDialogRestoreFocusEl = restoreFocusEl || null;
+  sourceDialogTitleEl.textContent = callableLabel(declaration.name || declaration.declarationName || 'Source');
+  sourceDialogPathEl.textContent = (declaration.modulePath || 'unknown source') + ':' + lineRange(declaration);
+  sourceDialogInsightEl.textContent = '';
+  sourceDialogInsightEl.appendChild(createElement('p', 'takeaway', 'Saved source for this diagram member is available, but it is not present in the function network snapshot.'));
+  sourceDialogNeighborhoodEl.textContent = '';
+  sourceDialogCodeEl.textContent = declaration.code || '// Source snippet was not saved for this member.';
+  sourceDialogConnectionsEl.hidden = true;
+  updateDialogNavigationControls();
+  if (typeof sourceDialogEl.showModal === 'function') {
+    if (!sourceDialogEl.open) sourceDialogEl.showModal();
+  } else {
+    sourceDialogEl.setAttribute('open', '');
+  }
+  sourceDialogBodyEl.scrollTop = 0;
+  sourceDialogCloseBtn.focus();
+  sendViewerBridgeState('open-source');
+}
+
+function openSourceDeclarationFromDiagram(declaration, restoreFocusEl) {
+  const node = functionNodeForDeclaration(declaration);
+  if (node) {
+    showSourceDialogForFunctionId(node.id, restoreFocusEl);
+    return true;
+  }
+  renderDeclarationFallbackDialog(declaration, restoreFocusEl);
+  return true;
+}
+
+function addSourceActivation(element, declaration) {
+  const record = {
+    id: String(++sourceMemberTargetCounter),
+    order: sourceMemberTargetCounter,
+    element,
+    declaration,
+    hitTarget: null,
+  };
+  sourceMemberTargets.set(record.id, record);
+
+  element.classList.add('source-member-trigger');
+  element.setAttribute('data-source-member-target-id', record.id);
+  if (declaration.functionId) element.setAttribute('data-ironglancer-function-id', declaration.functionId);
+  if (declaration.functionStableId) element.setAttribute('data-ironglancer-function-stable-id', declaration.functionStableId);
+  element.setAttribute('tabindex', '0');
+  element.setAttribute('role', 'button');
+  element.setAttribute('focusable', 'true');
+  element.setAttribute('aria-label', 'Show source for ' + (declaration.name || declaration.declarationName) + ' in ' + declaration.modulePath);
+
+  const title = element.querySelector?.('title') || createSvgElement('title');
+  title.textContent = 'Show source for ' + callableLabel(declaration.name || declaration.declarationName);
+  if (!title.parentNode) element.insertBefore(title, element.firstChild);
+
+  const activate = (event) => {
+    if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
+    const activationRecord = sourceActivationRecordForEvent(event, record) || record;
+    highlightSourceRecord(activationRecord);
+    openSourceDeclarationFromDiagram(activationRecord.declaration, activationRecord.element || element);
+  };
+  addKeyboardActivation(element, activate);
+  addSourceHitTarget(record, activate);
+}
+
+function sourceRecordForDeclaration(declaration) {
+  if (!declaration) return null;
+  const functionId = String(declaration.functionId || '').trim();
+  const functionStableId = String(declaration.functionStableId || '').trim();
+  return Array.from(sourceMemberTargets.values())
+    .find((record) => (
+      record.declaration === declaration
+      || (functionStableId && record.declaration?.functionStableId === functionStableId)
+      || (functionId && record.declaration?.functionId === functionId)
+    )) || null;
+}
+
+function sourceRecordForFunctionId(functionId) {
+  const declaration = declarationsByFunctionId.get(functionId)
+    || declarationsByFunctionStableId.get(functionById.get(functionId)?.stableId);
+  return sourceRecordForDeclaration(declaration);
+}
+
+function clearSourceHighlight() {
+  if (!highlightedSourceRecord) return;
+  highlightedSourceRecord.element?.classList?.remove('is-agent-highlighted');
+  highlightedSourceRecord.hitTarget?.classList?.remove('is-agent-highlighted');
+  highlightedSourceRecord = null;
+}
+
+function highlightSourceRecord(record) {
+  clearSourceHighlight();
+  if (!record) return false;
+  highlightedSourceRecord = record;
+  record.element?.classList?.add('is-agent-highlighted');
+  record.hitTarget?.classList?.add('is-agent-highlighted');
+  return true;
+}
+
+function scrollSourceRecordIntoView(record) {
+  const element = record?.element;
+  if (!element) return false;
+  if (typeof element.scrollIntoView === 'function') {
+    element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'smooth' });
+    return true;
+  }
+  return true;
+}
+
+function wireSourceMembers() {
+  if (!moduleDiagramSvgEl || typeof moduleDiagramSvgEl.querySelectorAll !== 'function') return;
+  sourceMemberTargetCounter = 0;
+  sourceMemberTargets = new Map();
+  const labels = [
+    ...Array.from(moduleDiagramSvgEl.querySelectorAll('text')),
+    ...Array.from(moduleDiagramSvgEl.querySelectorAll('p')),
+  ];
+  for (const label of labels) {
+    const declaration = sourceDeclarationForLabel(label);
+    if (!declaration) continue;
+    addSourceActivation(label, declaration);
+  }
+}
+
+function wireImportEdges(importEdges) {
+  if (!moduleDiagramSvgEl || typeof moduleDiagramSvgEl.querySelectorAll !== 'function') return;
+  const paths = Array.from(moduleDiagramSvgEl.querySelectorAll('path[data-id]'))
+    .filter((path) => hasClass(path, 'relation') || path.getAttribute('data-edge') === 'true');
+  const labels = Array.from(moduleDiagramSvgEl.querySelectorAll('g.edgeLabel'));
+  const claimedPaths = new Set();
+
+  for (const edge of safeArray(importEdges)) {
+    const prefix = edgeDataIdPrefix(edge.source, edge.target);
+    const path = paths.find((candidate) => {
+      const dataId = candidate.getAttribute('data-id') || '';
+      return !claimedPaths.has(candidate) && dataId.startsWith(prefix);
+    });
+    if (!path) continue;
+    const dataId = path.getAttribute('data-id');
+    const { label, labelGroup } = findRenderedEdgeLabel(labels, dataId);
+    if (!label || !labelGroup) continue;
+    claimedPaths.add(path);
+
+    const activate = () => expandEdgeLabel(edge, path, label, labelGroup);
+    const targetLabel = edge.targetPath || edge.target;
+    path.setAttribute('aria-label', 'Show imports for ' + targetLabel);
+    label.setAttribute('aria-label', 'Show imports for ' + targetLabel);
+    addEdgeActivation(path, activate);
+    addEdgeActivation(label, activate);
+
+    const hitPath = path.cloneNode(false);
+    hitPath.classList.add('edge-hit-target');
+    hitPath.removeAttribute('id');
+    hitPath.removeAttribute('data-id');
+    hitPath.removeAttribute('aria-label');
+    hitPath.removeAttribute('role');
+    hitPath.removeAttribute('tabindex');
+    hitPath.removeAttribute('marker-start');
+    hitPath.removeAttribute('marker-mid');
+    hitPath.removeAttribute('marker-end');
+    hitPath.setAttribute('aria-hidden', 'true');
+    hitPath.setAttribute('focusable', 'false');
+    hitPath.setAttribute('vector-effect', 'non-scaling-stroke');
+    hitPath.addEventListener('click', activate);
+    path.parentNode.insertBefore(hitPath, path);
+  }
+}
+
+function prepareModuleDiagramForInteraction(svgMarkup, importEdges) {
+  latestModuleSvg = svgMarkup;
+  moduleDiagramEl.innerHTML = svgMarkup;
+  moduleDiagramSvgEl = moduleDiagramEl.querySelector('svg');
+  expandedImportEdge = null;
+  renderEmptySelectedImport();
+  if (!moduleDiagramSvgEl) return;
+
+  const viewBox = moduleDiagramSvgEl.viewBox && moduleDiagramSvgEl.viewBox.baseVal;
+  if (viewBox && viewBox.width > 0 && viewBox.height > 0) {
+    moduleDiagramBaseWidth = viewBox.width;
+    moduleDiagramBaseHeight = viewBox.height;
+  } else {
+    moduleDiagramBaseWidth = moduleDiagramSvgEl.getBoundingClientRect().width
+      || Number.parseFloat(moduleDiagramSvgEl.getAttribute('width'))
+      || 1200;
+    moduleDiagramBaseHeight = moduleDiagramSvgEl.getBoundingClientRect().height
+      || Number.parseFloat(moduleDiagramSvgEl.getAttribute('height'))
+      || 800;
+  }
+
+  moduleDiagramSvgEl.setAttribute('preserveAspectRatio', 'xMinYMin meet');
+  moduleDiagramSvgEl.style.maxWidth = 'none';
+  moduleDiagramZoom = 1;
+  setModuleDiagramSvgSizeForZoom();
+  wireImportEdges(importEdges);
+  wireSourceMembers();
+  requestAnimationFrame(() => fitModuleDiagramToViewport());
 }
 
 function externalRelationshipsForNode(node = {}) {
@@ -813,6 +1613,119 @@ function renderFilterControls(parent, items) {
   if (row.children.length > 0) parent.appendChild(row);
 }
 
+function relationshipMetricItems(items) {
+  const counts = relationshipCounts(items);
+  return [
+    { label: 'Used by', value: counts['used-by'] || 0, className: 'is-incoming' },
+    { label: 'Uses', value: counts.uses || 0, className: 'is-outgoing' },
+    { label: 'Across files', value: counts['other-files'] || 0, className: 'is-cross-file' },
+    { label: 'Browser/library', value: counts['browser-library'] || 0, className: 'is-external' },
+    { label: "Couldn't trace", value: counts['couldnt-trace'] || 0, className: 'is-unresolved' },
+  ].filter((item) => item.value > 0 || item.className === 'is-incoming' || item.className === 'is-outgoing');
+}
+
+function renderRelationshipMetrics(parent, items) {
+  const row = createElement('div', 'connection-metrics');
+  for (const item of relationshipMetricItems(items)) {
+    const metric = createElement('span', 'connection-metric ' + item.className);
+    metric.append(createElement('strong', '', String(item.value)), createElement('span', '', item.label));
+    row.appendChild(metric);
+  }
+  parent.appendChild(row);
+}
+
+function relationshipPreviewItems(items, maxItems = 8) {
+  const visibleItems = filteredRelationshipItems(items);
+  const ordered = [
+    ...visibleItems.filter((item) => item.direction === 'incoming' && item.functionId),
+    ...visibleItems.filter((item) => item.direction === 'outgoing' && item.functionId),
+    ...visibleItems.filter((item) => item.kind === 'external'),
+  ];
+  const seen = new Set();
+  const preview = [];
+  for (const item of ordered) {
+    const key = item.functionId || item.id;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    preview.push(item);
+    if (preview.length >= maxItems) break;
+  }
+  return { preview, hiddenCount: Math.max(0, ordered.length - preview.length) };
+}
+
+function relationshipDirectionLabel(item) {
+  if (item.kind === 'external' && item.tags.includes('couldnt-trace')) return "Couldn't trace";
+  if (item.kind === 'external') return 'Browser/library';
+  return item.direction === 'incoming' ? 'Used by' : 'Uses';
+}
+
+function renderRelatedNodePill(item, mode) {
+  const targetNode = item.functionId ? functionById.get(item.functionId) : null;
+  const element = createElement(targetNode ? 'button' : 'span', 'related-node');
+  if (targetNode) {
+    element.type = 'button';
+    element.setAttribute('aria-label', (mode === 'dialog' ? 'Open ' : 'Select ') + displayName(targetNode));
+    element.addEventListener('click', () => {
+      if (mode === 'dialog') {
+        showSourceDialogForFunctionId(targetNode.id, element);
+      } else {
+        selectFunction(targetNode.id, { reason: 'select-related-function', restoreFocusEl: element });
+        scrollFunctionIntoView(targetNode.id);
+      }
+    });
+  }
+  const swatch = createElement('span', 'related-node-swatch');
+  swatch.style.background = targetNode
+    ? (fileColorByPath.get(targetNode.modulePath) || '#64748b')
+    : (item.tags.includes('couldnt-trace') ? '#f97316' : '#0f766e');
+  element.append(
+    swatch,
+    createElement('span', 'related-node-label', shortLabel(item.title.replace(/\(\)$/, ''), 18)),
+    createElement('span', 'related-node-meta', relationshipDirectionLabel(item)),
+  );
+  return element;
+}
+
+function renderCompactRelationshipSummary(parent, node, { mode = 'panel' } = {}) {
+  const items = relationshipItemsForNode(node);
+  const summary = createElement('section', 'connection-summary');
+  summary.setAttribute('aria-label', 'Connection summary');
+  renderRelationshipMetrics(summary, items);
+  const { preview, hiddenCount } = relationshipPreviewItems(items, mode === 'dialog' ? 10 : 8);
+  if (items.length === 0) {
+    summary.appendChild(createElement('p', 'empty-note', 'No saved callers or uses were traced for this function.'));
+  } else if (preview.length === 0) {
+    summary.appendChild(createElement('p', 'empty-note', 'No relationships match that focus.'));
+  } else {
+    const strip = createElement('div', 'related-node-strip');
+    for (const item of preview) strip.appendChild(renderRelatedNodePill(item, mode));
+    if (hiddenCount > 0) {
+      strip.appendChild(createElement('span', 'related-node', '+' + hiddenCount + ' more'));
+    }
+    summary.appendChild(strip);
+  }
+  parent.appendChild(summary);
+}
+
+function renderConnectionDisclosure(parent, node, { mode = 'panel' } = {}) {
+  const items = relationshipItemsForNode(node);
+  if (items.length === 0) return;
+  const details = createElement('details', 'connections-disclosure');
+  const summary = createElement('summary', '', 'All connections (' + items.length + ')');
+  const list = createElement('div', 'relationship-list');
+  details.append(summary, list);
+  renderRelationshipList(list, node, { mode, filterId: 'all' });
+  parent.appendChild(details);
+}
+
+function renderSourceConnectionDisclosure(node) {
+  const items = relationshipItemsForNode(node);
+  sourceDialogConnectionsEl.hidden = items.length === 0;
+  sourceDialogConnectionsEl.open = false;
+  sourceDialogConnectionsSummaryEl.textContent = 'All connections (' + items.length + ')';
+  renderRelationshipList(sourceDialogRelationshipsEl, node, { mode: 'dialog', filterId: 'all' });
+}
+
 function renderStaticChips(parent, node) {
   const row = createElement('div', 'chip-row');
   row.append(
@@ -820,7 +1733,12 @@ function renderStaticChips(parent, node) {
     createElement('span', 'chip', functionKindLabel(node)),
     createElement('span', 'chip', fileName(node.modulePath)),
   );
-  if (node.exported) row.appendChild(createElement('span', 'chip', 'Shared from file'));
+  const counts = relationshipCounts(relationshipItemsForNode(node));
+  if ((counts['other-files'] || 0) > 0) {
+    row.appendChild(createElement('span', 'chip', 'Used across files'));
+  } else if (node.exported) {
+    row.appendChild(createElement('span', 'chip', 'Exported'));
+  }
   parent.appendChild(row);
 }
 
@@ -865,10 +1783,10 @@ function renderRelationshipItem(item, mode = 'panel') {
   return element;
 }
 
-function renderRelationshipList(parent, node, { mode = 'panel' } = {}) {
+function renderRelationshipList(parent, node, { mode = 'panel', filterId = activeRelationFilter } = {}) {
   parent.textContent = '';
   const items = relationshipItemsForNode(node);
-  const visibleItems = filteredRelationshipItems(items);
+  const visibleItems = filteredRelationshipItems(items, filterId);
   if (items.length === 0) {
     parent.appendChild(createElement('p', 'empty-note', 'No saved callers or uses were traced for this function.'));
     return;
@@ -889,10 +1807,7 @@ function renderRelationshipList(parent, node, { mode = 'panel' } = {}) {
     if (groupItems.length === 0) continue;
     const section = createElement('section', 'relationship-group');
     section.appendChild(createElement('h4', '', relationshipGroupTitle(groupId)));
-    for (const item of groupItems.slice(0, 10)) section.appendChild(renderRelationshipItem(item, mode));
-    if (groupItems.length > 10) {
-      section.appendChild(createElement('p', 'empty-note', '+' + (groupItems.length - 10) + ' more'));
-    }
+    for (const item of groupItems) section.appendChild(renderRelationshipItem(item, mode));
     parent.appendChild(section);
   }
 }
@@ -925,9 +1840,8 @@ function renderSelectedFunctionPanel() {
   selectedFunctionEl.appendChild(createElement('p', 'takeaway', takeawayForNode(node)));
   renderStaticChips(selectedFunctionEl, node);
   renderFilterControls(selectedFunctionEl, relationshipItemsForNode(node));
-  const list = createElement('div', 'relationship-list');
-  selectedFunctionEl.appendChild(list);
-  renderRelationshipList(list, node, { mode: 'panel' });
+  renderCompactRelationshipSummary(selectedFunctionEl, node, { mode: 'panel' });
+  renderConnectionDisclosure(selectedFunctionEl, node, { mode: 'panel' });
 }
 
 function filterMatchedNodeIds(node, items) {
@@ -1031,10 +1945,11 @@ function renderDialogInsight(node) {
   sourceDialogInsightEl.appendChild(createElement('p', 'takeaway', takeawayForNode(node)));
   renderStaticChips(sourceDialogInsightEl, node);
   renderFilterControls(sourceDialogInsightEl, relationshipItemsForNode(node));
+  renderRelationshipMetrics(sourceDialogInsightEl, relationshipItemsForNode(node));
 }
 
-function miniNodeLabel(node) {
-  return shortLabel(displayName(node), 13);
+function miniNodeLabel(node, center = false) {
+  return shortLabel(displayName(node), center ? 14 : 10);
 }
 
 function renderNeighborhoodNode(parent, { x, y, node, color, center = false }) {
@@ -1050,15 +1965,15 @@ function renderNeighborhoodNode(parent, { x, y, node, color, center = false }) {
   group.appendChild(createSvgElement('circle', {
     cx: x,
     cy: y,
-    r: center ? 24 : 18,
+    r: center ? 22 : 15,
     fill: color,
   }));
   const label = createSvgElement('text', {
-    x: center ? x : x + 25,
-    y: center ? y + 40 : y + 4,
-    'text-anchor': center ? 'middle' : 'start',
+    x,
+    y: center ? y + 38 : y + 28,
+    'text-anchor': 'middle',
   });
-  label.textContent = miniNodeLabel(node);
+  label.textContent = miniNodeLabel(node, center);
   group.appendChild(label);
   addKeyboardActivation(group, () => showSourceDialogForFunctionId(node.id, group));
   parent.appendChild(group);
@@ -1070,19 +1985,19 @@ function renderExternalNeighborhoodNode(parent, { x, y, item }) {
   title.textContent = item.title + ' from ' + item.meta;
   group.appendChild(title);
   group.appendChild(createSvgElement('rect', {
-    x: x - 18,
-    y: y - 18,
-    width: 36,
-    height: 36,
+    x: x - 15,
+    y: y - 15,
+    width: 30,
+    height: 30,
     rx: 8,
     fill: item.tags.includes('couldnt-trace') ? '#f97316' : '#0f766e',
   }));
   const label = createSvgElement('text', {
-    x: x + 25,
-    y: y + 4,
-    'text-anchor': 'start',
+    x,
+    y: y + 28,
+    'text-anchor': 'middle',
   });
-  label.textContent = shortLabel(item.title.replace(/\(\)$/, ''), 13);
+  label.textContent = shortLabel(item.title.replace(/\(\)$/, ''), 10);
   group.appendChild(label);
   parent.appendChild(group);
 }
@@ -1096,15 +2011,26 @@ function miniEdge(parent, x1, y1, x2, y2, className) {
   }));
 }
 
-function distributedY(index, count, height, top = 58, bottom = 190) {
-  if (count <= 1) return height / 2;
-  const gap = (bottom - top) / Math.max(1, count - 1);
-  return top + index * gap;
+function spreadCoordinate(index, count, start, end) {
+  if (count <= 1) return (start + end) / 2;
+  return start + index * ((end - start) / (count - 1));
+}
+
+function gridPosition(index, count, { x1, x2, y1, y2 }) {
+  const rows = count > 4 ? 2 : 1;
+  const columns = Math.ceil(count / rows);
+  const row = Math.floor(index / columns);
+  const column = index - row * columns;
+  const rowCount = row === rows - 1 ? count - row * columns : columns;
+  return {
+    x: spreadCoordinate(column, rowCount, x1, x2),
+    y: spreadCoordinate(row, rows, y1, y2),
+  };
 }
 
 function renderNeighborhood(node) {
   sourceDialogNeighborhoodEl.textContent = '';
-  const svg = createSvgElement('svg', { viewBox: '0 0 620 260', role: 'img', 'aria-label': 'Nearby functions for ' + displayName(node) });
+  const svg = createSvgElement('svg', { viewBox: '0 0 700 190', role: 'img', 'aria-label': 'Nearby functions for ' + displayName(node) });
   const defs = createSvgElement('defs');
   const marker = createSvgElement('marker', {
     id: 'neighborhood-arrow',
@@ -1119,39 +2045,46 @@ function renderNeighborhood(node) {
   defs.appendChild(marker);
   svg.appendChild(defs);
 
-  const items = filteredRelationshipItems(relationshipItemsForNode(node));
-  const incoming = items.filter((item) => item.direction === 'incoming' && item.functionId).slice(0, 5);
-  const outgoingFunctions = items.filter((item) => item.direction === 'outgoing' && item.functionId).slice(0, 5);
-  const outgoingExternal = items.filter((item) => item.kind === 'external').slice(0, Math.max(0, 5 - outgoingFunctions.length));
-  const center = { x: 310, y: 126 };
+  const allItems = relationshipItemsForNode(node);
+  const items = filteredRelationshipItems(allItems);
+  const allIncoming = items.filter((item) => item.direction === 'incoming' && item.functionId);
+  const allOutgoing = [
+    ...items.filter((item) => item.direction === 'outgoing' && item.functionId),
+    ...items.filter((item) => item.kind === 'external'),
+  ];
+  const incoming = allIncoming.slice(0, 8);
+  const outgoing = allOutgoing.slice(0, 6);
+  const hiddenCount = Math.max(0, allIncoming.length - incoming.length)
+    + Math.max(0, allOutgoing.length - outgoing.length);
+  const center = { x: 350, y: 92 };
 
   incoming.forEach((item, index) => {
     const caller = functionById.get(item.functionId);
     if (!caller) return;
-    const y = distributedY(index, incoming.length, 260);
-    miniEdge(svg, 128, y, center.x - 26, center.y, 'is-incoming');
+    const position = gridPosition(index, incoming.length, { x1: 58, x2: 262, y1: 52, y2: 132 });
+    miniEdge(svg, position.x + 18, position.y, center.x - 24, center.y, 'is-incoming');
     renderNeighborhoodNode(svg, {
-      x: 108,
-      y,
+      x: position.x,
+      y: position.y,
       node: caller,
       color: fileColorByPath.get(caller.modulePath) || '#64748b',
     });
   });
 
-  [...outgoingFunctions, ...outgoingExternal].forEach((item, index, all) => {
-    const y = distributedY(index, all.length, 260);
-    miniEdge(svg, center.x + 26, center.y, 492, y, 'is-outgoing');
+  outgoing.forEach((item, index) => {
+    const position = gridPosition(index, outgoing.length, { x1: 438, x2: 642, y1: 52, y2: 132 });
+    miniEdge(svg, center.x + 24, center.y, position.x - 18, position.y, 'is-outgoing');
     if (item.functionId) {
       const target = functionById.get(item.functionId);
       if (!target) return;
       renderNeighborhoodNode(svg, {
-        x: 512,
-        y,
+        x: position.x,
+        y: position.y,
         node: target,
         color: fileColorByPath.get(target.modulePath) || '#64748b',
       });
     } else {
-      renderExternalNeighborhoodNode(svg, { x: 512, y, item });
+      renderExternalNeighborhoodNode(svg, { x: position.x, y: position.y, item });
     }
   });
 
@@ -1165,8 +2098,8 @@ function renderNeighborhood(node) {
 
   if (items.length === 0) {
     const message = createSvgElement('text', {
-      x: 310,
-      y: 218,
+      x: 350,
+      y: 168,
       'text-anchor': 'middle',
       fill: '#667085',
       'font-size': 13,
@@ -1174,16 +2107,19 @@ function renderNeighborhood(node) {
     });
     message.textContent = 'No nearby functions were traced.';
     svg.appendChild(message);
-  } else if (relationshipItemsForNode(node).length > items.length) {
+  } else if (hiddenCount > 0 || allItems.length > items.length) {
     const message = createSvgElement('text', {
-      x: 310,
-      y: 236,
+      x: 350,
+      y: 178,
       'text-anchor': 'middle',
       fill: '#667085',
       'font-size': 12,
       'font-weight': 700,
     });
-    message.textContent = 'Focused on ' + relationFilters.find((filter) => filter.id === activeRelationFilter)?.label + '.';
+    const filterLabel = activeRelationFilter === 'all'
+      ? 'Showing main nearby functions'
+      : 'Focused on ' + relationFilters.find((filter) => filter.id === activeRelationFilter)?.label;
+    message.textContent = filterLabel + (hiddenCount > 0 ? '; +' + hiddenCount + ' more in details.' : '.');
     svg.appendChild(message);
   }
 
@@ -1198,8 +2134,8 @@ function renderSourceDialogFunction(functionId) {
   sourceDialogPathEl.textContent = node.modulePath + ':' + lineRange(node);
   renderDialogInsight(node);
   renderNeighborhood(node);
-  renderRelationshipList(sourceDialogRelationshipsEl, node, { mode: 'dialog' });
   sourceDialogCodeEl.textContent = declaration.code || '// Source snippet was not saved for this function.';
+  renderSourceConnectionDisclosure(node);
   updateDialogNavigationControls();
 }
 
@@ -1220,6 +2156,7 @@ function showSourceDialogForFunctionId(functionId, restoreFocusEl = null) {
   } else {
     sourceDialogEl.setAttribute('open', '');
   }
+  sourceDialogBodyEl.scrollTop = 0;
   sourceDialogCloseBtn.focus();
   sendViewerBridgeState('open-source');
   return true;
@@ -1236,6 +2173,7 @@ function navigateSourceDialog(direction) {
   };
   selectFunction(node.id, { reason: 'navigate-source', scroll: true });
   renderSourceDialogFunction(node.id);
+  sourceDialogBodyEl.scrollTop = 0;
   sendViewerBridgeState('navigate-source');
 }
 
@@ -1316,23 +2254,30 @@ function functionIdForViewerCommand(command = {}) {
 function applyViewerBridgeCommand(command = {}) {
   const type = String(command.type || command.command || '').trim();
   if (type === 'clearHighlight') {
+    clearSourceHighlight();
     clearSelection();
     return { applied: true, message: 'highlight cleared' };
   }
 
   const functionId = functionIdForViewerCommand(command);
   if (!functionId) return { applied: false, message: 'target function is not visible in this viewer snapshot' };
+  const sourceRecord = sourceRecordForFunctionId(functionId);
 
   if (type === 'openFunction' || type === 'openSource') {
+    highlightSourceRecord(sourceRecord);
+    scrollSourceRecordIntoView(sourceRecord);
     scrollFunctionIntoView(functionId);
     showSourceDialogForFunctionId(functionId, networkNodeElement(functionId));
     return { applied: true, message: 'source opened' };
   }
   if (type === 'focusFunction' || type === 'highlightFunction') {
+    highlightSourceRecord(sourceRecord);
+    scrollSourceRecordIntoView(sourceRecord);
     selectFunction(functionId, { reason: 'focus-function', scroll: true });
     return { applied: true, message: 'function focused' };
   }
   if (type === 'scrollToFunction') {
+    scrollSourceRecordIntoView(sourceRecord);
     selectFunction(functionId, { reason: 'scroll-function', scroll: true });
     return { applied: true, message: 'function scrolled into view' };
   }
@@ -1379,11 +2324,29 @@ function randomClientId() {
   return 'viewer-' + Date.now() + '-' + Math.random().toString(16).slice(2);
 }
 
+function isLoopbackHost(hostname = '') {
+  return hostname === 'localhost'
+    || hostname === '127.0.0.1'
+    || hostname === '[::1]'
+    || hostname === '::1'
+    || hostname.endsWith('.localhost');
+}
+
+function viewerBridgeRequested() {
+  const params = new URLSearchParams(window.location.search);
+  const bridgeParam = String(params.get('bridge') || '').toLowerCase();
+  if (bridgeParam === '0' || bridgeParam === 'false' || bridgeParam === 'off') return false;
+  if (bridgeParam === '1' || bridgeParam === 'true' || bridgeParam === 'on') return true;
+  const rootPath = window.location.pathname.replace(/\/index\.html$/, '/') || '/';
+  return isLoopbackHost(window.location.hostname) && rootPath === '/';
+}
+
 function canUseViewerBridge() {
   return typeof window === 'object'
     && window.location
     && /^https?:$/.test(window.location.protocol)
-    && typeof fetch === 'function';
+    && typeof fetch === 'function'
+    && viewerBridgeRequested();
 }
 
 async function initViewerBridge(payload = {}) {
@@ -1439,6 +2402,121 @@ function startPinchIfNeeded() {
     startDistance: distanceBetween(pointerA, pointerB),
     midpoint: midpointBetween(pointerA, pointerB),
   };
+}
+
+function isModuleDiagramEdgeTarget(target) {
+  let element = target;
+  while (element && element !== moduleDiagramViewportEl) {
+    const tagName = typeof element.tagName === 'string' ? element.tagName.toLowerCase() : '';
+    if (hasClass(element, 'edge-hit-target') || hasClass(element, 'edgeLabel')) return true;
+    if (tagName === 'path' && (hasClass(element, 'relation') || element.getAttribute('data-edge') === 'true')) {
+      return true;
+    }
+    element = element.parentNode;
+  }
+  return false;
+}
+
+function isModuleDiagramSourceTarget(target) {
+  let element = target;
+  while (element && element !== moduleDiagramViewportEl) {
+    if (hasClass(element, 'source-member-trigger') || hasClass(element, 'source-member-hit-target')) return true;
+    element = element.parentNode;
+  }
+  return false;
+}
+
+function startModuleDiagramPinchIfNeeded() {
+  if (moduleDiagramPointers.size !== 2) {
+    moduleDiagramPinchState = null;
+    return;
+  }
+  const [pointerA, pointerB] = Array.from(moduleDiagramPointers.values());
+  moduleDiagramPinchState = {
+    startZoom: moduleDiagramZoom,
+    startDistance: distanceBetween(pointerA, pointerB),
+    midpoint: midpointBetween(pointerA, pointerB),
+  };
+}
+
+function bindModuleDiagramInteraction() {
+  moduleDiagramViewportEl.addEventListener('wheel', (event) => {
+    if (!(event.ctrlKey || event.metaKey)) return;
+    event.preventDefault();
+    setModuleDiagramZoom(moduleDiagramZoom * Math.exp(-event.deltaY * 0.0025), event.clientX, event.clientY);
+  }, { passive: false });
+
+  moduleDiagramViewportEl.addEventListener('pointerdown', (event) => {
+    if (isModuleDiagramEdgeTarget(event.target) || isModuleDiagramSourceTarget(event.target)) return;
+    moduleDiagramPointers.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY });
+    if (moduleDiagramPointers.size === 1) {
+      moduleDiagramDragState = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        startScrollLeft: moduleDiagramViewportEl.scrollLeft,
+        startScrollTop: moduleDiagramViewportEl.scrollTop,
+      };
+      moduleDiagramViewportEl.classList.add('is-dragging');
+      moduleDiagramViewportEl.setPointerCapture(event.pointerId);
+    } else {
+      moduleDiagramDragState = null;
+      moduleDiagramViewportEl.classList.remove('is-dragging');
+      startModuleDiagramPinchIfNeeded();
+    }
+  });
+
+  moduleDiagramViewportEl.addEventListener('pointermove', (event) => {
+    if (!moduleDiagramPointers.has(event.pointerId)) return;
+    moduleDiagramPointers.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY });
+    if (moduleDiagramPinchState && moduleDiagramPointers.size === 2) {
+      const [pointerA, pointerB] = Array.from(moduleDiagramPointers.values());
+      const currentDistance = distanceBetween(pointerA, pointerB);
+      const midpoint = midpointBetween(pointerA, pointerB);
+      if (moduleDiagramPinchState.startDistance > 0) {
+        setModuleDiagramZoom(
+          (currentDistance / moduleDiagramPinchState.startDistance) * moduleDiagramPinchState.startZoom,
+          midpoint.clientX,
+          midpoint.clientY,
+        );
+      }
+      return;
+    }
+    if (!moduleDiagramDragState || moduleDiagramDragState.pointerId !== event.pointerId) return;
+    moduleDiagramViewportEl.scrollLeft = moduleDiagramDragState.startScrollLeft - (event.clientX - moduleDiagramDragState.startX);
+    moduleDiagramViewportEl.scrollTop = moduleDiagramDragState.startScrollTop - (event.clientY - moduleDiagramDragState.startY);
+  });
+
+  function clearPointer(event) {
+    moduleDiagramPointers.delete(event.pointerId);
+    if (moduleDiagramDragState && moduleDiagramDragState.pointerId === event.pointerId) {
+      moduleDiagramDragState = null;
+      moduleDiagramViewportEl.classList.remove('is-dragging');
+    }
+    if (moduleDiagramPointers.size < 2) moduleDiagramPinchState = null;
+    if (moduleDiagramPointers.size === 1) {
+      const [remainingId, remainingPointer] = Array.from(moduleDiagramPointers.entries())[0];
+      moduleDiagramDragState = {
+        pointerId: remainingId,
+        startX: remainingPointer.clientX,
+        startY: remainingPointer.clientY,
+        startScrollLeft: moduleDiagramViewportEl.scrollLeft,
+        startScrollTop: moduleDiagramViewportEl.scrollTop,
+      };
+      moduleDiagramViewportEl.classList.add('is-dragging');
+    }
+  }
+
+  moduleDiagramViewportEl.addEventListener('pointerup', clearPointer);
+  moduleDiagramViewportEl.addEventListener('pointercancel', clearPointer);
+  moduleDiagramViewportEl.addEventListener('pointerleave', (event) => {
+    if (event.pointerType === 'mouse'
+      && moduleDiagramDragState
+      && moduleDiagramDragState.pointerId === event.pointerId
+      && event.buttons === 0) {
+      clearPointer(event);
+    }
+  });
 }
 
 function bindNetworkInteraction() {
@@ -1520,6 +2598,10 @@ function bindControls() {
   networkFitBtn.addEventListener('click', fitNetworkToViewport);
   networkResetViewBtn.addEventListener('click', resetNetworkView);
   networkResetSelectionBtn.addEventListener('click', clearSelection);
+  moduleDiagramZoomInBtn.addEventListener('click', () => setModuleDiagramZoom(moduleDiagramZoom * 1.2));
+  moduleDiagramZoomOutBtn.addEventListener('click', () => setModuleDiagramZoom(moduleDiagramZoom / 1.2));
+  moduleDiagramFitBtn.addEventListener('click', fitModuleDiagramToViewport);
+  moduleDiagramResetViewBtn.addEventListener('click', resetModuleDiagramView);
   sourceDialogPreviousBtn.addEventListener('click', () => navigateSourceDialog(-1));
   sourceDialogNextBtn.addEventListener('click', () => navigateSourceDialog(1));
   sourceDialogCloseBtn.addEventListener('click', closeSourceDialog);
@@ -1541,13 +2623,13 @@ function bindControls() {
 
 async function renderModuleDiagram() {
   mermaidEl.textContent = outputPayload.mermaid || '';
+  renderEmptySelectedImport();
   if (!outputPayload.mermaid) {
     moduleDiagramEl.textContent = 'No file import diagram was saved.';
     return;
   }
   const { svg } = await mermaid.render('ironglancer-file-diagram-' + Date.now(), outputPayload.mermaid);
-  latestModuleSvg = svg;
-  moduleDiagramEl.innerHTML = svg;
+  prepareModuleDiagramForInteraction(svg, outputPayload.importEdges);
   downloadBtn.disabled = false;
 }
 
@@ -1592,6 +2674,7 @@ function rawRenderText() {
 }
 
 bindNetworkInteraction();
+bindModuleDiagramInteraction();
 bindControls();
 main().catch((error) => {
   subtitleEl.textContent = error?.message || String(error);

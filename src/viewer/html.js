@@ -153,8 +153,6 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         min-width:100%;
         min-height:100%;
       }
-      .file-lane { fill:#ffffff; stroke:#dfe5ef; stroke-width:1; }
-      .file-lane-label { fill:#64748b; font-size:12px; font-weight:800; }
       .network-edge {
         fill:none;
         stroke:#9aa8bb;
@@ -233,6 +231,12 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         border:1px solid rgba(17,24,39,.18);
         flex:0 0 auto;
       }
+      .legend-item span:last-child {
+        min-width:0;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+      }
       .summary-grid {
         display:grid;
         grid-template-columns:repeat(auto-fit, minmax(128px, 1fr));
@@ -309,6 +313,118 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         display:grid;
         gap:7px;
       }
+      .connection-summary {
+        display:grid;
+        gap:8px;
+      }
+      .connection-metrics {
+        display:flex;
+        flex-wrap:wrap;
+        gap:7px;
+      }
+      .connection-metric {
+        display:inline-flex;
+        align-items:center;
+        gap:6px;
+        min-height:30px;
+        border:1px solid #d6dee9;
+        border-radius:8px;
+        background:#fbfcff;
+        color:#344054;
+        padding:6px 8px;
+        font-size:.78rem;
+        font-weight:800;
+      }
+      .connection-metric strong {
+        color:#111827;
+        font-size:.95rem;
+        line-height:1;
+      }
+      .connection-metric.is-incoming { border-color:#b9e2d1; background:#f1fbf7; }
+      .connection-metric.is-outgoing { border-color:#f1d2a8; background:#fff8ed; }
+      .related-node-strip {
+        display:flex;
+        flex-wrap:wrap;
+        gap:7px;
+      }
+      .related-node {
+        display:inline-flex;
+        align-items:center;
+        gap:7px;
+        min-width:0;
+        max-width:100%;
+        border:1px solid #d6dee9;
+        border-radius:8px;
+        background:#ffffff;
+        color:#344054;
+        padding:6px 8px;
+        text-align:left;
+      }
+      button.related-node { cursor:pointer; }
+      button.related-node:hover,
+      button.related-node:focus-visible {
+        border-color:var(--accent);
+        box-shadow:0 0 0 3px rgba(29,78,216,.14);
+        outline:0;
+      }
+      .related-node-swatch {
+        width:10px;
+        height:10px;
+        border-radius:50%;
+        border:1px solid rgba(17,24,39,.18);
+        flex:0 0 auto;
+      }
+      .related-node-label {
+        min-width:0;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+        font-size:.8rem;
+        font-weight:850;
+      }
+      .related-node-meta {
+        color:var(--muted);
+        font-size:.72rem;
+        font-weight:800;
+      }
+      .connections-disclosure {
+        border:1px solid var(--border);
+        border-radius:8px;
+        background:#fbfcff;
+      }
+      .connections-disclosure[hidden] { display:none; }
+      .connections-disclosure summary {
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:10px;
+        min-height:38px;
+        cursor:pointer;
+        list-style:none;
+        padding:8px 10px;
+        color:#344054;
+        font-size:.84rem;
+        font-weight:850;
+      }
+      .connections-disclosure summary::-webkit-details-marker { display:none; }
+      .connections-disclosure summary::after {
+        content:"+";
+        display:inline-grid;
+        place-items:center;
+        width:22px;
+        height:22px;
+        border:1px solid #c5d2e6;
+        border-radius:7px;
+        color:#344054;
+        font-weight:900;
+      }
+      .connections-disclosure[open] summary {
+        border-bottom:1px solid var(--border);
+      }
+      .connections-disclosure[open] summary::after { content:"-"; }
+      .connections-disclosure .relationship-list {
+        padding:10px;
+      }
       .relationship-group {
         display:grid;
         gap:7px;
@@ -384,18 +500,135 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         font-weight:900;
       }
       details.panel[open] summary::after { content:"-"; }
-      .module-diagram-wrap {
-        min-height:360px;
-        max-height:68vh;
+      .module-diagram-body {
+        display:grid;
+        gap:10px;
+      }
+      .module-diagram-viewport {
+        min-height:420px;
+        max-height:70vh;
         overflow:auto;
+        overscroll-behavior:contain;
         border:1px solid var(--border);
         border-radius:8px;
-        background:#ffffff;
-        padding:10px;
+        background:
+          linear-gradient(90deg, rgba(18,32,54,.04) 1px, transparent 1px) 0 0 / 26px 26px,
+          linear-gradient(rgba(18,32,54,.04) 1px, transparent 1px) 0 0 / 26px 26px,
+          #ffffff;
+        cursor:grab;
+        touch-action:none;
       }
-      .module-diagram-wrap svg {
+      .module-diagram-viewport.is-dragging { cursor:grabbing; }
+      .module-diagram-canvas {
+        min-width:100%;
+        min-height:100%;
+        padding:14px;
+      }
+      .module-diagram-canvas svg {
         display:block;
         max-width:none;
+        height:auto;
+        overflow:visible;
+      }
+      .module-diagram-canvas path.relation,
+      .module-diagram-canvas path[data-edge="true"],
+      .module-diagram-canvas g.edgeLabel {
+        cursor:pointer;
+      }
+      .module-diagram-canvas .edge-hit-target {
+        fill:none !important;
+        stroke:transparent !important;
+        stroke-width:16px !important;
+        vector-effect:non-scaling-stroke;
+        pointer-events:stroke;
+      }
+      .module-diagram-canvas path.relation.is-selected,
+      .module-diagram-canvas path[data-edge="true"].is-selected {
+        stroke:var(--accent) !important;
+        stroke-width:3px !important;
+      }
+      .module-diagram-canvas .edge-import-label { pointer-events:none; }
+      .module-diagram-canvas g.edgeLabel.is-expanded .edge-import-label rect {
+        fill:#eef5ff;
+        stroke:#8fb1f4;
+        stroke-width:1.5;
+      }
+      .module-diagram-canvas g.edgeLabel.is-expanded .edge-import-label text {
+        fill:#173a8a;
+        font-size:13px;
+        font-weight:800;
+      }
+      .module-diagram-canvas .source-member-trigger {
+        cursor:pointer;
+        fill:var(--accent);
+        color:var(--accent);
+        font-weight:800;
+        pointer-events:auto;
+      }
+      .module-diagram-canvas .source-member-trigger.is-agent-highlighted {
+        fill:var(--danger);
+        color:var(--danger);
+        text-decoration:underline;
+      }
+      .module-diagram-canvas .source-member-hit-target {
+        fill:none !important;
+        stroke:transparent !important;
+        stroke-linecap:round;
+        stroke-width:24px !important;
+        vector-effect:non-scaling-stroke;
+        pointer-events:stroke;
+        cursor:pointer;
+      }
+      .selected-import-details {
+        display:grid;
+        gap:9px;
+        border-top:1px solid var(--border);
+        padding-top:10px;
+      }
+      .selected-import-details h3,
+      .selected-import-details h4,
+      .selected-import-details p {
+        margin:0;
+      }
+      .selected-import-details h3 {
+        font-size:.95rem;
+        overflow-wrap:anywhere;
+      }
+      .selected-import-details h4 {
+        color:var(--muted);
+        font-size:.75rem;
+        text-transform:uppercase;
+      }
+      .selected-import-rows {
+        display:grid;
+        gap:6px;
+      }
+      .selected-import-row {
+        display:grid;
+        gap:2px;
+      }
+      .selected-import-row span {
+        color:var(--muted);
+        font-size:.72rem;
+        font-weight:800;
+        text-transform:uppercase;
+      }
+      .selected-import-row code {
+        overflow-wrap:anywhere;
+      }
+      .selected-import-list {
+        display:grid;
+        gap:6px;
+        margin:0;
+        padding:0;
+        list-style:none;
+      }
+      .selected-import-list li {
+        border:1px solid #d9e1ec;
+        border-radius:8px;
+        background:#fbfcff;
+        padding:7px 9px;
+        overflow-wrap:anywhere;
       }
       pre {
         margin:0;
@@ -420,10 +653,10 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
       .source-dialog::backdrop { background:rgba(15,23,42,.44); }
       .source-dialog-body {
         display:grid;
-        gap:12px;
+        gap:10px;
         max-height:inherit;
         overflow:auto;
-        padding:14px;
+        padding:12px;
       }
       .source-dialog-header {
         display:flex;
@@ -445,21 +678,14 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
       }
       .dialog-insight {
         display:grid;
-        gap:9px;
+        gap:8px;
         border:1px solid var(--border);
         border-radius:8px;
         background:#fbfcff;
-        padding:10px;
-      }
-      .dialog-layout {
-        display:grid;
-        gap:10px;
-      }
-      @media (min-width: 880px) {
-        .dialog-layout { grid-template-columns:minmax(320px,.86fr) minmax(0,1.14fr); }
+        padding:9px;
       }
       .neighborhood {
-        min-height:230px;
+        height:190px;
         border:1px solid var(--border);
         border-radius:8px;
         background:#ffffff;
@@ -469,7 +695,6 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         display:block;
         width:100%;
         height:100%;
-        min-height:230px;
       }
       .neighborhood-node { cursor:pointer; }
       .neighborhood-node circle,
@@ -483,13 +708,14 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
       }
       .neighborhood-node text {
         fill:#1f2937;
-        font-size:11px;
+        font-size:10px;
         font-weight:800;
         paint-order:stroke;
         stroke:#ffffff;
         stroke-width:3px;
         pointer-events:none;
       }
+      .neighborhood-node.is-center text { font-size:11px; }
       .neighborhood-edge {
         fill:none;
         stroke:#98a6ba;
@@ -498,7 +724,7 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
       .neighborhood-edge.is-incoming { stroke:var(--good); stroke-width:2.5; }
       .neighborhood-edge.is-outgoing { stroke:var(--warn); stroke-width:2.3; }
       .source-code-block {
-        max-height:40vh;
+        max-height:46vh;
         border:1px solid #24324a;
         border-radius:8px;
         background:var(--code);
@@ -574,7 +800,26 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         <details class="panel" open>
           <summary><h2>File Import Diagram</h2></summary>
           <div class="panel-body">
-            <div id="module-diagram" class="module-diagram-wrap"></div>
+            <div class="module-diagram-body">
+              <div class="network-toolbar">
+                <div class="toolbar-group" aria-label="File diagram view controls">
+                  <button id="module-diagram-zoom-out-btn" type="button" aria-label="Zoom out">-</button>
+                  <button id="module-diagram-zoom-in-btn" type="button" aria-label="Zoom in">+</button>
+                  <button id="module-diagram-fit-btn" type="button">Fit</button>
+                  <button id="module-diagram-reset-view-btn" type="button">100%</button>
+                </div>
+                <div class="toolbar-group">
+                  <span id="module-diagram-zoom-status" class="status-line">Zoom 100%</span>
+                </div>
+              </div>
+              <div class="network-help">Drag to pan. Use the zoom buttons, pinch, or Ctrl/Cmd + wheel to zoom. Select an import edge for details or a member name for source.</div>
+              <div id="module-diagram-viewport" class="module-diagram-viewport">
+                <div id="module-diagram" class="module-diagram-canvas"></div>
+              </div>
+              <section id="selected-import" class="selected-import-details" aria-live="polite">
+                <p class="empty-note">No import edge selected.</p>
+              </section>
+            </div>
           </div>
         </details>
 
@@ -608,12 +853,15 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
             <button id="source-dialog-close" type="button">Close</button>
           </div>
         </div>
-        <section id="source-dialog-insight" class="dialog-insight"></section>
-        <div class="dialog-layout">
+        <section class="dialog-insight" aria-label="Source insight">
+          <div id="source-dialog-insight" class="connection-summary"></div>
           <div id="source-dialog-neighborhood" class="neighborhood" aria-label="Nearby functions"></div>
-          <div id="source-dialog-relationships" class="relationship-list"></div>
-        </div>
+        </section>
         <pre class="source-code-block"><code id="source-dialog-code"></code></pre>
+        <details id="source-dialog-connections" class="connections-disclosure">
+          <summary id="source-dialog-connections-summary">All connections</summary>
+          <div id="source-dialog-relationships" class="relationship-list"></div>
+        </details>
       </div>
     </dialog>
 
