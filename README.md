@@ -27,6 +27,19 @@ Examples
 - ironglancer ./my-app --entry src/app.jsx --out ./ironglancer-site --serve
 - ironglancer ./my-app --serve --host 127.0.0.1 --port 0
 
+Architecture diffs
+- compare two architecture snapshots from git refs without changing the checkout:
+  `ironglancer diff ./my-app --base main --head HEAD --entry src/app.jsx --format html --out architecture-diff.html --sarif review.sarif`
+- compare saved snapshots:
+  `ironglancer diff --base ./before/output.json --head ./after-site --format json`
+- inputs can be git refs resolvable in the project repo, an `output.json` file, or a generated-site directory containing `output.json`
+- `--format json` writes machine-readable JSON to stdout unless `--out` is supplied; `--format html` writes one self-contained static report and requires `--out`
+- `--sarif review.sarif` writes SARIF 2.1.0 findings alongside either JSON or HTML output
+- diff reports include schema/build/commit labels, module/function/edge deltas, structural findings, severity counts, static-analysis limitations, and `privacy.sourceMode = "none"`
+- privacy guarantee: diff JSON, HTML, and SARIF intentionally exclude absolute `rootDir` values and source excerpts
+- caveat: findings are static structural review prompts, not runtime behavior claims; function edges are static identifier-use evidence
+- current limitations: git-ref inputs are analyzed from archived committed contents, so uncommitted work is not included; function move/rename pairing is conservative and leaves ambiguous candidates as ordinary add/remove changes; fan findings use the documented threshold of at least 3 new edges and at least 2x the previous count
+
 Standalone viewer
 - generate the static viewer: `ironglancer ./my-app --entry src/app.jsx --out ./ironglancer-site`
 - serve it with any local file server, or use IronGlancer's server: `ironglancer ./my-app --entry src/app.jsx --out ./ironglancer-site --serve`
@@ -49,7 +62,7 @@ Connected Hermes + viewer
 
 Library usage
 ```js
-import { analyzeProject, generateStaticSite, startStaticAnalysisServer } from 'ironglancer';
+import { analyzeProject, compareSnapshots, generateStaticSite, startStaticAnalysisServer } from 'ironglancer';
 
 const analysis = await analyzeProject({ rootDir: './my-app', entry: 'src/app.jsx' });
 const site = await generateStaticSite({ rootDir: './my-app', entry: 'src/app.jsx', outDir: './ironglancer-site' });
@@ -59,6 +72,7 @@ const routed = await analyzeProject({
   routeAliases: [{ from: '/creator/', to: 'src/web/creator/' }],
 });
 const service = await startStaticAnalysisServer({ outDir: site.outDir });
+const diff = compareSnapshots(beforeOutputJson, afterOutputJson, { baseLabel: 'main', headLabel: 'HEAD' });
 console.log(service.url, service.apiBaseUrl);
 ```
 

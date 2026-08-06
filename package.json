@@ -29,6 +29,7 @@
   "exports": {
     ".": "./src/index.js",
     "./analyze-project": "./src/lib/analyze-project.js",
+    "./diff": "./src/lib/diff-snapshots.js",
     "./generate-static-site": "./src/lib/generate-static-site.js",
     "./serve-static-site": "./src/lib/serve-static-site.js",
     "./package.json": "./package.json"

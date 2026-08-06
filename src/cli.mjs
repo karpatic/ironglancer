@@ -3,6 +3,7 @@ import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 
+import { createArchitectureDiff as defaultCreateArchitectureDiff } from './lib/diff-command.js';
 import { generateStaticSite as defaultGenerateStaticSite } from './lib/generate-static-site.js';
 import { startStaticAnalysisServer as defaultStartStaticAnalysisServer } from './lib/serve-static-site.js';
 
@@ -12,6 +13,7 @@ const DEFAULT_PORT = 4173;
 function usage() {
   return [
     'Usage: ironglancer <folder> [--entry src/app.jsx] [--out ./ironglancer-site] [--route-alias /app/=src/app/]',
+    '       ironglancer diff [folder] --base <input> --head <input> [--entry src/app.jsx] [--format json|html] [--out architecture-diff.html] [--sarif review.sarif]',
     '',
     'Options:',
     '  --entry <path>              Entry module inside the project root.',
@@ -20,7 +22,18 @@ function usage() {
     '  --serve                     Generate once, then serve the immutable viewer and /api/v1 JSON API.',
     `  --host ${DEFAULT_HOST}          Host to bind in serve mode.`,
     `  --port ${DEFAULT_PORT}              Port to bind in serve mode. Use 0 to pick an available port.`,
+    '',
+    'Diff options:',
+    '  --base <input>              Git ref, output.json path, or generated-site directory for the base snapshot.',
+    '  --head <input>              Git ref, output.json path, or generated-site directory for the head snapshot.',
+    '  --format json|html          Diff report format. Defaults to json. HTML requires --out.',
+    '  --sarif <path>              Write SARIF 2.1.0 review findings alongside the selected format.',
     '  -h, --help                 Show this help.',
+    '',
+    'Examples:',
+    '  ironglancer ./my-app --entry src/app.jsx --out ./ironglancer-site',
+    '  ironglancer diff --base main --head HEAD --entry src/app.jsx --format html --out architecture-diff.html --sarif review.sarif',
+    '  ironglancer diff ./my-app --base ./before/output.json --head ./after-site --format json',
     '',
   ].join('\n');
 }
@@ -82,6 +95,7 @@ async function waitForShutdown(service) {
 export async function runCli(args = process.argv.slice(2), {
   generateStaticSite = defaultGenerateStaticSite,
   startStaticAnalysisServer = defaultStartStaticAnalysisServer,
+  createArchitectureDiff = defaultCreateArchitectureDiff,
   stdout = process.stdout,
   stderr = process.stderr,
   waitForClose = true,
@@ -92,6 +106,10 @@ export async function runCli(args = process.argv.slice(2), {
       entry: { type: 'string' },
       out: { type: 'string' },
       'route-alias': { type: 'string', multiple: true },
+      base: { type: 'string' },
+      head: { type: 'string' },
+      format: { type: 'string' },
+      sarif: { type: 'string' },
       serve: { type: 'boolean' },
       host: { type: 'string' },
       port: { type: 'string' },
@@ -102,6 +120,21 @@ export async function runCli(args = process.argv.slice(2), {
 
   if (values.help) {
     await writeStream(stdout, usage());
+    return 0;
+  }
+
+  if (positionals[0] === 'diff') {
+    const result = await createArchitectureDiff({
+      folder: positionals[1] || '.',
+      base: values.base,
+      head: values.head,
+      entry: values.entry,
+      routeAliases: values['route-alias'] || [],
+      format: values.format || 'json',
+      outPath: values.out,
+      sarifPath: values.sarif,
+    });
+    if (result.stdoutText) await writeStream(stdout, result.stdoutText);
     return 0;
   }
 
