@@ -556,8 +556,18 @@ function layoutVerticalRadius(item = {}) {
   return item.height ? item.height / 2 : item.radius;
 }
 
+function layoutCollisionPadding(item = {}) {
+  return item.node?.nodeType === 'file' ? 28 : 14;
+}
+
 function layoutCollisionRadius(item = {}) {
-  return item.collisionRadius || Math.max(layoutHorizontalRadius(item), layoutVerticalRadius(item), item.radius || 0);
+  if (item.collisionRadius) return item.collisionRadius;
+  const horizontalRadius = layoutHorizontalRadius(item) || 0;
+  const verticalRadius = layoutVerticalRadius(item) || 0;
+  if (item.width || item.height) {
+    return Math.hypot(horizontalRadius, verticalRadius) + layoutCollisionPadding(item);
+  }
+  return Math.max(horizontalRadius, verticalRadius, item.radius || 0);
 }
 
 function layoutEdgeRadius(item = {}) {
@@ -926,14 +936,85 @@ function networkInitialPosition(node, index, count, clusterCenter, width, height
   };
 }
 
-function simulateForceLayout(layoutNodes, layoutEdges, clusterCenters, width, height) {
+function layoutUsesRectangularCollision(item = {}) {
+  return item.node?.nodeType === 'file' || Boolean(item.width || item.height);
+}
+
+function layoutCollisionBox(item = {}, extraPadding = 0) {
+  const padding = layoutCollisionPadding(item) + extraPadding;
+  return {
+    halfWidth: (layoutHorizontalRadius(item) || 0) + padding,
+    halfHeight: (layoutVerticalRadius(item) || 0) + padding,
+  };
+}
+
+function deterministicPairDirection(a, b, axis) {
+  const first = a.node?.id || a.node?.stableId || '';
+  const second = b.node?.id || b.node?.stableId || '';
+  const key = first < second ? first + '|' + second : second + '|' + first;
+  return seededUnit(key + ':' + axis) < 0.5 ? -1 : 1;
+}
+
+function clampLayoutNodeToCanvas(item, width, height) {
+  const box = layoutCollisionBox(item);
+  const minX = box.halfWidth + 28;
+  const maxX = width - box.halfWidth - 28;
+  const minY = box.halfHeight + 28;
+  const maxY = height - box.halfHeight - 44;
+  item.x = minX <= maxX ? clamp(item.x, minX, maxX) : width / 2;
+  item.y = minY <= maxY ? clamp(item.y, minY, maxY) : height / 2;
+}
+
+function separateRectangularLayoutCollisions(nodes, width, height, { iterations = 36, extraPadding = 0 } = {}) {
+  if (nodes.filter(layoutUsesRectangularCollision).length === 0) return;
+
+  for (let tick = 0; tick < iterations; tick += 1) {
+    let moved = false;
+    const movedNodes = new Set();
+    const strength = 1 - (tick / (iterations * 1.4));
+    for (let index = 0; index < nodes.length; index += 1) {
+      const a = nodes[index];
+      const aBox = layoutCollisionBox(a, extraPadding);
+      for (let next = index + 1; next < nodes.length; next += 1) {
+        const b = nodes[next];
+        if (!layoutUsesRectangularCollision(a) && !layoutUsesRectangularCollision(b)) continue;
+        const bBox = layoutCollisionBox(b, extraPadding);
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const overlapX = aBox.halfWidth + bBox.halfWidth - Math.abs(dx);
+        const overlapY = aBox.halfHeight + bBox.halfHeight - Math.abs(dy);
+        if (overlapX <= 0 || overlapY <= 0) continue;
+
+        moved = true;
+        if (overlapX <= overlapY) {
+          const direction = dx === 0 ? deterministicPairDirection(a, b, 'x') : Math.sign(dx);
+          const shift = ((overlapX / 2) + 1) * strength;
+          a.x -= direction * shift;
+          b.x += direction * shift;
+        } else {
+          const direction = dy === 0 ? deterministicPairDirection(a, b, 'y') : Math.sign(dy);
+          const shift = ((overlapY / 2) + 1) * strength;
+          a.y -= direction * shift;
+          b.y += direction * shift;
+        }
+        movedNodes.add(a);
+        movedNodes.add(b);
+      }
+    }
+
+    for (const item of movedNodes) clampLayoutNodeToCanvas(item, width, height);
+    if (!moved) return;
+  }
+}
+
+function simulateForceLayout(layoutNodes, layoutEdges, clusterCenters, width, height, options = {}) {
   const nodes = Array.from(layoutNodes.values());
   if (nodes.length === 0) return;
   const center = { x: width / 2, y: height / 2 };
   const iterations = clamp(Math.round(520 - nodes.length * 2.2), 220, 520);
   const edgeStrength = nodes.length > 90 ? 0.018 : 0.026;
-  const repelStrength = nodes.length > 90 ? 5600 : 7200;
-  const clusterStrength = nodes.length > 90 ? 0.006 : 0.009;
+  const repelStrength = (nodes.length > 90 ? 5600 : 7200) * (options.repelScale || 1);
+  const clusterStrength = (nodes.length > 90 ? 0.006 : 0.009) * (options.clusterScale || 1);
   const centerStrength = 0.0025;
 
   for (let tick = 0; tick < iterations; tick += 1) {
@@ -1000,6 +1081,11 @@ function simulateForceLayout(layoutNodes, layoutEdges, clusterCenters, width, he
       item.y = clamp(item.y + item.vy, collisionRadius + 28, height - collisionRadius - 44);
     }
   }
+
+  separateRectangularLayoutCollisions(nodes, width, height, {
+    iterations: options.rectangleSeparationIterations || 36,
+    extraPadding: options.rectangleSeparationPadding || 0,
+  });
 }
 
 function expandNetworkSpread(layoutNodes) {
@@ -1091,7 +1177,7 @@ function fileLayoutNode(node, x, y, { minMeasure, maxMeasure }, extra = {}) {
     width,
     height,
     edgeRadius: Math.max(width / 2, height / 2),
-    collisionRadius: Math.max(width / 2, height / 2) + 10,
+    collisionRadius: Math.hypot(width / 2, height / 2) + layoutCollisionPadding({ node }),
     color: fileColorByPath.get(node.modulePath) || '#64748b',
     ...extra,
   };
@@ -1135,15 +1221,15 @@ function layoutForceFunctionNetwork(fileOrder, lineExtents, fileExtents) {
   const visibleFileOrder = fileOrder.filter((modulePath) => fileByPath.has(modulePath));
   if (!networkShowsFunctions()) {
     const count = Math.max(1, visibleFileOrder.length);
-    const width = Math.max(960, Math.ceil(Math.sqrt(count) * 245));
-    const height = Math.max(620, Math.ceil(Math.sqrt(count) * 185));
-    const center = { x: width / 2, y: height / 2 };
-    const clusterCenters = new Map(visibleFileOrder.map((modulePath) => [modulePath, center]));
+    const width = Math.max(1120, Math.ceil(Math.sqrt(count) * 335));
+    const height = Math.max(760, Math.ceil(Math.sqrt(count) * 245));
+    const clusterCenters = moduleClusterCenters(visibleFileOrder, width, height);
     const nodes = new Map();
 
     visibleFileOrder.forEach((modulePath, index) => {
       const node = fileByPath.get(modulePath);
-      const position = networkInitialPosition(node, index, visibleFileOrder.length, center, width, height);
+      const cluster = clusterCenters.get(modulePath) || { x: width / 2, y: height / 2 };
+      const position = networkInitialPosition(node, index, visibleFileOrder.length, cluster, width, height);
       nodes.set(node.id, {
         ...fileLayoutNode(node, position.x, position.y, fileExtents),
         vx: 0,
@@ -1151,7 +1237,12 @@ function layoutForceFunctionNetwork(fileOrder, lineExtents, fileExtents) {
       });
     });
 
-    simulateForceLayout(nodes, fileEdges, clusterCenters, width, height);
+    simulateForceLayout(nodes, fileEdges, clusterCenters, width, height, {
+      repelScale: 1.35,
+      clusterScale: 1.15,
+      rectangleSeparationIterations: 60,
+      rectangleSeparationPadding: 10,
+    });
     expandNetworkSpread(nodes);
     const bounds = normalizeNetworkBounds(nodes);
     networkLayout = { mode: 'network', width: bounds.width, height: bounds.height, nodes };
