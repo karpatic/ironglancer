@@ -26,12 +26,21 @@ const relationFilters = [
   { id: 'browser-library', label: 'Browser/library' },
   { id: 'couldnt-trace', label: "Couldn't trace" },
 ];
+const primaryViewStorageKey = 'ironglancer:primary-visualization-view';
+const primaryViewModes = [
+  { id: 'function-graphs', label: 'Function graphs', accessibilityLabel: 'Function graphs' },
+  { id: 'jsx-map', label: 'JSX map', accessibilityLabel: 'JSX file composition map' },
+];
 const networkLayoutModeStorageKey = 'ironglancer:function-network-layout';
 const networkLayoutModes = [
-  { id: 'force', label: 'Force' },
-  { id: 'flow', label: 'Flow' },
-  { id: 'by-file', label: 'By file' },
+  { id: 'network', label: 'Network', statusLabel: 'Network graph' },
+  { id: 'radial', label: 'Radial', statusLabel: 'Radial network graph' },
+  { id: 'by-file', label: 'By file', statusLabel: 'By file' },
 ];
+const networkLayoutModeAliases = new Map([
+  ['force', 'network'],
+  ['flow', 'radial'],
+]);
 
 const subtitleEl = document.getElementById('subtitle');
 const buildMetaEl = document.getElementById('build-meta');
@@ -49,6 +58,9 @@ const moduleDiagramResetViewBtn = document.getElementById('module-diagram-reset-
 const selectedImportEl = document.getElementById('selected-import');
 const downloadBtn = document.getElementById('download-svg-btn');
 const networkStatusEl = document.getElementById('network-status');
+const primaryViewSwitchEl = document.getElementById('primary-view-switch');
+const functionGraphsViewEl = document.getElementById('function-graphs-view');
+const jsxMapViewEl = document.getElementById('jsx-map-view');
 const networkViewportEl = document.getElementById('function-network-viewport');
 const networkSvgEl = document.getElementById('function-network-svg');
 const networkZoomStatusEl = document.getElementById('network-zoom-status');
@@ -109,7 +121,11 @@ let sourceMemberTargets = new Map();
 let highlightedSourceRecord = null;
 let selectedFunctionId = '';
 let activeRelationFilter = 'all';
-let activeNetworkLayoutMode = 'force';
+let activePrimaryView = 'function-graphs';
+let activeNetworkLayoutMode = 'network';
+let latestFunctionGraphStatus = '';
+let networkNeedsFit = true;
+let moduleDiagramNeedsFit = true;
 let sourceDialogState = { functionId: '', group: [], index: -1 };
 let sourceDialogRestoreFocusEl = null;
 let viewerBridge = emptyViewerBridge();
@@ -419,11 +435,21 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
-function networkLayoutModeRecord(modeId = activeNetworkLayoutMode) {
-  return networkLayoutModes.find((mode) => mode.id === modeId) || networkLayoutModes[0];
+function primaryViewRecord(viewId = activePrimaryView) {
+  return primaryViewModes.find((mode) => mode.id === viewId) || primaryViewModes[0];
 }
 
-function storageForNetworkLayoutMode() {
+function normalizeNetworkLayoutModeId(modeId) {
+  const rawMode = String(modeId || '').trim();
+  return networkLayoutModeAliases.get(rawMode) || rawMode;
+}
+
+function networkLayoutModeRecord(modeId = activeNetworkLayoutMode) {
+  const normalizedModeId = normalizeNetworkLayoutModeId(modeId);
+  return networkLayoutModes.find((mode) => mode.id === normalizedModeId) || networkLayoutModes[0];
+}
+
+function storageForViewerPreferences() {
   try {
     if (typeof window !== 'object' || !window.localStorage) return null;
     return window.localStorage;
@@ -432,14 +458,38 @@ function storageForNetworkLayoutMode() {
   }
 }
 
+function loadPrimaryViewMode() {
+  const storage = storageForViewerPreferences();
+  const savedMode = storage ? storage.getItem(primaryViewStorageKey) : '';
+  return primaryViewRecord(savedMode).id;
+}
+
+function persistPrimaryViewMode(modeId) {
+  const storage = storageForViewerPreferences();
+  if (!storage) return;
+  try {
+    storage.setItem(primaryViewStorageKey, primaryViewRecord(modeId).id);
+  } catch {
+    // View persistence is a convenience; the viewer still works without it.
+  }
+}
+
 function loadNetworkLayoutMode() {
-  const storage = storageForNetworkLayoutMode();
+  const storage = storageForViewerPreferences();
   const savedMode = storage ? storage.getItem(networkLayoutModeStorageKey) : '';
-  return networkLayoutModeRecord(savedMode).id;
+  const migratedMode = networkLayoutModeRecord(savedMode).id;
+  if (storage && savedMode && savedMode !== migratedMode) {
+    try {
+      storage.setItem(networkLayoutModeStorageKey, migratedMode);
+    } catch {
+      // Migration is best-effort; the normalized mode is still used for this session.
+    }
+  }
+  return migratedMode;
 }
 
 function persistNetworkLayoutMode(modeId) {
-  const storage = storageForNetworkLayoutMode();
+  const storage = storageForViewerPreferences();
   if (!storage) return;
   try {
     storage.setItem(networkLayoutModeStorageKey, networkLayoutModeRecord(modeId).id);
@@ -448,22 +498,80 @@ function persistNetworkLayoutMode(modeId) {
   }
 }
 
+function renderPrimaryViewSwitch() {
+  primaryViewSwitchEl.textContent = '';
+  for (const mode of primaryViewModes) {
+    const button = createElement('button', mode.id === activePrimaryView ? 'is-active' : '', mode.label);
+    button.type = 'button';
+    button.setAttribute('aria-label', mode.accessibilityLabel);
+    button.setAttribute('aria-pressed', mode.id === activePrimaryView ? 'true' : 'false');
+    button.addEventListener('click', () => setPrimaryViewMode(mode.id));
+    primaryViewSwitchEl.appendChild(button);
+  }
+}
+
 function renderNetworkLayoutSwitch() {
   networkLayoutSwitchEl.textContent = '';
   for (const mode of networkLayoutModes) {
     const button = createElement('button', mode.id === activeNetworkLayoutMode ? 'is-active' : '', mode.label);
     button.type = 'button';
+    button.setAttribute('aria-label', mode.statusLabel);
     button.setAttribute('aria-pressed', mode.id === activeNetworkLayoutMode ? 'true' : 'false');
     button.addEventListener('click', () => setNetworkLayoutMode(mode.id));
     networkLayoutSwitchEl.appendChild(button);
   }
 }
 
+function updateVisualizationStatus() {
+  if (activePrimaryView === 'jsx-map') {
+    networkStatusEl.textContent = !outputPayload?.mermaid
+      ? 'JSX map: no file composition diagram was saved.'
+      : moduleDiagramSvgEl
+      ? 'JSX map: file composition, member rows, and import edges.'
+      : 'JSX map: loading file composition.';
+    return;
+  }
+  networkStatusEl.textContent = latestFunctionGraphStatus;
+}
+
 function fitCurrentNetworkLayout() {
+  if (activePrimaryView !== 'function-graphs') {
+    networkNeedsFit = true;
+    return;
+  }
+  networkNeedsFit = false;
   requestAnimationFrame(() => {
     fitNetworkToViewport();
     if (selectedFunctionId) scrollFunctionIntoView(selectedFunctionId);
   });
+}
+
+function fitModuleDiagramWhenVisible() {
+  if (activePrimaryView !== 'jsx-map') {
+    moduleDiagramNeedsFit = true;
+    return;
+  }
+  if (!moduleDiagramSvgEl) return;
+  moduleDiagramNeedsFit = false;
+  requestAnimationFrame(() => fitModuleDiagramToViewport());
+}
+
+function applyPrimaryViewMode() {
+  const showFunctionGraphs = activePrimaryView === 'function-graphs';
+  functionGraphsViewEl.hidden = !showFunctionGraphs;
+  jsxMapViewEl.hidden = showFunctionGraphs;
+  renderPrimaryViewSwitch();
+  updateVisualizationStatus();
+  if (showFunctionGraphs && networkNeedsFit) fitCurrentNetworkLayout();
+  if (!showFunctionGraphs && moduleDiagramNeedsFit) fitModuleDiagramWhenVisible();
+}
+
+function setPrimaryViewMode(modeId) {
+  const nextMode = primaryViewRecord(modeId).id;
+  if (nextMode === activePrimaryView) return;
+  activePrimaryView = nextMode;
+  persistPrimaryViewMode(nextMode);
+  applyPrimaryViewMode();
 }
 
 function setNetworkLayoutMode(modeId) {
@@ -691,7 +799,7 @@ function layoutForceFunctionNetwork(fileOrder, lineExtents) {
   simulateForceLayout(nodes, edges, clusterCenters, width, height);
   expandNetworkSpread(nodes);
   const bounds = normalizeNetworkBounds(nodes);
-  networkLayout = { mode: 'force', width: bounds.width, height: bounds.height, nodes };
+  networkLayout = { mode: 'network', width: bounds.width, height: bounds.height, nodes };
 }
 
 function layoutByFileFunctionNetwork(fileOrder, lineExtents) {
@@ -732,190 +840,238 @@ function compareFunctionIds(a, b) {
   return sortFunctions(functionById.get(a), functionById.get(b));
 }
 
-function stronglyConnectedFunctionComponents() {
-  const adjacency = new Map(functions.map((node) => [node.id, []]));
-  for (const edge of edges) {
-    if (!adjacency.has(edge.sourceId)) continue;
-    adjacency.get(edge.sourceId).push(edge.targetId);
-  }
-  for (const list of adjacency.values()) list.sort(compareFunctionIds);
+function sortedFunctionIds(ids) {
+  return Array.from(ids || [])
+    .filter((id) => functionById.has(id))
+    .sort(compareFunctionIds);
+}
 
-  const indexById = new Map();
-  const lowById = new Map();
-  const stack = [];
-  const onStack = new Set();
+function radialGraphIndexes() {
+  const outgoing = new Map(functions.map((node) => [node.id, new Set()]));
+  const incoming = new Map(functions.map((node) => [node.id, new Set()]));
+  const undirected = new Map(functions.map((node) => [node.id, new Set()]));
+  for (const edge of edges) {
+    if (!outgoing.has(edge.sourceId) || !outgoing.has(edge.targetId)) continue;
+    outgoing.get(edge.sourceId).add(edge.targetId);
+    incoming.get(edge.targetId).add(edge.sourceId);
+    undirected.get(edge.sourceId).add(edge.targetId);
+    undirected.get(edge.targetId).add(edge.sourceId);
+  }
+  return { outgoing, incoming, undirected };
+}
+
+function connectedRadialComponents(undirected) {
+  const remaining = new Set(functions.map((node) => node.id));
   const components = [];
-  let nextIndex = 0;
-
-  function visit(functionId) {
-    indexById.set(functionId, nextIndex);
-    lowById.set(functionId, nextIndex);
-    nextIndex += 1;
-    stack.push(functionId);
-    onStack.add(functionId);
-
-    for (const targetId of adjacency.get(functionId) || []) {
-      if (!indexById.has(targetId)) {
-        visit(targetId);
-        lowById.set(functionId, Math.min(lowById.get(functionId), lowById.get(targetId)));
-      } else if (onStack.has(targetId)) {
-        lowById.set(functionId, Math.min(lowById.get(functionId), indexById.get(targetId)));
+  for (const node of functions) {
+    if (!remaining.has(node.id)) continue;
+    const component = [];
+    const stack = [node.id];
+    remaining.delete(node.id);
+    while (stack.length > 0) {
+      const currentId = stack.pop();
+      component.push(currentId);
+      for (const nextId of sortedFunctionIds(undirected.get(currentId))) {
+        if (!remaining.has(nextId)) continue;
+        remaining.delete(nextId);
+        stack.push(nextId);
       }
     }
-
-    if (lowById.get(functionId) !== indexById.get(functionId)) return;
-    const nodeIds = [];
-    let currentId = '';
-    do {
-      currentId = stack.pop();
-      onStack.delete(currentId);
-      nodeIds.push(currentId);
-    } while (currentId !== functionId);
-    nodeIds.sort(compareFunctionIds);
-    components.push({ id: 'component-' + components.length, nodeIds });
+    component.sort(compareFunctionIds);
+    components.push(component);
   }
-
-  for (const node of functions) {
-    if (!indexById.has(node.id)) visit(node.id);
-  }
-  return components.sort((a, b) => compareFunctionIds(a.nodeIds[0], b.nodeIds[0]));
+  return components.sort((a, b) => compareFunctionIds(a[0], b[0]));
 }
 
-function flowDepthByFunctionId() {
-  const components = stronglyConnectedFunctionComponents();
-  const componentByFunctionId = new Map();
-  for (const component of components) {
-    for (const functionId of component.nodeIds) componentByFunctionId.set(functionId, component.id);
-  }
+function neighborCountWithin(neighborIds, componentSet) {
+  return sortedFunctionIds(neighborIds).filter((id) => componentSet.has(id)).length;
+}
 
-  const outgoingByComponent = new Map(components.map((component) => [component.id, new Set()]));
-  const incomingCountByComponent = new Map(components.map((component) => [component.id, 0]));
-  const depthByComponent = new Map(components.map((component) => [component.id, 0]));
-  for (const edge of edges) {
-    const sourceComponentId = componentByFunctionId.get(edge.sourceId);
-    const targetComponentId = componentByFunctionId.get(edge.targetId);
-    if (!sourceComponentId || !targetComponentId || sourceComponentId === targetComponentId) continue;
-    const outgoing = outgoingByComponent.get(sourceComponentId);
-    if (outgoing.has(targetComponentId)) continue;
-    outgoing.add(targetComponentId);
-    incomingCountByComponent.set(targetComponentId, incomingCountByComponent.get(targetComponentId) + 1);
-  }
+function compareRadialRootCandidates(a, b, componentSet, indexes) {
+  const aIncoming = neighborCountWithin(indexes.incoming.get(a), componentSet);
+  const bIncoming = neighborCountWithin(indexes.incoming.get(b), componentSet);
+  const aOutgoing = neighborCountWithin(indexes.outgoing.get(a), componentSet);
+  const bOutgoing = neighborCountWithin(indexes.outgoing.get(b), componentSet);
+  const aSourceRank = aIncoming === 0 ? 0 : 1;
+  const bSourceRank = bIncoming === 0 ? 0 : 1;
+  if (aSourceRank !== bSourceRank) return aSourceRank - bSourceRank;
+  if (aOutgoing !== bOutgoing) return bOutgoing - aOutgoing;
+  const aBalance = aOutgoing - aIncoming;
+  const bBalance = bOutgoing - bIncoming;
+  if (aBalance !== bBalance) return bBalance - aBalance;
+  return compareFunctionIds(a, b);
+}
 
-  const componentById = new Map(components.map((component) => [component.id, component]));
-  const compareComponents = (a, b) => compareFunctionIds(componentById.get(a).nodeIds[0], componentById.get(b).nodeIds[0]);
-  const queue = components
-    .filter((component) => incomingCountByComponent.get(component.id) === 0)
-    .map((component) => component.id)
-    .sort(compareComponents);
+function radialRootsForComponent(componentIds, indexes) {
+  const componentSet = new Set(componentIds);
+  const sourceRoots = componentIds
+    .filter((id) => neighborCountWithin(indexes.incoming.get(id), componentSet) === 0)
+    .sort((a, b) => compareRadialRootCandidates(a, b, componentSet, indexes));
+  if (sourceRoots.length > 0) return sourceRoots;
+  return [componentIds.slice().sort((a, b) => compareRadialRootCandidates(a, b, componentSet, indexes))[0]];
+}
 
+function applyRadialBreadthFirstAssignment(queue, componentSet, adjacency, rootById, distanceById) {
   while (queue.length > 0) {
-    const componentId = queue.shift();
-    const targets = Array.from(outgoingByComponent.get(componentId) || []).sort(compareComponents);
-    for (const targetId of targets) {
-      depthByComponent.set(targetId, Math.max(
-        depthByComponent.get(targetId),
-        depthByComponent.get(componentId) + 1,
-      ));
-      incomingCountByComponent.set(targetId, incomingCountByComponent.get(targetId) - 1);
-      if (incomingCountByComponent.get(targetId) === 0) {
-        queue.push(targetId);
-        queue.sort(compareComponents);
-      }
+    const currentId = queue.shift();
+    const currentRootId = rootById.get(currentId);
+    const currentDistance = distanceById.get(currentId) || 0;
+    const neighbors = sortedFunctionIds(adjacency.get(currentId)).filter((id) => componentSet.has(id));
+    for (const nextId of neighbors) {
+      if (rootById.has(nextId)) continue;
+      rootById.set(nextId, currentRootId);
+      distanceById.set(nextId, currentDistance + 1);
+      queue.push(nextId);
     }
   }
+}
 
-  const depthByFunctionId = new Map();
-  for (const component of components) {
-    const depth = depthByComponent.get(component.id) || 0;
-    for (const functionId of component.nodeIds) depthByFunctionId.set(functionId, depth);
+function radialAssignmentsForComponent(componentIds, rootIds, indexes) {
+  const componentSet = new Set(componentIds);
+  const rootById = new Map();
+  const distanceById = new Map();
+  const roots = rootIds.slice().sort(compareFunctionIds);
+  for (const rootId of roots) {
+    rootById.set(rootId, rootId);
+    distanceById.set(rootId, 0);
   }
-  return depthByFunctionId;
+
+  applyRadialBreadthFirstAssignment(roots.slice(), componentSet, indexes.outgoing, rootById, distanceById);
+  applyRadialBreadthFirstAssignment(roots.slice(), componentSet, indexes.undirected, rootById, distanceById);
+
+  for (const id of componentIds) {
+    if (rootById.has(id)) continue;
+    const rootId = roots[0];
+    rootById.set(id, rootId);
+    distanceById.set(id, 1);
+  }
+  return { rootById, distanceById };
 }
 
-function averageOrderedNeighbor(node, edgeList, neighborKey, orderById) {
-  const values = safeArray(edgeList)
-    .map((edge) => orderById.get(edge[neighborKey]))
-    .filter((value) => Number.isFinite(value));
-  if (values.length === 0) return Number.POSITIVE_INFINITY;
-  return values.reduce((total, value) => total + value, 0) / values.length;
+function radialRootGroups(indexes) {
+  const groups = [];
+  for (const componentIds of connectedRadialComponents(indexes.undirected)) {
+    const roots = radialRootsForComponent(componentIds, indexes);
+    const assignments = radialAssignmentsForComponent(componentIds, roots, indexes);
+    const groupsByRoot = new Map(roots.map((rootId) => [rootId, {
+      rootId,
+      nodeIds: [],
+      distanceById: new Map(),
+      rings: new Map(),
+    }]));
+    for (const id of componentIds) {
+      const rootId = assignments.rootById.get(id) || roots[0];
+      const group = groupsByRoot.get(rootId) || groupsByRoot.get(roots[0]);
+      const distance = assignments.distanceById.get(id) || 0;
+      group.nodeIds.push(id);
+      group.distanceById.set(id, distance);
+      if (!group.rings.has(distance)) group.rings.set(distance, []);
+      group.rings.get(distance).push(functionById.get(id));
+    }
+    for (const group of groupsByRoot.values()) {
+      if (group.nodeIds.length === 0) continue;
+      group.nodeIds.sort((a, b) => (group.distanceById.get(a) || 0) - (group.distanceById.get(b) || 0)
+        || compareFunctionIds(a, b));
+      for (const ring of group.rings.values()) ring.sort(sortFunctions);
+      groups.push(group);
+    }
+  }
+  return groups.sort((a, b) => compareFunctionIds(a.rootId, b.rootId));
 }
 
-function sortFlowLayer(layer, scoreForNode) {
-  layer.sort((a, b) => {
-    const aScore = scoreForNode(a);
-    const bScore = scoreForNode(b);
-    if (aScore !== bScore) return aScore - bScore;
-    return sortFunctions(a, b);
+function assignRadialSectors(groups) {
+  if (groups.length === 0) return;
+  if (groups.length === 1) {
+    groups[0].startAngle = -Math.PI / 2;
+    groups[0].endAngle = groups[0].startAngle + Math.PI * 2;
+    return;
+  }
+
+  const gap = Math.min(0.11, (Math.PI * 2) / (groups.length * 7));
+  const available = Math.PI * 2 - gap * groups.length;
+  const weights = groups.map((group) => Math.sqrt(group.nodeIds.length));
+  const totalWeight = weights.reduce((total, weight) => total + weight, 0) || 1;
+  let cursor = -Math.PI / 2;
+  groups.forEach((group, index) => {
+    const span = available * (weights[index] / totalWeight);
+    group.startAngle = cursor + gap / 2;
+    group.endAngle = group.startAngle + span;
+    cursor += span + gap;
   });
 }
 
-function sortedFlowLayers(depthByFunctionId) {
-  const layersByDepth = new Map();
-  for (const node of functions) {
-    const depth = depthByFunctionId.get(node.id) || 0;
-    if (!layersByDepth.has(depth)) layersByDepth.set(depth, []);
-    layersByDepth.get(depth).push(node);
-  }
-  const layers = Array.from(layersByDepth.entries())
-    .sort((a, b) => a[0] - b[0])
-    .map(([, layer]) => layer.sort(sortFunctions));
-  const orderById = new Map();
-  const refreshOrder = () => {
-    orderById.clear();
-    layers.forEach((layer, layerIndex) => {
-      layer.forEach((node, rowIndex) => {
-        orderById.set(node.id, layerIndex * 10000 + rowIndex);
-      });
-    });
-  };
+function radialRingRadii(groups) {
+  const multipleRoots = groups.length > 1;
+  const ringGap = 150;
+  const minArcSpacing = 86;
+  const baseRadius = multipleRoots
+    ? Math.max(86, (groups.length * minArcSpacing) / (Math.PI * 2))
+    : 0;
+  const maxDistance = Math.max(0, ...groups.flatMap((group) => Array.from(group.rings.keys())));
+  const radii = new Map([[0, baseRadius]]);
 
-  refreshOrder();
-  for (let pass = 0; pass < 2; pass += 1) {
-    for (let layerIndex = 1; layerIndex < layers.length; layerIndex += 1) {
-      sortFlowLayer(layers[layerIndex], (node) => averageOrderedNeighbor(
-        node,
-        edgesByTargetId.get(node.id),
-        'sourceId',
-        orderById,
-      ));
-      refreshOrder();
+  for (let distance = 1; distance <= maxDistance; distance += 1) {
+    let radius = baseRadius + distance * ringGap;
+    for (const group of groups) {
+      const count = safeArray(group.rings.get(distance)).length;
+      if (count <= 1) continue;
+      const span = Math.max(0.28, group.endAngle - group.startAngle);
+      radius = Math.max(radius, (count * minArcSpacing) / span);
     }
-    for (let layerIndex = layers.length - 2; layerIndex >= 0; layerIndex -= 1) {
-      sortFlowLayer(layers[layerIndex], (node) => averageOrderedNeighbor(
-        node,
-        edgesBySourceId.get(node.id),
-        'targetId',
-        orderById,
-      ));
-      refreshOrder();
-    }
+    radii.set(distance, radius);
   }
-  return layers;
+  return radii;
 }
 
-function layoutFlowFunctionNetwork(lineExtents) {
-  const layers = sortedFlowLayers(flowDepthByFunctionId());
-  const layerGap = 245;
-  const rowGap = 68;
-  const marginX = 110;
-  const marginY = 86;
-  const maxRows = Math.max(1, ...layers.map((layer) => layer.length));
-  const layerCount = Math.max(1, layers.length);
-  const width = Math.max(920, marginX * 2 + (layerCount - 1) * layerGap + 180);
-  const height = Math.max(560, marginY * 2 + (maxRows - 1) * rowGap + 118);
+function radialAngleFor(group, distance, index, count) {
+  const middle = (group.startAngle + group.endAngle) / 2;
+  if (distance === 0) return middle;
+  const span = group.endAngle - group.startAngle;
+  if (span >= Math.PI * 2 - 0.001) {
+    if (count <= 1) return -Math.PI / 2;
+    return -Math.PI / 2 + (index * Math.PI * 2) / count;
+  }
+  if (count <= 1) return middle;
+  return group.startAngle + ((index + 0.5) * span) / count;
+}
+
+function layoutRadialFunctionNetwork(lineExtents) {
   const nodes = new Map();
+  if (functions.length === 0) {
+    networkBaseWidth = 900;
+    networkBaseHeight = 420;
+    networkLayout = { mode: 'radial', width: networkBaseWidth, height: networkBaseHeight, nodes, center: { x: 450, y: 210 } };
+    return;
+  }
 
-  layers.forEach((layer, layerIndex) => {
-    const layerHeight = (layer.length - 1) * rowGap;
-    const top = Math.max(marginY, (height - layerHeight) / 2);
-    layer.forEach((node, rowIndex) => {
-      nodes.set(node.id, networkLayoutNode(node, marginX + layerIndex * layerGap, top + rowIndex * rowGap, lineExtents));
-    });
-  });
+  const groups = radialRootGroups(radialGraphIndexes());
+  assignRadialSectors(groups);
+  const radii = radialRingRadii(groups);
+  const maxRadius = Math.max(0, ...radii.values());
+  const padding = 160;
+  const width = Math.max(980, Math.ceil(maxRadius * 2 + padding * 2));
+  const height = Math.max(640, Math.ceil(maxRadius * 2 + padding * 2));
+  const center = { x: width / 2, y: height / 2 };
+
+  for (const group of groups) {
+    for (const [distance, ring] of Array.from(group.rings.entries()).sort((a, b) => a[0] - b[0])) {
+      const radius = radii.get(distance) || 0;
+      ring.forEach((node, index) => {
+        const angle = radialAngleFor(group, distance, index, ring.length);
+        nodes.set(node.id, networkLayoutNode(
+          node,
+          center.x + Math.cos(angle) * radius,
+          center.y + Math.sin(angle) * radius,
+          lineExtents,
+          { radialAngle: angle, radialDistance: distance, radialRootId: group.rootId },
+        ));
+      });
+    }
+  }
 
   networkBaseWidth = width;
   networkBaseHeight = height;
-  networkLayout = { mode: 'flow', width, height, nodes };
+  networkLayout = { mode: 'radial', width, height, nodes, center };
 }
 
 function layoutFunctionNetwork() {
@@ -924,8 +1080,10 @@ function layoutFunctionNetwork() {
   renderFileLegend(fileOrder);
   const lineExtents = networkLineExtents();
 
-  if (activeNetworkLayoutMode === 'flow') {
-    layoutFlowFunctionNetwork(lineExtents);
+  networkNeedsFit = true;
+
+  if (activeNetworkLayoutMode === 'radial') {
+    layoutRadialFunctionNetwork(lineExtents);
     return;
   }
   if (activeNetworkLayoutMode === 'by-file') {
@@ -948,13 +1106,29 @@ function edgeEndpoint(source, target, sourceRadius, targetRadius) {
 }
 
 function selfEdgePath(source) {
-  if (networkLayout.mode === 'flow') {
+  if (networkLayout.mode === 'radial') {
     const r = source.radius + 28;
+    const angle = Number.isFinite(source.radialAngle) ? source.radialAngle : -Math.PI / 2;
+    const tangentX = -Math.sin(angle);
+    const tangentY = Math.cos(angle);
+    const radialX = Math.cos(angle);
+    const radialY = Math.sin(angle);
+    const startX = source.x + radialX * source.radius;
+    const startY = source.y + radialY * source.radius;
+    return [
+      'M', startX, startY,
+      'C', startX + tangentX * r + radialX * 18, startY + tangentY * r + radialY * 18,
+      startX - tangentX * r + radialX * 18, startY - tangentY * r + radialY * 18,
+      source.x - radialX * source.radius, source.y - radialY * source.radius,
+    ].join(' ');
+  }
+  if (networkLayout.mode === 'network') {
+    const r = source.radius + 34;
     return [
       'M', source.x + source.radius, source.y,
-      'C', source.x + r + 42, source.y - r,
-      source.x + r + 42, source.y + r,
-      source.x + source.radius, source.y + 2,
+      'C', source.x + r, source.y - r,
+      source.x - r, source.y - r,
+      source.x - source.radius, source.y,
     ].join(' ');
   }
   if (networkLayout.mode === 'by-file') {
@@ -966,13 +1140,7 @@ function selfEdgePath(source) {
       source.x + source.radius, source.y + 2,
     ].join(' ');
   }
-  const r = source.radius + 34;
-  return [
-    'M', source.x + source.radius, source.y,
-    'C', source.x + r, source.y - r,
-    source.x - r, source.y - r,
-    source.x - source.radius, source.y,
-  ].join(' ');
+  return forceEdgePath({ id: source.node.id, sourceId: source.node.id, targetId: source.node.id }, source, source);
 }
 
 function forceEdgePath(edge, source, target) {
@@ -993,23 +1161,39 @@ function forceEdgePath(edge, source, target) {
   ].join(' ');
 }
 
-function flowEdgePath(edge, source, target) {
+function radialEdgePath(edge, source, target) {
   const endpoints = edgeEndpoint(source, target, source.radius, target.radius);
+  const center = networkLayout.center || { x: networkLayout.width / 2, y: networkLayout.height / 2 };
   const dx = endpoints.endX - endpoints.startX;
-  if (target.x > source.x + 24) {
-    const curve = Math.max(72, Math.min(220, Math.abs(dx) * 0.48));
-    return [
-      'M', endpoints.startX, endpoints.startY,
-      'C', endpoints.startX + curve, endpoints.startY,
-      endpoints.endX - curve, endpoints.endY,
-      endpoints.endX, endpoints.endY,
-    ].join(' ');
+  const dy = endpoints.endY - endpoints.startY;
+  const length = Math.max(1, Math.hypot(dx, dy));
+  const middleX = (endpoints.startX + endpoints.endX) / 2;
+  const middleY = (endpoints.startY + endpoints.endY) / 2;
+  const sourceDistance = source.radialDistance || 0;
+  const targetDistance = target.radialDistance || 0;
+  const sameRing = sourceDistance === targetDistance;
+  const sameRoot = source.radialRootId && source.radialRootId === target.radialRootId;
+
+  let controlX = middleX;
+  let controlY = middleY;
+  if (sameRing || !sameRoot) {
+    const radialX = middleX - center.x;
+    const radialY = middleY - center.y;
+    const radialLength = Math.max(1, Math.hypot(radialX, radialY));
+    const outward = sameRoot ? 1 : (seededUnit(edge.id || edge.sourceId + ':' + edge.targetId) < 0.5 ? -1 : 1);
+    const offset = Math.min(180, Math.max(44, length * 0.24));
+    controlX = middleX + (radialX / radialLength) * offset * outward;
+    controlY = middleY + (radialY / radialLength) * offset * outward;
+  } else {
+    const bendSign = seededUnit(edge.id || edge.sourceId + ':' + edge.targetId) < 0.5 ? -1 : 1;
+    const offset = bendSign * Math.min(120, Math.max(32, length * 0.16));
+    controlX = middleX - (dy / length) * offset;
+    controlY = middleY + (dx / length) * offset;
   }
-  const sideX = Math.max(source.x, target.x) + 82 + seededUnit(edge.id || edge.sourceId + ':' + edge.targetId) * 38;
+
   return [
     'M', endpoints.startX, endpoints.startY,
-    'C', sideX, endpoints.startY,
-    sideX, endpoints.endY,
+    'Q', controlX, controlY,
     endpoints.endX, endpoints.endY,
   ].join(' ');
 }
@@ -1039,7 +1223,7 @@ function edgePath(edge) {
   const target = networkLayout.nodes.get(edge.targetId);
   if (!source || !target) return '';
   if (edge.sourceId === edge.targetId) return selfEdgePath(source);
-  if (networkLayout.mode === 'flow') return flowEdgePath(edge, source, target);
+  if (networkLayout.mode === 'radial') return radialEdgePath(edge, source, target);
   if (networkLayout.mode === 'by-file') return byFileEdgePath(source, target);
   return forceEdgePath(edge, source, target);
 }
@@ -1086,11 +1270,14 @@ function renderFunctionNetwork() {
     });
     message.textContent = 'No saved function relationships were found.';
     networkSvgEl.appendChild(message);
+    latestFunctionGraphStatus = networkLayoutModeRecord(activeNetworkLayoutMode).statusLabel
+      + ': no saved function relationships were found.';
+    updateVisualizationStatus();
     return;
   }
 
   networkSvgEl.setAttribute('viewBox', '0 0 ' + networkLayout.width + ' ' + networkLayout.height);
-  networkSvgEl.setAttribute('aria-label', 'Function call network, ' + networkLayoutModeRecord(networkLayout.mode).label + ' layout');
+  networkSvgEl.setAttribute('aria-label', 'Function graph, ' + networkLayoutModeRecord(networkLayout.mode).statusLabel);
   networkSvgEl.style.width = (networkLayout.width * networkZoom) + 'px';
   networkSvgEl.style.height = (networkLayout.height * networkZoom) + 'px';
 
@@ -1214,6 +1401,7 @@ function networkNodeElement(functionId) {
 
 function setNetworkZoom(nextZoom, anchorClientX = null, anchorClientY = null) {
   if (!networkLayout) return;
+  networkNeedsFit = false;
   const minZoom = 0.22;
   const maxZoom = 4;
   const clamped = Math.min(maxZoom, Math.max(minZoom, nextZoom));
@@ -1243,6 +1431,7 @@ function centerNetwork() {
 
 function fitNetworkToViewport() {
   if (!networkLayout) return;
+  networkNeedsFit = false;
   const availableWidth = Math.max(120, networkViewportEl.clientWidth - 28);
   const availableHeight = Math.max(120, networkViewportEl.clientHeight - 28);
   const nextZoom = Math.min(1, availableWidth / networkBaseWidth, availableHeight / networkBaseHeight);
@@ -1256,6 +1445,7 @@ function fitNetworkToViewport() {
 
 function resetNetworkView() {
   if (!networkLayout) return;
+  networkNeedsFit = false;
   networkZoom = 1;
   networkSvgEl.style.width = networkBaseWidth + 'px';
   networkSvgEl.style.height = networkBaseHeight + 'px';
@@ -1298,6 +1488,7 @@ function centerModuleDiagram() {
 
 function setModuleDiagramZoom(nextZoom, anchorClientX = null, anchorClientY = null) {
   if (!moduleDiagramSvgEl || !moduleDiagramBaseWidth || !moduleDiagramBaseHeight) return;
+  moduleDiagramNeedsFit = false;
   const clamped = clamp(nextZoom, 0.2, 4);
   if (Math.abs(clamped - moduleDiagramZoom) < 0.001) return;
 
@@ -1318,6 +1509,7 @@ function setModuleDiagramZoom(nextZoom, anchorClientX = null, anchorClientY = nu
 
 function fitModuleDiagramToViewport() {
   if (!moduleDiagramSvgEl || !moduleDiagramBaseWidth || !moduleDiagramBaseHeight) return;
+  moduleDiagramNeedsFit = false;
   const availableWidth = Math.max(100, moduleDiagramViewportEl.clientWidth - 34);
   const availableHeight = Math.max(100, moduleDiagramViewportEl.clientHeight - 34);
   moduleDiagramZoom = clamp(Math.min(1, availableWidth / moduleDiagramBaseWidth, availableHeight / moduleDiagramBaseHeight), 0.2, 4);
@@ -1328,6 +1520,7 @@ function fitModuleDiagramToViewport() {
 
 function resetModuleDiagramView() {
   if (!moduleDiagramSvgEl) return;
+  moduleDiagramNeedsFit = false;
   moduleDiagramZoom = 1;
   setModuleDiagramSvgSizeForZoom();
   centerModuleDiagram();
@@ -1701,7 +1894,7 @@ function renderDeclarationFallbackDialog(declaration, restoreFocusEl = null) {
   sourceDialogTitleEl.textContent = callableLabel(declaration.name || declaration.declarationName || 'Source');
   sourceDialogPathEl.textContent = (declaration.modulePath || 'unknown source') + ':' + lineRange(declaration);
   sourceDialogInsightEl.textContent = '';
-  sourceDialogInsightEl.appendChild(createElement('p', 'takeaway', 'Saved source for this diagram member is available, but it is not present in the function network snapshot.'));
+  sourceDialogInsightEl.appendChild(createElement('p', 'takeaway', 'Saved source for this diagram member is available, but it is not present in the function graph snapshot.'));
   sourceDialogNeighborhoodEl.textContent = '';
   sourceDialogCodeEl.textContent = declaration.code || '// Source snippet was not saved for this member.';
   sourceDialogConnectionsEl.hidden = true;
@@ -1889,7 +2082,9 @@ function prepareModuleDiagramForInteraction(svgMarkup, importEdges) {
   setModuleDiagramSvgSizeForZoom();
   wireImportEdges(importEdges);
   wireSourceMembers();
-  requestAnimationFrame(() => fitModuleDiagramToViewport());
+  moduleDiagramNeedsFit = true;
+  fitModuleDiagramWhenVisible();
+  updateVisualizationStatus();
 }
 
 function externalRelationshipsForNode(node = {}) {
@@ -2254,7 +2449,7 @@ function renderSelectedFunctionPanel() {
     selectedFunctionEl.appendChild(createElement(
       'p',
       'empty-note',
-      'Select a function in the network to see who uses it, what it uses, and its source.',
+      'Select a function in the graph to see who uses it, what it uses, and its source.',
     ));
     return;
   }
@@ -2324,15 +2519,16 @@ function updateNetworkHighlights() {
     edgeEl.classList.toggle('is-filter-match', matchedEdgeIds.has(edgeId));
   }
 
-  const modeLabel = networkLayoutModeRecord(networkLayout?.mode).label;
+  const modeLabel = networkLayoutModeRecord(networkLayout?.mode).statusLabel;
   if (selectedNode) {
     const usedBy = incomingEdges.length;
     const uses = outgoingEdges.length + externalRelationshipsForNode(selectedNode).length;
-    networkStatusEl.textContent = modeLabel + ': selected ' + displayName(selectedNode) + ': '
+    latestFunctionGraphStatus = modeLabel + ': selected ' + displayName(selectedNode) + ': '
       + usedBy + ' ' + plural(usedBy, 'function') + ' use it; it uses ' + uses + '.';
   } else {
-    networkStatusEl.textContent = modeLabel + ': ' + functions.length + ' functions, ' + edges.length + ' saved function links.';
+    latestFunctionGraphStatus = modeLabel + ': ' + functions.length + ' functions, ' + edges.length + ' saved function links.';
   }
+  updateVisualizationStatus();
 }
 
 function setRelationFilter(filterId) {
@@ -3063,6 +3259,7 @@ async function renderModuleDiagram() {
   renderEmptySelectedImport();
   if (!outputPayload.mermaid) {
     moduleDiagramEl.textContent = 'No file import diagram was saved.';
+    updateVisualizationStatus();
     return;
   }
   const { svg } = await mermaid.render('ironglancer-file-diagram-' + Date.now(), outputPayload.mermaid);
@@ -3092,11 +3289,13 @@ async function main() {
   buildDeclarationIndexes(sourcePayload);
   indexFunctions();
 
+  activePrimaryView = loadPrimaryViewMode();
   activeNetworkLayoutMode = loadNetworkLayoutMode();
   rawRenderText();
   subtitleEl.textContent = (outputPayload.entry || 'unknown entry') + '  |  ' + (outputPayload.rootDir || 'unknown root');
   buildMetaEl.textContent = formatBuildMeta(outputPayload.meta);
   renderStats();
+  applyPrimaryViewMode();
   renderNetworkLayoutSwitch();
   renderSelectedFunctionPanel();
   layoutFunctionNetwork();

@@ -108,6 +108,22 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         display:grid;
         gap:14px;
       }
+      .visualization-panel-body {
+        display:grid;
+        gap:12px;
+      }
+      .visualization-switch-row {
+        display:flex;
+        flex-wrap:wrap;
+        align-items:center;
+        justify-content:space-between;
+        gap:10px;
+      }
+      .visualization-view {
+        display:grid;
+        gap:10px;
+      }
+      .visualization-view[hidden] { display:none; }
       .lower-grid {
         display:grid;
         gap:14px;
@@ -543,8 +559,8 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         gap:10px;
       }
       .module-diagram-viewport {
-        min-height:420px;
-        max-height:70vh;
+        min-height:620px;
+        max-height:78vh;
         overflow:auto;
         overscroll-behavior:contain;
         border:1px solid var(--border);
@@ -773,8 +789,8 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
       .error-text { color:var(--danger); }
       @media (max-width: 760px) {
         .shell { width:min(100% - 18px, 1480px); padding-top:10px; }
-        .header, .function-title, .network-toolbar { align-items:flex-start; flex-direction:column; }
-        .network-viewport { min-height:500px; }
+        .header, .function-title, .network-toolbar, .visualization-switch-row { align-items:flex-start; flex-direction:column; }
+        .network-viewport, .module-diagram-viewport { min-height:500px; }
         .source-dialog-actions { justify-content:flex-start; }
       }
     </style>
@@ -784,41 +800,68 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
       <header class="header">
         <div>
           <h1 class="title">IronGlancer</h1>
-          <p id="subtitle" class="subtitle">Loading function network...</p>
+          <p id="subtitle" class="subtitle">Loading visualizations...</p>
           <p id="build-meta" class="meta-line">Checking build metadata...</p>
-        </div>
-        <div class="toolbar-group">
-          <button id="download-svg-btn" type="button" disabled>Download file diagram</button>
         </div>
       </header>
 
       <main class="viewer-grid">
-        <section class="panel" aria-labelledby="network-title">
+        <section class="panel" aria-labelledby="visualization-title">
           <div class="panel-header">
-            <h2 id="network-title">Function Network</h2>
+            <h2 id="visualization-title">Architecture Views</h2>
             <span id="network-status" class="status-line" aria-live="polite"></span>
           </div>
-          <div class="panel-body viewer-grid">
-            <div class="network-toolbar">
-              <div class="toolbar-group network-primary-controls">
-                <div id="network-layout-switch" class="segmented-control" role="group" aria-label="Function network layout"></div>
-                <div class="toolbar-group" aria-label="Network view controls">
-                  <button id="network-zoom-out-btn" type="button" aria-label="Zoom out">-</button>
-                  <button id="network-zoom-in-btn" type="button" aria-label="Zoom in">+</button>
-                  <button id="network-fit-btn" type="button">Fit</button>
-                  <button id="network-reset-view-btn" type="button">100%</button>
-                  <button id="network-reset-selection-btn" type="button" disabled>Reset</button>
+          <div class="panel-body visualization-panel-body">
+            <div class="visualization-switch-row">
+              <div id="primary-view-switch" class="segmented-control" role="group" aria-label="Primary visualization view"></div>
+            </div>
+
+            <section id="function-graphs-view" class="visualization-view" aria-label="Function graphs">
+              <div class="network-toolbar">
+                <div class="toolbar-group network-primary-controls">
+                  <div id="network-layout-switch" class="segmented-control" role="group" aria-label="Function graph layout"></div>
+                  <div class="toolbar-group" aria-label="Function graph view controls">
+                    <button id="network-zoom-out-btn" type="button" aria-label="Zoom out">-</button>
+                    <button id="network-zoom-in-btn" type="button" aria-label="Zoom in">+</button>
+                    <button id="network-fit-btn" type="button">Fit</button>
+                    <button id="network-reset-view-btn" type="button">100%</button>
+                    <button id="network-reset-selection-btn" type="button" disabled>Reset</button>
+                  </div>
+                </div>
+                <div class="toolbar-group">
+                  <span id="network-zoom-status" class="status-line">Zoom 100%</span>
                 </div>
               </div>
-              <div class="toolbar-group">
-                <span id="network-zoom-status" class="status-line">Zoom 100%</span>
+              <div id="file-legend" class="legend" aria-label="File color legend"></div>
+              <div class="network-help">Drag to pan. Use the zoom buttons, pinch, or Ctrl/Cmd + wheel to zoom. Select a function in the graph to highlight who uses it and what it uses.</div>
+              <div id="function-network-viewport" class="network-viewport">
+                <svg id="function-network-svg" class="network-svg" role="img" aria-label="Function graph"></svg>
               </div>
-            </div>
-            <div id="file-legend" class="legend" aria-label="File color legend"></div>
-            <div class="network-help">Drag to pan. Use the zoom buttons, pinch, or Ctrl/Cmd + wheel to zoom. Select a function to highlight who uses it and what it uses.</div>
-            <div id="function-network-viewport" class="network-viewport">
-              <svg id="function-network-svg" class="network-svg" role="img" aria-label="Function call network"></svg>
-            </div>
+            </section>
+
+            <section id="jsx-map-view" class="visualization-view" aria-label="JSX file composition map" hidden>
+              <div class="module-diagram-body">
+                <div class="network-toolbar">
+                  <div class="toolbar-group" aria-label="JSX map view controls">
+                    <button id="module-diagram-zoom-out-btn" type="button" aria-label="Zoom out">-</button>
+                    <button id="module-diagram-zoom-in-btn" type="button" aria-label="Zoom in">+</button>
+                    <button id="module-diagram-fit-btn" type="button">Fit</button>
+                    <button id="module-diagram-reset-view-btn" type="button">100%</button>
+                    <button id="download-svg-btn" type="button" disabled>Download</button>
+                  </div>
+                  <div class="toolbar-group">
+                    <span id="module-diagram-zoom-status" class="status-line">Zoom 100%</span>
+                  </div>
+                </div>
+                <div class="network-help">Drag to pan. Use the zoom buttons, pinch, or Ctrl/Cmd + wheel to zoom. Select an import edge for details or a member name for source.</div>
+                <div id="module-diagram-viewport" class="module-diagram-viewport">
+                  <div id="module-diagram" class="module-diagram-canvas"></div>
+                </div>
+                <section id="selected-import" class="selected-import-details" aria-live="polite">
+                  <p class="empty-note">No import edge selected.</p>
+                </section>
+              </div>
+            </section>
           </div>
         </section>
 
@@ -837,32 +880,6 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
             <div id="stats" class="panel-body summary-grid"></div>
           </section>
         </div>
-
-        <details class="panel" open>
-          <summary><h2>File Import Diagram</h2></summary>
-          <div class="panel-body">
-            <div class="module-diagram-body">
-              <div class="network-toolbar">
-                <div class="toolbar-group" aria-label="File diagram view controls">
-                  <button id="module-diagram-zoom-out-btn" type="button" aria-label="Zoom out">-</button>
-                  <button id="module-diagram-zoom-in-btn" type="button" aria-label="Zoom in">+</button>
-                  <button id="module-diagram-fit-btn" type="button">Fit</button>
-                  <button id="module-diagram-reset-view-btn" type="button">100%</button>
-                </div>
-                <div class="toolbar-group">
-                  <span id="module-diagram-zoom-status" class="status-line">Zoom 100%</span>
-                </div>
-              </div>
-              <div class="network-help">Drag to pan. Use the zoom buttons, pinch, or Ctrl/Cmd + wheel to zoom. Select an import edge for details or a member name for source.</div>
-              <div id="module-diagram-viewport" class="module-diagram-viewport">
-                <div id="module-diagram" class="module-diagram-canvas"></div>
-              </div>
-              <section id="selected-import" class="selected-import-details" aria-live="polite">
-                <p class="empty-note">No import edge selected.</p>
-              </section>
-            </div>
-          </div>
-        </details>
 
         <details class="panel">
           <summary><h2>Files</h2></summary>

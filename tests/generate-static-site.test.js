@@ -489,13 +489,16 @@ test('generateStaticSite writes a static viewer bundle', async () => {
     new URL(appScriptMatch[1], 'https://static.example/analysis/index.html').href,
     `https://static.example/analysis/app.js?v=${expectedAppHash}`,
   );
-  assert.match(html, />Function Network</);
+  assert.match(html, />Architecture Views</);
+  assert.match(html, /id="primary-view-switch"/);
+  assert.match(html, /id="function-graphs-view"/);
+  assert.match(html, /id="jsx-map-view"/);
   assert.match(html, /id="function-network-viewport"/);
   assert.match(html, /id="function-network-svg"/);
   assert.match(html, /id="selected-function"/);
   assert.match(html, />Function Details</);
   assert.match(html, />Project Snapshot</);
-  assert.match(html, />File Import Diagram</);
+  assert.match(html, /id="download-svg-btn"/);
   assert.match(html, /id="source-dialog-neighborhood"/);
   assert.match(html, /id="source-dialog-relationships"/);
   assert.doesNotMatch(html, /id="jsx-line-counts-panel"/);
