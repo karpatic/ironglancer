@@ -26,6 +26,12 @@ const relationFilters = [
   { id: 'browser-library', label: 'Browser/library' },
   { id: 'couldnt-trace', label: "Couldn't trace" },
 ];
+const networkLayoutModeStorageKey = 'ironglancer:function-network-layout';
+const networkLayoutModes = [
+  { id: 'force', label: 'Force' },
+  { id: 'flow', label: 'Flow' },
+  { id: 'by-file', label: 'By file' },
+];
 
 const subtitleEl = document.getElementById('subtitle');
 const buildMetaEl = document.getElementById('build-meta');
@@ -51,6 +57,7 @@ const networkZoomOutBtn = document.getElementById('network-zoom-out-btn');
 const networkFitBtn = document.getElementById('network-fit-btn');
 const networkResetViewBtn = document.getElementById('network-reset-view-btn');
 const networkResetSelectionBtn = document.getElementById('network-reset-selection-btn');
+const networkLayoutSwitchEl = document.getElementById('network-layout-switch');
 const fileLegendEl = document.getElementById('file-legend');
 const selectedFunctionEl = document.getElementById('selected-function');
 const sourceDialogEl = document.getElementById('source-dialog');
@@ -102,6 +109,7 @@ let sourceMemberTargets = new Map();
 let highlightedSourceRecord = null;
 let selectedFunctionId = '';
 let activeRelationFilter = 'all';
+let activeNetworkLayoutMode = 'force';
 let sourceDialogState = { functionId: '', group: [], index: -1 };
 let sourceDialogRestoreFocusEl = null;
 let viewerBridge = emptyViewerBridge();
@@ -411,6 +419,65 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
+function networkLayoutModeRecord(modeId = activeNetworkLayoutMode) {
+  return networkLayoutModes.find((mode) => mode.id === modeId) || networkLayoutModes[0];
+}
+
+function storageForNetworkLayoutMode() {
+  try {
+    if (typeof window !== 'object' || !window.localStorage) return null;
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+function loadNetworkLayoutMode() {
+  const storage = storageForNetworkLayoutMode();
+  const savedMode = storage ? storage.getItem(networkLayoutModeStorageKey) : '';
+  return networkLayoutModeRecord(savedMode).id;
+}
+
+function persistNetworkLayoutMode(modeId) {
+  const storage = storageForNetworkLayoutMode();
+  if (!storage) return;
+  try {
+    storage.setItem(networkLayoutModeStorageKey, networkLayoutModeRecord(modeId).id);
+  } catch {
+    // Layout persistence is a convenience; the viewer still works without it.
+  }
+}
+
+function renderNetworkLayoutSwitch() {
+  networkLayoutSwitchEl.textContent = '';
+  for (const mode of networkLayoutModes) {
+    const button = createElement('button', mode.id === activeNetworkLayoutMode ? 'is-active' : '', mode.label);
+    button.type = 'button';
+    button.setAttribute('aria-pressed', mode.id === activeNetworkLayoutMode ? 'true' : 'false');
+    button.addEventListener('click', () => setNetworkLayoutMode(mode.id));
+    networkLayoutSwitchEl.appendChild(button);
+  }
+}
+
+function fitCurrentNetworkLayout() {
+  requestAnimationFrame(() => {
+    fitNetworkToViewport();
+    if (selectedFunctionId) scrollFunctionIntoView(selectedFunctionId);
+  });
+}
+
+function setNetworkLayoutMode(modeId) {
+  const nextMode = networkLayoutModeRecord(modeId).id;
+  if (nextMode === activeNetworkLayoutMode && networkLayout) return;
+  activeNetworkLayoutMode = nextMode;
+  persistNetworkLayoutMode(nextMode);
+  renderNetworkLayoutSwitch();
+  layoutFunctionNetwork();
+  renderFunctionNetwork();
+  fitCurrentNetworkLayout();
+  sendViewerBridgeState('switch-network-layout');
+}
+
 function moduleClusterCenters(fileOrder, width, height) {
   const visibleFileOrder = fileOrder.filter((modulePath) => functions.some((node) => node.modulePath === modulePath));
   const centers = new Map();
@@ -575,14 +642,36 @@ function normalizeNetworkBounds(layoutNodes) {
   return { width, height };
 }
 
-function layoutFunctionNetwork() {
-  const fileOrder = buildModuleOrder();
-  assignFileColors(fileOrder);
-  renderFileLegend(fileOrder);
-
+function networkLineExtents() {
   const lineCounts = functions.map(lineCountFor).filter((count) => count > 0);
-  const minLines = lineCounts.length ? Math.min(...lineCounts) : 1;
-  const maxLines = lineCounts.length ? Math.max(...lineCounts) : 1;
+  return {
+    minLines: lineCounts.length ? Math.min(...lineCounts) : 1,
+    maxLines: lineCounts.length ? Math.max(...lineCounts) : 1,
+  };
+}
+
+function networkLayoutNode(node, x, y, { minLines, maxLines }, extra = {}) {
+  return {
+    node,
+    x,
+    y,
+    radius: scaledNodeRadius(node, minLines, maxLines),
+    color: fileColorByPath.get(node.modulePath) || '#64748b',
+    ...extra,
+  };
+}
+
+function functionNodesByFile(fileOrder) {
+  const nodesByFile = new Map(fileOrder.map((modulePath) => [modulePath, []]));
+  for (const node of functions) {
+    if (!nodesByFile.has(node.modulePath)) nodesByFile.set(node.modulePath, []);
+    nodesByFile.get(node.modulePath).push(node);
+  }
+  for (const list of nodesByFile.values()) list.sort(sortFunctions);
+  return nodesByFile;
+}
+
+function layoutForceFunctionNetwork(fileOrder, lineExtents) {
   const count = Math.max(1, functions.length);
   const width = Math.max(1040, Math.ceil(Math.sqrt(count) * 195));
   const height = Math.max(680, Math.ceil(Math.sqrt(count) * 155));
@@ -593,20 +682,257 @@ function layoutFunctionNetwork() {
     const cluster = clusterCenters.get(node.modulePath) || { x: width / 2, y: height / 2 };
     const position = networkInitialPosition(node, index, functions.length, cluster, width, height);
     nodes.set(node.id, {
-      node,
-      x: position.x,
-      y: position.y,
+      ...networkLayoutNode(node, position.x, position.y, lineExtents),
       vx: 0,
       vy: 0,
-      radius: scaledNodeRadius(node, minLines, maxLines),
-      color: fileColorByPath.get(node.modulePath) || '#64748b',
     });
   });
 
   simulateForceLayout(nodes, edges, clusterCenters, width, height);
   expandNetworkSpread(nodes);
   const bounds = normalizeNetworkBounds(nodes);
-  networkLayout = { width: bounds.width, height: bounds.height, nodes };
+  networkLayout = { mode: 'force', width: bounds.width, height: bounds.height, nodes };
+}
+
+function layoutByFileFunctionNetwork(fileOrder, lineExtents) {
+  const nodesByFile = functionNodesByFile(fileOrder);
+  const visibleFileOrder = fileOrder.filter((modulePath) => (nodesByFile.get(modulePath) || []).length > 0);
+  const columnGap = 245;
+  const laneWidth = 205;
+  const rowGap = 66;
+  const marginX = 110;
+  const marginY = 78;
+  const maxRows = Math.max(1, ...visibleFileOrder.map((modulePath) => nodesByFile.get(modulePath).length));
+  const width = Math.max(920, marginX * 2 + Math.max(1, visibleFileOrder.length - 1) * columnGap + laneWidth);
+  const height = Math.max(560, marginY * 2 + (maxRows - 1) * rowGap + 100);
+  const nodes = new Map();
+  const lanes = [];
+
+  visibleFileOrder.forEach((modulePath, fileIndex) => {
+    const x = marginX + fileIndex * columnGap;
+    lanes.push({
+      modulePath,
+      x: x - laneWidth / 2,
+      y: 34,
+      width: laneWidth,
+      height: height - 68,
+    });
+    const list = nodesByFile.get(modulePath) || [];
+    list.forEach((node, index) => {
+      nodes.set(node.id, networkLayoutNode(node, x, marginY + index * rowGap, lineExtents));
+    });
+  });
+
+  networkBaseWidth = width;
+  networkBaseHeight = height;
+  networkLayout = { mode: 'by-file', width, height, lanes, nodes };
+}
+
+function compareFunctionIds(a, b) {
+  return sortFunctions(functionById.get(a), functionById.get(b));
+}
+
+function stronglyConnectedFunctionComponents() {
+  const adjacency = new Map(functions.map((node) => [node.id, []]));
+  for (const edge of edges) {
+    if (!adjacency.has(edge.sourceId)) continue;
+    adjacency.get(edge.sourceId).push(edge.targetId);
+  }
+  for (const list of adjacency.values()) list.sort(compareFunctionIds);
+
+  const indexById = new Map();
+  const lowById = new Map();
+  const stack = [];
+  const onStack = new Set();
+  const components = [];
+  let nextIndex = 0;
+
+  function visit(functionId) {
+    indexById.set(functionId, nextIndex);
+    lowById.set(functionId, nextIndex);
+    nextIndex += 1;
+    stack.push(functionId);
+    onStack.add(functionId);
+
+    for (const targetId of adjacency.get(functionId) || []) {
+      if (!indexById.has(targetId)) {
+        visit(targetId);
+        lowById.set(functionId, Math.min(lowById.get(functionId), lowById.get(targetId)));
+      } else if (onStack.has(targetId)) {
+        lowById.set(functionId, Math.min(lowById.get(functionId), indexById.get(targetId)));
+      }
+    }
+
+    if (lowById.get(functionId) !== indexById.get(functionId)) return;
+    const nodeIds = [];
+    let currentId = '';
+    do {
+      currentId = stack.pop();
+      onStack.delete(currentId);
+      nodeIds.push(currentId);
+    } while (currentId !== functionId);
+    nodeIds.sort(compareFunctionIds);
+    components.push({ id: 'component-' + components.length, nodeIds });
+  }
+
+  for (const node of functions) {
+    if (!indexById.has(node.id)) visit(node.id);
+  }
+  return components.sort((a, b) => compareFunctionIds(a.nodeIds[0], b.nodeIds[0]));
+}
+
+function flowDepthByFunctionId() {
+  const components = stronglyConnectedFunctionComponents();
+  const componentByFunctionId = new Map();
+  for (const component of components) {
+    for (const functionId of component.nodeIds) componentByFunctionId.set(functionId, component.id);
+  }
+
+  const outgoingByComponent = new Map(components.map((component) => [component.id, new Set()]));
+  const incomingCountByComponent = new Map(components.map((component) => [component.id, 0]));
+  const depthByComponent = new Map(components.map((component) => [component.id, 0]));
+  for (const edge of edges) {
+    const sourceComponentId = componentByFunctionId.get(edge.sourceId);
+    const targetComponentId = componentByFunctionId.get(edge.targetId);
+    if (!sourceComponentId || !targetComponentId || sourceComponentId === targetComponentId) continue;
+    const outgoing = outgoingByComponent.get(sourceComponentId);
+    if (outgoing.has(targetComponentId)) continue;
+    outgoing.add(targetComponentId);
+    incomingCountByComponent.set(targetComponentId, incomingCountByComponent.get(targetComponentId) + 1);
+  }
+
+  const componentById = new Map(components.map((component) => [component.id, component]));
+  const compareComponents = (a, b) => compareFunctionIds(componentById.get(a).nodeIds[0], componentById.get(b).nodeIds[0]);
+  const queue = components
+    .filter((component) => incomingCountByComponent.get(component.id) === 0)
+    .map((component) => component.id)
+    .sort(compareComponents);
+
+  while (queue.length > 0) {
+    const componentId = queue.shift();
+    const targets = Array.from(outgoingByComponent.get(componentId) || []).sort(compareComponents);
+    for (const targetId of targets) {
+      depthByComponent.set(targetId, Math.max(
+        depthByComponent.get(targetId),
+        depthByComponent.get(componentId) + 1,
+      ));
+      incomingCountByComponent.set(targetId, incomingCountByComponent.get(targetId) - 1);
+      if (incomingCountByComponent.get(targetId) === 0) {
+        queue.push(targetId);
+        queue.sort(compareComponents);
+      }
+    }
+  }
+
+  const depthByFunctionId = new Map();
+  for (const component of components) {
+    const depth = depthByComponent.get(component.id) || 0;
+    for (const functionId of component.nodeIds) depthByFunctionId.set(functionId, depth);
+  }
+  return depthByFunctionId;
+}
+
+function averageOrderedNeighbor(node, edgeList, neighborKey, orderById) {
+  const values = safeArray(edgeList)
+    .map((edge) => orderById.get(edge[neighborKey]))
+    .filter((value) => Number.isFinite(value));
+  if (values.length === 0) return Number.POSITIVE_INFINITY;
+  return values.reduce((total, value) => total + value, 0) / values.length;
+}
+
+function sortFlowLayer(layer, scoreForNode) {
+  layer.sort((a, b) => {
+    const aScore = scoreForNode(a);
+    const bScore = scoreForNode(b);
+    if (aScore !== bScore) return aScore - bScore;
+    return sortFunctions(a, b);
+  });
+}
+
+function sortedFlowLayers(depthByFunctionId) {
+  const layersByDepth = new Map();
+  for (const node of functions) {
+    const depth = depthByFunctionId.get(node.id) || 0;
+    if (!layersByDepth.has(depth)) layersByDepth.set(depth, []);
+    layersByDepth.get(depth).push(node);
+  }
+  const layers = Array.from(layersByDepth.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([, layer]) => layer.sort(sortFunctions));
+  const orderById = new Map();
+  const refreshOrder = () => {
+    orderById.clear();
+    layers.forEach((layer, layerIndex) => {
+      layer.forEach((node, rowIndex) => {
+        orderById.set(node.id, layerIndex * 10000 + rowIndex);
+      });
+    });
+  };
+
+  refreshOrder();
+  for (let pass = 0; pass < 2; pass += 1) {
+    for (let layerIndex = 1; layerIndex < layers.length; layerIndex += 1) {
+      sortFlowLayer(layers[layerIndex], (node) => averageOrderedNeighbor(
+        node,
+        edgesByTargetId.get(node.id),
+        'sourceId',
+        orderById,
+      ));
+      refreshOrder();
+    }
+    for (let layerIndex = layers.length - 2; layerIndex >= 0; layerIndex -= 1) {
+      sortFlowLayer(layers[layerIndex], (node) => averageOrderedNeighbor(
+        node,
+        edgesBySourceId.get(node.id),
+        'targetId',
+        orderById,
+      ));
+      refreshOrder();
+    }
+  }
+  return layers;
+}
+
+function layoutFlowFunctionNetwork(lineExtents) {
+  const layers = sortedFlowLayers(flowDepthByFunctionId());
+  const layerGap = 245;
+  const rowGap = 68;
+  const marginX = 110;
+  const marginY = 86;
+  const maxRows = Math.max(1, ...layers.map((layer) => layer.length));
+  const layerCount = Math.max(1, layers.length);
+  const width = Math.max(920, marginX * 2 + (layerCount - 1) * layerGap + 180);
+  const height = Math.max(560, marginY * 2 + (maxRows - 1) * rowGap + 118);
+  const nodes = new Map();
+
+  layers.forEach((layer, layerIndex) => {
+    const layerHeight = (layer.length - 1) * rowGap;
+    const top = Math.max(marginY, (height - layerHeight) / 2);
+    layer.forEach((node, rowIndex) => {
+      nodes.set(node.id, networkLayoutNode(node, marginX + layerIndex * layerGap, top + rowIndex * rowGap, lineExtents));
+    });
+  });
+
+  networkBaseWidth = width;
+  networkBaseHeight = height;
+  networkLayout = { mode: 'flow', width, height, nodes };
+}
+
+function layoutFunctionNetwork() {
+  const fileOrder = buildModuleOrder();
+  assignFileColors(fileOrder);
+  renderFileLegend(fileOrder);
+  const lineExtents = networkLineExtents();
+
+  if (activeNetworkLayoutMode === 'flow') {
+    layoutFlowFunctionNetwork(lineExtents);
+    return;
+  }
+  if (activeNetworkLayoutMode === 'by-file') {
+    layoutByFileFunctionNetwork(fileOrder, lineExtents);
+    return;
+  }
+  layoutForceFunctionNetwork(fileOrder, lineExtents);
 }
 
 function edgeEndpoint(source, target, sourceRadius, targetRadius) {
@@ -621,19 +947,35 @@ function edgeEndpoint(source, target, sourceRadius, targetRadius) {
   };
 }
 
-function edgePath(edge) {
-  const source = networkLayout.nodes.get(edge.sourceId);
-  const target = networkLayout.nodes.get(edge.targetId);
-  if (!source || !target) return '';
-  if (edge.sourceId === edge.targetId) {
-    const r = source.radius + 34;
+function selfEdgePath(source) {
+  if (networkLayout.mode === 'flow') {
+    const r = source.radius + 28;
+    return [
+      'M', source.x + source.radius, source.y,
+      'C', source.x + r + 42, source.y - r,
+      source.x + r + 42, source.y + r,
+      source.x + source.radius, source.y + 2,
+    ].join(' ');
+  }
+  if (networkLayout.mode === 'by-file') {
+    const r = source.radius + 20;
     return [
       'M', source.x + source.radius, source.y,
       'C', source.x + r, source.y - r,
-      source.x - r, source.y - r,
-      source.x - source.radius, source.y,
+      source.x + r, source.y + r,
+      source.x + source.radius, source.y + 2,
     ].join(' ');
   }
+  const r = source.radius + 34;
+  return [
+    'M', source.x + source.radius, source.y,
+    'C', source.x + r, source.y - r,
+    source.x - r, source.y - r,
+    source.x - source.radius, source.y,
+  ].join(' ');
+}
+
+function forceEdgePath(edge, source, target) {
   const endpoints = edgeEndpoint(source, target, source.radius, target.radius);
   const dx = endpoints.endX - endpoints.startX;
   const dy = endpoints.endY - endpoints.startY;
@@ -651,6 +993,57 @@ function edgePath(edge) {
   ].join(' ');
 }
 
+function flowEdgePath(edge, source, target) {
+  const endpoints = edgeEndpoint(source, target, source.radius, target.radius);
+  const dx = endpoints.endX - endpoints.startX;
+  if (target.x > source.x + 24) {
+    const curve = Math.max(72, Math.min(220, Math.abs(dx) * 0.48));
+    return [
+      'M', endpoints.startX, endpoints.startY,
+      'C', endpoints.startX + curve, endpoints.startY,
+      endpoints.endX - curve, endpoints.endY,
+      endpoints.endX, endpoints.endY,
+    ].join(' ');
+  }
+  const sideX = Math.max(source.x, target.x) + 82 + seededUnit(edge.id || edge.sourceId + ':' + edge.targetId) * 38;
+  return [
+    'M', endpoints.startX, endpoints.startY,
+    'C', sideX, endpoints.startY,
+    sideX, endpoints.endY,
+    endpoints.endX, endpoints.endY,
+  ].join(' ');
+}
+
+function byFileEdgePath(source, target) {
+  const endpoints = edgeEndpoint(source, target, source.radius, target.radius);
+  if (source.node.modulePath === target.node.modulePath) {
+    const curveX = Math.max(source.x, target.x) + 72;
+    return [
+      'M', endpoints.startX, endpoints.startY,
+      'C', curveX, endpoints.startY,
+      curveX, endpoints.endY,
+      endpoints.endX, endpoints.endY,
+    ].join(' ');
+  }
+  const middleX = (endpoints.startX + endpoints.endX) / 2;
+  return [
+    'M', endpoints.startX, endpoints.startY,
+    'C', middleX, endpoints.startY,
+    middleX, endpoints.endY,
+    endpoints.endX, endpoints.endY,
+  ].join(' ');
+}
+
+function edgePath(edge) {
+  const source = networkLayout.nodes.get(edge.sourceId);
+  const target = networkLayout.nodes.get(edge.targetId);
+  if (!source || !target) return '';
+  if (edge.sourceId === edge.targetId) return selfEdgePath(source);
+  if (networkLayout.mode === 'flow') return flowEdgePath(edge, source, target);
+  if (networkLayout.mode === 'by-file') return byFileEdgePath(source, target);
+  return forceEdgePath(edge, source, target);
+}
+
 function connectionSummary(node) {
   const incoming = safeArray(edgesByTargetId.get(node.id)).length;
   const outgoing = safeArray(edgesBySourceId.get(node.id)).length;
@@ -663,6 +1056,12 @@ function nodeAriaLabel(node) {
   return displayName(node) + ', ' + fileName(node.modulePath) + ', '
     + lineCountFor(node) + ' ' + plural(lineCountFor(node), 'line') + '. '
     + connectionSummary(node);
+}
+
+function edgeAriaLabel(edge) {
+  const source = functionById.get(edge.sourceId);
+  const target = functionById.get(edge.targetId);
+  return displayName(source) + ' uses ' + displayName(target) + '. Select ' + displayName(target) + '.';
 }
 
 function addKeyboardActivation(element, callback) {
@@ -691,6 +1090,7 @@ function renderFunctionNetwork() {
   }
 
   networkSvgEl.setAttribute('viewBox', '0 0 ' + networkLayout.width + ' ' + networkLayout.height);
+  networkSvgEl.setAttribute('aria-label', 'Function call network, ' + networkLayoutModeRecord(networkLayout.mode).label + ' layout');
   networkSvgEl.style.width = (networkLayout.width * networkZoom) + 'px';
   networkSvgEl.style.height = (networkLayout.height * networkZoom) + 'px';
 
@@ -709,10 +1109,36 @@ function renderFunctionNetwork() {
   defs.appendChild(marker);
   networkSvgEl.appendChild(defs);
 
+  if (safeArray(networkLayout.lanes).length > 0) {
+    const laneGroup = createSvgElement('g', { class: 'file-lanes' });
+    for (const lane of networkLayout.lanes) {
+      laneGroup.appendChild(createSvgElement('rect', {
+        class: 'file-lane',
+        x: lane.x,
+        y: lane.y,
+        width: lane.width,
+        height: lane.height,
+        rx: 10,
+      }));
+      const label = createSvgElement('text', {
+        class: 'file-lane-label',
+        x: lane.x + 12,
+        y: lane.y + 22,
+      });
+      label.textContent = shortLabel(lane.modulePath, 25);
+      const title = createSvgElement('title');
+      title.textContent = lane.modulePath;
+      label.appendChild(title);
+      laneGroup.appendChild(label);
+    }
+    networkSvgEl.appendChild(laneGroup);
+  }
+
   const edgeGroup = createSvgElement('g', { class: 'network-edges' });
   for (const edge of edges) {
     const path = edgePath(edge);
     if (!path) continue;
+    const label = edgeAriaLabel(edge);
     const visiblePath = createSvgElement('path', {
       class: 'network-edge',
       d: path,
@@ -720,6 +1146,10 @@ function renderFunctionNetwork() {
       'data-source-id': edge.sourceId,
       'data-target-id': edge.targetId,
       'marker-end': 'url(#network-arrow)',
+      role: 'button',
+      tabindex: 0,
+      focusable: 'true',
+      'aria-label': label,
     });
     const hitPath = createSvgElement('path', {
       class: 'network-edge-hit',
@@ -728,9 +1158,14 @@ function renderFunctionNetwork() {
       'data-edge-id': edge.id,
     });
     const title = createSvgElement('title');
-    title.textContent = displayName(functionById.get(edge.sourceId)) + ' uses '
-      + displayName(functionById.get(edge.targetId));
+    title.textContent = label;
     visiblePath.appendChild(title);
+    const activate = (event) => {
+      if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
+      selectFunction(edge.targetId, { reason: 'select-function-edge', restoreFocusEl: visiblePath, scroll: true });
+    };
+    addKeyboardActivation(visiblePath, activate);
+    hitPath.addEventListener('click', activate);
     edgeGroup.append(hitPath, visiblePath);
   }
   networkSvgEl.appendChild(edgeGroup);
@@ -1889,13 +2324,14 @@ function updateNetworkHighlights() {
     edgeEl.classList.toggle('is-filter-match', matchedEdgeIds.has(edgeId));
   }
 
+  const modeLabel = networkLayoutModeRecord(networkLayout?.mode).label;
   if (selectedNode) {
     const usedBy = incomingEdges.length;
     const uses = outgoingEdges.length + externalRelationshipsForNode(selectedNode).length;
-    networkStatusEl.textContent = 'Selected ' + displayName(selectedNode) + ': '
+    networkStatusEl.textContent = modeLabel + ': selected ' + displayName(selectedNode) + ': '
       + usedBy + ' ' + plural(usedBy, 'function') + ' use it; it uses ' + uses + '.';
   } else {
-    networkStatusEl.textContent = functions.length + ' functions, ' + edges.length + ' saved function links.';
+    networkStatusEl.textContent = modeLabel + ': ' + functions.length + ' functions, ' + edges.length + ' saved function links.';
   }
 }
 
@@ -2213,6 +2649,7 @@ function currentViewerState(reason) {
     openSource: declarationSnapshotForFunctionId(sourceDialogState.functionId),
     highlighted: declarationSnapshotForFunctionId(selectedFunctionId),
     viewport: {
+      layout: activeNetworkLayoutMode,
       zoom: networkZoom,
       scrollLeft: networkViewportEl.scrollLeft,
       scrollTop: networkViewportEl.scrollTop,
@@ -2377,7 +2814,7 @@ async function initViewerBridge(payload = {}) {
 }
 
 function isNetworkNodeTarget(target) {
-  return Boolean(target?.closest?.('.network-node'));
+  return Boolean(target?.closest?.('.network-node,.network-edge,.network-edge-hit'));
 }
 
 function distanceBetween(pointerA, pointerB) {
@@ -2655,14 +3092,16 @@ async function main() {
   buildDeclarationIndexes(sourcePayload);
   indexFunctions();
 
+  activeNetworkLayoutMode = loadNetworkLayoutMode();
   rawRenderText();
   subtitleEl.textContent = (outputPayload.entry || 'unknown entry') + '  |  ' + (outputPayload.rootDir || 'unknown root');
   buildMetaEl.textContent = formatBuildMeta(outputPayload.meta);
   renderStats();
+  renderNetworkLayoutSwitch();
   renderSelectedFunctionPanel();
   layoutFunctionNetwork();
   renderFunctionNetwork();
-  requestAnimationFrame(() => fitNetworkToViewport());
+  fitCurrentNetworkLayout();
   await renderModuleDiagram();
   await initViewerBridge(outputPayload);
 }

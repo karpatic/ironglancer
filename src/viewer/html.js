@@ -123,6 +123,36 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         gap:7px;
       }
       .network-toolbar { justify-content:space-between; }
+      .network-primary-controls {
+        align-items:center;
+        gap:10px;
+      }
+      .segmented-control {
+        display:inline-flex;
+        align-items:center;
+        gap:2px;
+        min-height:34px;
+        border:1px solid #c7d4e7;
+        border-radius:8px;
+        background:#eef3f9;
+        padding:2px;
+      }
+      .segmented-control button {
+        min-height:28px;
+        border:0;
+        border-radius:6px;
+        background:transparent;
+        color:#475467;
+        font-size:.78rem;
+        font-weight:850;
+        padding:6px 9px;
+      }
+      .segmented-control button:hover { background:#f8fbff; }
+      .segmented-control button.is-active {
+        background:#ffffff;
+        color:#173a8a;
+        box-shadow:0 1px 3px rgba(31,45,68,.14);
+      }
       .status-line {
         min-height:1.25em;
         color:var(--muted);
@@ -153,6 +183,8 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         min-width:100%;
         min-height:100%;
       }
+      .file-lane { fill:#ffffff; stroke:#dfe5ef; stroke-width:1; }
+      .file-lane-label { fill:#64748b; font-size:12px; font-weight:800; }
       .network-edge {
         fill:none;
         stroke:#9aa8bb;
@@ -164,6 +196,12 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         stroke:transparent;
         stroke-width:14;
         pointer-events:stroke;
+        cursor:pointer;
+      }
+      .network-edge:focus-visible {
+        outline:0;
+        stroke:var(--accent);
+        stroke-width:3;
       }
       .network-node { cursor:pointer; transition:opacity .14s ease; }
       .network-node circle {
@@ -762,12 +800,15 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
           </div>
           <div class="panel-body viewer-grid">
             <div class="network-toolbar">
-              <div class="toolbar-group" aria-label="Network view controls">
-                <button id="network-zoom-out-btn" type="button" aria-label="Zoom out">-</button>
-                <button id="network-zoom-in-btn" type="button" aria-label="Zoom in">+</button>
-                <button id="network-fit-btn" type="button">Fit</button>
-                <button id="network-reset-view-btn" type="button">100%</button>
-                <button id="network-reset-selection-btn" type="button" disabled>Reset</button>
+              <div class="toolbar-group network-primary-controls">
+                <div id="network-layout-switch" class="segmented-control" role="group" aria-label="Function network layout"></div>
+                <div class="toolbar-group" aria-label="Network view controls">
+                  <button id="network-zoom-out-btn" type="button" aria-label="Zoom out">-</button>
+                  <button id="network-zoom-in-btn" type="button" aria-label="Zoom in">+</button>
+                  <button id="network-fit-btn" type="button">Fit</button>
+                  <button id="network-reset-view-btn" type="button">100%</button>
+                  <button id="network-reset-selection-btn" type="button" disabled>Reset</button>
+                </div>
               </div>
               <div class="toolbar-group">
                 <span id="network-zoom-status" class="status-line">Zoom 100%</span>
