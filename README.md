@@ -29,11 +29,11 @@ Examples
 
 Architecture diffs
 - compare two architecture snapshots from git refs without changing the checkout:
-  `ironglancer diff ./my-app --base main --head HEAD --entry src/app.jsx --format html --out architecture-diff.html --sarif review.sarif`
+  `ironglancer diff ./my-app --base main --head HEAD --entry src/app.jsx --format html --sarif review.sarif`
 - compare saved snapshots:
   `ironglancer diff --base ./before/output.json --head ./after-site --format json`
 - inputs can be git refs resolvable in the project repo, an `output.json` file, or a generated-site directory containing `output.json`
-- `--format json` writes machine-readable JSON to stdout unless `--out` is supplied; `--format html` writes one self-contained static report and requires `--out`
+- `--format json` writes machine-readable JSON to stdout unless `--out` is supplied; `--format html` writes one self-contained static report and defaults to `architecture-diff.html` when `--out` is omitted
 - `--sarif review.sarif` writes SARIF 2.1.0 findings alongside either JSON or HTML output
 - diff reports include schema/build/commit labels, module/function/edge deltas, structural findings, severity counts, static-analysis limitations, and `privacy.sourceMode = "none"`
 - privacy guarantee: diff JSON, HTML, and SARIF intentionally exclude absolute `rootDir` values and source excerpts

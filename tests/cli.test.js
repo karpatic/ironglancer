@@ -182,6 +182,41 @@ test('cli diff compares git refs without mutating branch, HEAD, or worktree', as
   assert.equal(await git(projectDir, ['status', '--short']), statusBefore);
 });
 
+test('cli diff analyzes a nested project folder at each git ref', async () => {
+  const repoDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-nested-'));
+  const projectDir = path.join(repoDir, 'packages', 'app');
+  await git(repoDir, ['init', '-b', 'main']);
+  await git(repoDir, ['config', 'user.email', 'tests@example.test']);
+  await git(repoDir, ['config', 'user.name', 'IronGlancer Tests']);
+  await writeText(path.join(projectDir, 'src/app.js'), 'export function App() { return null; }\n');
+  await writeText(path.join(repoDir, 'root-only.js'), 'export const rootOnly = true;\n');
+  await git(repoDir, ['add', '.']);
+  await git(repoDir, ['commit', '-m', 'base']);
+  const baseCommit = await git(repoDir, ['rev-parse', 'HEAD']);
+  await writeText(path.join(projectDir, 'src/feature.js'), 'export function feature() { return true; }\n');
+  await git(repoDir, ['add', '.']);
+  await git(repoDir, ['commit', '-m', 'head']);
+
+  const { stdout } = await execFile('node', [
+    path.resolve('src/cli.mjs'),
+    'diff',
+    projectDir,
+    '--base',
+    baseCommit,
+    '--head',
+    'HEAD',
+    '--entry',
+    'src/app.js',
+    '--format',
+    'json',
+  ], { cwd: path.resolve('.') });
+  const output = JSON.parse(stdout);
+
+  assert.deepEqual(output.modules.added.map((item) => item.path), ['src/feature.js']);
+  assert.equal(output.modules.added.some((item) => item.path === 'root-only.js'), false);
+  assert.equal(await git(repoDir, ['status', '--short']), '');
+});
+
 test('cli diff writes HTML and SARIF files for saved snapshots', async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-files-'));
   const basePath = path.join(tempDir, 'base.json');
@@ -234,6 +269,30 @@ test('cli diff writes HTML and SARIF files for saved snapshots', async () => {
   assert.equal(html.includes('/tmp/private'), false);
   assert.equal(sarif.version, '2.1.0');
   assert.equal(sarif.runs[0].results[0].ruleId, 'IRONG_DIFF_EXPORT_REMOVED');
+});
+
+test('cli diff uses architecture-diff.html when HTML output is omitted', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-default-html-'));
+  const basePath = path.join(tempDir, 'base.json');
+  const headPath = path.join(tempDir, 'head.json');
+  await writeJson(basePath, diffSnapshot({ label: 'base', modules: [] }));
+  await writeJson(headPath, diffSnapshot({
+    label: 'head',
+    modules: [{ path: 'src/app.js', lineCount: 1, reachable: true, isJsx: false, localDependencies: [], externalDependencies: [] }],
+  }));
+
+  await execFile('node', [
+    path.resolve('src/cli.mjs'),
+    'diff',
+    '--base',
+    basePath,
+    '--head',
+    headPath,
+    '--format',
+    'html',
+  ], { cwd: tempDir });
+
+  assert.match(await fs.readFile(path.join(tempDir, 'architecture-diff.html'), 'utf8'), /IronGlancer Architecture Diff/);
 });
 
 test('cli diff reports bad refs on stderr and cleans temporary ref directories', async () => {

@@ -26,7 +26,7 @@ function usage() {
     'Diff options:',
     '  --base <input>              Git ref, output.json path, or generated-site directory for the base snapshot.',
     '  --head <input>              Git ref, output.json path, or generated-site directory for the head snapshot.',
-    '  --format json|html          Diff report format. Defaults to json. HTML requires --out.',
+    '  --format json|html          Diff report format. Defaults to json; HTML defaults to architecture-diff.html.',
     '  --sarif <path>              Write SARIF 2.1.0 review findings alongside the selected format.',
     '  -h, --help                 Show this help.',
     '',

@@ -284,10 +284,8 @@ export async function createArchitectureDiff({
   if (!base) throw new SnapshotDiffError('ironglancer diff requires --base <input>.', 'missing_base');
   if (!head) throw new SnapshotDiffError('ironglancer diff requires --head <input>.', 'missing_head');
   const resolvedFormat = normalizedFormat(format);
-  if (resolvedFormat === 'html' && !outPath) {
-    throw new SnapshotDiffError('HTML diff output requires --out <path>.', 'missing_output');
-  }
-  assertNoOutputCollision(outPath, sarifPath);
+  const effectiveOutPath = resolvedFormat === 'html' ? outPath || 'architecture-diff.html' : outPath;
+  assertNoOutputCollision(effectiveOutPath, sarifPath);
 
   const [baseInput, headInput] = await Promise.all([
     loadSnapshotInput({ folder, input: base, entry, routeAliases, generatedAt }),
@@ -303,15 +301,15 @@ export async function createArchitectureDiff({
   let outputPath = null;
   if (resolvedFormat === 'json') {
     const json = JSON.stringify(diff, null, 2) + '\n';
-    if (outPath) {
-      await writeTextFile(outPath, json);
-      outputPath = path.resolve(outPath);
+    if (effectiveOutPath) {
+      await writeTextFile(effectiveOutPath, json);
+      outputPath = path.resolve(effectiveOutPath);
     } else {
       stdoutText = json;
     }
   } else {
-    await writeTextFile(outPath, renderDiffHtml(diff));
-    outputPath = path.resolve(outPath);
+    await writeTextFile(effectiveOutPath, renderDiffHtml(diff));
+    outputPath = path.resolve(effectiveOutPath);
   }
 
   let resolvedSarifPath = null;
