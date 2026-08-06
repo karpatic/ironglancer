@@ -677,6 +677,24 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         color:var(--danger);
         text-decoration:underline;
       }
+      .module-diagram-canvas .source-member-metrics {
+        display:inline-flex;
+        gap:3px;
+        margin-left:5px;
+        vertical-align:middle;
+        pointer-events:none;
+      }
+      .module-diagram-canvas .source-member-metric {
+        display:inline-block;
+        border:1px solid #bfd1f2;
+        border-radius:999px;
+        background:#eef5ff;
+        color:#17366f;
+        font-size:.75em;
+        font-weight:800;
+        line-height:1.15;
+        padding:1px 4px;
+      }
       .module-diagram-canvas .source-member-hit-target {
         fill:none !important;
         stroke:transparent !important;
@@ -745,6 +763,24 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         font-size:.84rem;
         line-height:1.45;
       }
+      .text-panel-body {
+        display:grid;
+        gap:10px;
+      }
+      .text-toolbar {
+        display:flex;
+        flex-wrap:wrap;
+        align-items:center;
+        justify-content:space-between;
+        gap:8px;
+      }
+      .copy-status {
+        min-height:1.2em;
+        color:var(--muted);
+        font-size:.84rem;
+      }
+      .copy-status.is-success { color:var(--good); }
+      .copy-status.is-error { color:var(--danger); }
       .source-dialog {
         position:fixed;
         inset:0;
@@ -951,17 +987,35 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
 
         <details class="panel">
           <summary><h2>Files</h2></summary>
-          <div class="panel-body"><pre id="jsx-tree"></pre></div>
+          <div class="panel-body text-panel-body">
+            <div class="text-toolbar">
+              <button id="copy-jsx-tree-btn" type="button" aria-describedby="copy-jsx-tree-status" disabled>Copy JSX tree</button>
+              <span id="copy-jsx-tree-status" class="copy-status" role="status" aria-live="polite"></span>
+            </div>
+            <pre id="jsx-tree"></pre>
+          </div>
         </details>
 
         <details class="panel">
           <summary><h2>Dependency Tree</h2></summary>
-          <div class="panel-body"><pre id="tree"></pre></div>
+          <div class="panel-body text-panel-body">
+            <div class="text-toolbar">
+              <button id="copy-tree-btn" type="button" aria-describedby="copy-tree-status" disabled>Copy dependency tree</button>
+              <span id="copy-tree-status" class="copy-status" role="status" aria-live="polite"></span>
+            </div>
+            <pre id="tree"></pre>
+          </div>
         </details>
 
         <details class="panel">
           <summary><h2>Mermaid Source</h2></summary>
-          <div class="panel-body"><pre id="mermaid"></pre></div>
+          <div class="panel-body text-panel-body">
+            <div class="text-toolbar">
+              <button id="copy-mermaid-source-btn" type="button" aria-describedby="copy-mermaid-source-status" disabled>Copy Mermaid source</button>
+              <span id="copy-mermaid-source-status" class="copy-status" role="status" aria-live="polite"></span>
+            </div>
+            <pre id="mermaid"></pre>
+          </div>
         </details>
       </main>
     </div>

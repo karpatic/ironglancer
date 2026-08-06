@@ -73,6 +73,12 @@ const statsEl = document.getElementById('stats');
 const jsxTreeEl = document.getElementById('jsx-tree');
 const treeEl = document.getElementById('tree');
 const mermaidEl = document.getElementById('mermaid');
+const copyJsxTreeBtn = document.getElementById('copy-jsx-tree-btn');
+const copyTreeBtn = document.getElementById('copy-tree-btn');
+const copyMermaidSourceBtn = document.getElementById('copy-mermaid-source-btn');
+const copyJsxTreeStatusEl = document.getElementById('copy-jsx-tree-status');
+const copyTreeStatusEl = document.getElementById('copy-tree-status');
+const copyMermaidSourceStatusEl = document.getElementById('copy-mermaid-source-status');
 const moduleDiagramEl = document.getElementById('module-diagram');
 const moduleDiagramViewportEl = document.getElementById('module-diagram-viewport');
 const moduleDiagramZoomStatusEl = document.getElementById('module-diagram-zoom-status');
@@ -167,7 +173,7 @@ let visibleNetworkGraph = null;
 let latestFunctionGraphStatus = '';
 let networkNeedsFit = true;
 let moduleDiagramNeedsFit = true;
-let sourceDialogState = { functionId: '', group: [], index: -1 };
+let sourceDialogState = { functionId: '', declaration: null, group: [], index: -1 };
 let sourceDialogRestoreFocusEl = null;
 let viewerBridge = emptyViewerBridge();
 const sourceMetricsSuffixPattern = /\s+\[lines:\s*\d+\s*\|\s*refs:\s*\d+\s*\|\s*importers:\s*\d+\]\s*$/i;
@@ -302,6 +308,59 @@ async function loadJson(url, fallback = null) {
   }
 }
 
+function setCopyStatus(statusEl, message, state) {
+  statusEl.textContent = message;
+  statusEl.classList.remove('is-success', 'is-error');
+  if (state) statusEl.classList.add('is-' + state);
+}
+
+function copyTextWithTextarea(text) {
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', '');
+  textarea.setAttribute('aria-hidden', 'true');
+  textarea.style.position = 'fixed';
+  textarea.style.top = '-1000px';
+  textarea.style.left = '-1000px';
+  textarea.style.width = '1px';
+  textarea.style.height = '1px';
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+
+  let didCopy = false;
+  try {
+    if (typeof document.execCommand === 'function') didCopy = document.execCommand('copy');
+  } finally {
+    textarea.remove();
+  }
+
+  if (!didCopy) throw new Error('Copy command was unavailable');
+}
+
+async function writeClipboardText(text) {
+  const clipboard = typeof navigator === 'object' ? navigator.clipboard : null;
+  if (clipboard && typeof clipboard.writeText === 'function') {
+    try {
+      await clipboard.writeText(text);
+      return;
+    } catch {
+      // Fall through to the textarea path for browsers that expose but reject Clipboard API.
+    }
+  }
+
+  copyTextWithTextarea(text);
+}
+
+async function copyRawText(text, label, statusEl) {
+  try {
+    await writeClipboardText(text);
+    setCopyStatus(statusEl, 'Copied ' + label + '.', 'success');
+  } catch {
+    setCopyStatus(statusEl, 'Could not copy ' + label + '.', 'error');
+  }
+}
+
 function sourcePayloadMatchesOutput(payload = {}, source = {}) {
   const outputMeta = payload && typeof payload.meta === 'object' ? payload.meta : {};
   const sourceMeta = source && typeof source.meta === 'object' ? source.meta : {};
@@ -310,6 +369,25 @@ function sourcePayloadMatchesOutput(payload = {}, source = {}) {
 
 function sourceKey(moduleId, name) {
   return moduleId + '\u0000' + name;
+}
+
+function sourceNavigationGroup(declaration) {
+  const moduleId = String(declaration?.moduleId || '').trim();
+  const sourceOrigin = String(declaration?.sourceOrigin || '').trim();
+  return moduleId && sourceOrigin ? sourceKey(moduleId, sourceOrigin) : '';
+}
+
+function sourceDialogGroupForDeclaration(declaration) {
+  const groupKey = sourceNavigationGroup(declaration);
+  if (!groupKey) return declaration ? [declaration] : [];
+  return safeArray(sourcePayload?.declarations)
+    .filter((candidate) => sourceNavigationGroup(candidate) === groupKey);
+}
+
+function sourceDialogPathForDeclaration(declaration = {}) {
+  const start = declaration.startLine || '?';
+  const end = declaration.endLine || start;
+  return (declaration.modulePath || 'unknown source') + ':' + start + '-' + end;
 }
 
 function buildDeclarationIndexes(payload = {}) {
@@ -2956,6 +3034,58 @@ function sourceMemberName(label) {
   return text.trim();
 }
 
+function sourceDeclarationLineCount(declaration) {
+  const startLine = Number(declaration?.startLine);
+  const endLine = Number(declaration?.endLine);
+  return Number.isInteger(startLine) && Number.isInteger(endLine) && endLine >= startLine
+    ? endLine - startLine + 1
+    : 0;
+}
+
+function sourceMetricCount(value) {
+  const count = Number(value);
+  return Number.isInteger(count) && count >= 0 ? count : 0;
+}
+
+function sourceMemberBaseText(labelText, declaration) {
+  const raw = typeof labelText === 'string' ? labelText : '';
+  const prefixMatch = raw.match(/^\s*(\\?[+#~-])\s*/);
+  const prefix = prefixMatch ? prefixMatch[1] : '';
+  const displayName = sourceLabelBase(raw)
+    || String(declaration?.name || declaration?.declarationName || '').trim();
+  return prefix + displayName;
+}
+
+function appendSourceMemberMetrics(element, declaration) {
+  const tagName = typeof element?.tagName === 'string' ? element.tagName.toLowerCase() : '';
+  const isSvgText = tagName === 'text';
+  const createInlineElement = (className) => {
+    const node = isSvgText
+      ? document.createElementNS(svgNamespace, 'tspan')
+      : document.createElement('span');
+    node.setAttribute('class', className);
+    return node;
+  };
+  const labelText = createInlineElement('source-member-label-text');
+  labelText.textContent = sourceMemberBaseText(element.textContent, declaration);
+
+  const metricsGroup = createInlineElement('source-member-metrics');
+  metricsGroup.setAttribute('aria-hidden', 'true');
+  for (const [metric, text] of [
+    ['lines', 'Lines ' + sourceDeclarationLineCount(declaration)],
+    ['refs', 'Refs ' + sourceMetricCount(declaration?.referenceCount)],
+    ['importers', 'Files ' + sourceMetricCount(declaration?.importerFileCount)],
+  ]) {
+    const badge = createInlineElement('source-member-metric');
+    badge.setAttribute('data-metric', metric);
+    badge.textContent = text;
+    metricsGroup.appendChild(badge);
+  }
+
+  element.textContent = '';
+  element.append(labelText, metricsGroup);
+}
+
 function addModuleIdCandidate(candidates, value) {
   const raw = typeof value === 'string' ? value.trim() : '';
   if (!raw) return;
@@ -3166,35 +3296,52 @@ function addSourceHitTarget(record, activate) {
   parent.appendChild(hitTarget);
 }
 
-function renderDeclarationFallbackDialog(declaration, restoreFocusEl = null) {
-  sourceDialogState = { functionId: '', group: [], index: -1 };
-  sourceDialogRestoreFocusEl = restoreFocusEl || null;
-  sourceDialogTitleEl.textContent = callableLabel(declaration.name || declaration.declarationName || 'Source');
-  sourceDialogPathEl.textContent = (declaration.modulePath || 'unknown source') + ':' + lineRange(declaration);
-  sourceDialogInsightEl.textContent = '';
-  sourceDialogInsightEl.appendChild(createElement('p', 'takeaway', 'Saved source for this diagram member is available, but it is not present in the function graph snapshot.'));
-  sourceDialogNeighborhoodEl.textContent = '';
+function renderSourceDialogDeclaration(declaration) {
+  const node = functionNodeForDeclaration(declaration);
+  sourceDialogTitleEl.textContent = declaration.name || declaration.declarationName || 'Source';
+  sourceDialogPathEl.textContent = sourceDialogPathForDeclaration(declaration);
   sourceDialogCodeEl.textContent = declaration.code || '// Source snippet was not saved for this member.';
-  sourceDialogConnectionsEl.hidden = true;
+
+  if (node) {
+    renderDialogInsight(node);
+    renderNeighborhood(node);
+    renderSourceConnectionDisclosure(node);
+  } else {
+    sourceDialogInsightEl.textContent = '';
+    sourceDialogInsightEl.appendChild(createElement('p', 'takeaway', 'Saved source for this diagram member is available, but it is not present in the function graph snapshot.'));
+    sourceDialogNeighborhoodEl.textContent = '';
+    sourceDialogConnectionsEl.hidden = true;
+  }
+
   updateDialogNavigationControls();
+}
+
+function showSourceDialogForDeclaration(declaration, restoreFocusEl = null) {
+  if (!declaration) return false;
+  const node = functionNodeForDeclaration(declaration);
+  if (node) selectFunction(node.id, { reason: 'open-source', restoreFocusEl });
+  const group = sourceDialogGroupForDeclaration(declaration);
+  sourceDialogState = {
+    functionId: node?.id || '',
+    declaration,
+    group,
+    index: group.indexOf(declaration),
+  };
+  sourceDialogRestoreFocusEl = restoreFocusEl || null;
+  renderSourceDialogDeclaration(declaration);
   if (typeof sourceDialogEl.showModal === 'function') {
     if (!sourceDialogEl.open) sourceDialogEl.showModal();
   } else {
     sourceDialogEl.setAttribute('open', '');
   }
-  sourceDialogBodyEl.scrollTop = 0;
+  if (sourceDialogBodyEl) sourceDialogBodyEl.scrollTop = 0;
   sourceDialogCloseBtn.focus();
   sendViewerBridgeState('open-source');
+  return true;
 }
 
 function openSourceDeclarationFromDiagram(declaration, restoreFocusEl) {
-  const node = functionNodeForDeclaration(declaration);
-  if (node) {
-    showSourceDialogForFunctionId(node.id, restoreFocusEl);
-    return true;
-  }
-  renderDeclarationFallbackDialog(declaration, restoreFocusEl);
-  return true;
+  return showSourceDialogForDeclaration(declaration, restoreFocusEl);
 }
 
 function addSourceActivation(element, declaration) {
@@ -3215,6 +3362,7 @@ function addSourceActivation(element, declaration) {
   element.setAttribute('role', 'button');
   element.setAttribute('focusable', 'true');
   element.setAttribute('aria-label', 'Show source for ' + (declaration.name || declaration.declarationName) + ' in ' + declaration.modulePath);
+  appendSourceMemberMetrics(element, declaration);
 
   const title = element.querySelector?.('title') || createSvgElement('title');
   title.textContent = 'Show source for ' + callableLabel(declaration.name || declaration.declarationName);
@@ -4296,6 +4444,7 @@ function showSourceDialogForFunctionId(functionId, restoreFocusEl = null) {
   const group = dialogGroupForNode(node);
   sourceDialogState = {
     functionId,
+    declaration: null,
     group,
     index: group.findIndex((candidate) => candidate.id === functionId),
   };
@@ -4306,7 +4455,7 @@ function showSourceDialogForFunctionId(functionId, restoreFocusEl = null) {
   } else {
     sourceDialogEl.setAttribute('open', '');
   }
-  sourceDialogBodyEl.scrollTop = 0;
+  if (sourceDialogBodyEl) sourceDialogBodyEl.scrollTop = 0;
   sourceDialogCloseBtn.focus();
   sendViewerBridgeState('open-source');
   return true;
@@ -4315,22 +4464,39 @@ function showSourceDialogForFunctionId(functionId, restoreFocusEl = null) {
 function navigateSourceDialog(direction) {
   const nextIndex = sourceDialogState.index + direction;
   if (nextIndex < 0 || nextIndex >= sourceDialogState.group.length) return;
+  if (sourceDialogState.declaration) {
+    const declaration = sourceDialogState.group[nextIndex];
+    const node = functionNodeForDeclaration(declaration);
+    if (node) selectFunction(node.id, { reason: 'navigate-source', scroll: true });
+    sourceDialogState = {
+      functionId: node?.id || '',
+      declaration,
+      group: sourceDialogState.group,
+      index: nextIndex,
+    };
+    renderSourceDialogDeclaration(declaration);
+    if (sourceDialogBodyEl) sourceDialogBodyEl.scrollTop = 0;
+    sendViewerBridgeState('navigate-source');
+    return;
+  }
+
   const node = sourceDialogState.group[nextIndex];
   sourceDialogState = {
     functionId: node.id,
+    declaration: null,
     group: sourceDialogState.group,
     index: nextIndex,
   };
   selectFunction(node.id, { reason: 'navigate-source', scroll: true });
   renderSourceDialogFunction(node.id);
-  sourceDialogBodyEl.scrollTop = 0;
+  if (sourceDialogBodyEl) sourceDialogBodyEl.scrollTop = 0;
   sendViewerBridgeState('navigate-source');
 }
 
 function closeSourceDialog() {
   const restoreFocusEl = sourceDialogRestoreFocusEl;
   sourceDialogRestoreFocusEl = null;
-  sourceDialogState = { functionId: '', group: [], index: -1 };
+  sourceDialogState = { functionId: '', declaration: null, group: [], index: -1 };
   updateDialogNavigationControls();
   if (sourceDialogEl.open && typeof sourceDialogEl.close === 'function') {
     sourceDialogEl.close();
@@ -4351,6 +4517,21 @@ function declarationSnapshotForFunctionId(functionId) {
     name: node.name || node.declarationName || null,
     startLine: node.startLine || null,
     endLine: node.endLine || null,
+  };
+}
+
+function declarationSnapshotForSourceDeclaration(declaration) {
+  if (!declaration) return null;
+  return {
+    functionId: declaration.functionId || null,
+    functionStableId: declaration.functionStableId || null,
+    moduleId: declaration.moduleId || null,
+    modulePath: declaration.modulePath || null,
+    name: declaration.name || declaration.declarationName || null,
+    declarationName: declaration.declarationName || declaration.name || null,
+    sourceOrigin: declaration.sourceOrigin || null,
+    startLine: declaration.startLine || null,
+    endLine: declaration.endLine || null,
   };
 }
 
@@ -4398,7 +4579,9 @@ function currentViewerState(reason) {
     graph: currentGraphPresentationState(),
     selectedFunction: declarationSnapshotForFunctionId(selectedFunctionId),
     selectedFile: fileSnapshotForModulePath(selectedFilePath),
-    openSource: declarationSnapshotForFunctionId(sourceDialogState.functionId),
+    openSource: sourceDialogState.declaration
+      ? declarationSnapshotForSourceDeclaration(sourceDialogState.declaration)
+      : declarationSnapshotForFunctionId(sourceDialogState.functionId),
     highlighted: declarationSnapshotForFunctionId(selectedFunctionId),
     viewport: {
       layout: activeNetworkLayoutMode,
@@ -4897,6 +5080,15 @@ function bindControls() {
   moduleDiagramZoomOutBtn.addEventListener('click', () => setModuleDiagramZoom(moduleDiagramZoom / 1.2));
   moduleDiagramFitBtn.addEventListener('click', fitModuleDiagramToViewport);
   moduleDiagramResetViewBtn.addEventListener('click', resetModuleDiagramView);
+  copyJsxTreeBtn.addEventListener('click', () => {
+    copyRawText(outputPayload?.jsxTreeText || '', 'JSX tree', copyJsxTreeStatusEl);
+  });
+  copyTreeBtn.addEventListener('click', () => {
+    copyRawText(outputPayload?.treeText || '', 'dependency tree', copyTreeStatusEl);
+  });
+  copyMermaidSourceBtn.addEventListener('click', () => {
+    copyRawText(outputPayload?.mermaid || '', 'Mermaid source', copyMermaidSourceStatusEl);
+  });
   sourceDialogPreviousBtn.addEventListener('click', () => navigateSourceDialog(-1));
   sourceDialogNextBtn.addEventListener('click', () => navigateSourceDialog(1));
   sourceDialogCloseBtn.addEventListener('click', closeSourceDialog);
@@ -4978,6 +5170,9 @@ function rawRenderText() {
   jsxTreeEl.textContent = outputPayload?.jsxTreeText || 'No JSX files found.';
   treeEl.textContent = outputPayload?.treeText || '';
   mermaidEl.textContent = outputPayload?.mermaid || '';
+  copyJsxTreeBtn.disabled = false;
+  copyTreeBtn.disabled = false;
+  copyMermaidSourceBtn.disabled = false;
 }
 
 bindNetworkInteraction();

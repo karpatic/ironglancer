@@ -78,7 +78,7 @@ class FakeElement {
   set innerHTML(value) {
     this._innerHTML = String(value);
     this.children = [];
-    if (this.id === 'diagram' && this._innerHTML.includes('<svg')) {
+    if ((this.id === 'diagram' || this.id === 'module-diagram') && this._innerHTML.includes('<svg')) {
       const svg = this.ownerDocument.renderedSvgFactory
         ? this.ownerDocument.renderedSvgFactory(this.ownerDocument)
         : this.ownerDocument.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -218,6 +218,9 @@ class FakeElement {
   }
 
   matchesSelector(selector) {
+    if (selector.includes(',')) {
+      return selector.split(',').some((part) => this.matchesSelector(part.trim()));
+    }
     const attrMatches = Array.from(selector.matchAll(/\[([^\]=]+)(?:=(['"]?)(.*?)\2)?\]/g));
     const selectorWithoutAttrs = selector.replace(/\[[^\]]+\]/g, '');
     const [tagName, ...classNames] = selectorWithoutAttrs.split('.');
@@ -640,7 +643,7 @@ test('generateStaticSite refuses credential-looking source snippets without reje
   }
 });
 
-test.skip('generated viewer opens visible member source snippets from scoped source payload', async () => {
+test('generated viewer opens visible member source snippets from scoped source payload', async () => {
   const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
   const { outDir, appJs, payload, sourcePayload } = await generateTestSite({
     rootDir,
@@ -652,7 +655,8 @@ test.skip('generated viewer opens visible member source snippets from scoped sou
 
   const appSource = await fs.readFile(path.join(rootDir, 'src/app.jsx'), 'utf8');
   const appLines = appSource.split(/\r\n|\r|\n/).slice(12, 28).join('\n');
-  assert.deepEqual(sourcePayload.declarations.map(({ moduleId, modulePath, name, startLine, endLine }) => ({
+  const jsxMapDeclarations = sourcePayload.declarations.filter((item) => item.sourceOrigin !== 'saved-function');
+  assert.deepEqual(jsxMapDeclarations.map(({ moduleId, modulePath, name, startLine, endLine }) => ({
     moduleId,
     modulePath,
     name,
@@ -710,7 +714,12 @@ test.skip('generated viewer opens visible member source snippets from scoped sou
     },
   ]);
   assert.equal(sourcePayload.declarations.find((item) => item.name === 'App').code, appLines);
-  assert.ok(!sourcePayload.declarations.some((item) => item.name === 'useCreatorModule'));
+  const savedFunctionDeclaration = sourcePayload.declarations.find((item) => item.name === 'useCreatorModule');
+  assert.ok(savedFunctionDeclaration, 'expected function graph-only source declaration');
+  assert.equal(savedFunctionDeclaration.sourceOrigin, 'saved-function');
+  assert.equal(savedFunctionDeclaration.modulePath, 'src/app.jsx');
+  assert.equal(savedFunctionDeclaration.startLine, 9);
+  assert.equal(savedFunctionDeclaration.endLine, 11);
 
   assert.equal(sourcePayload.meta.buildId, payload.meta.buildId);
   assert.equal(sourcePayload.meta.sourceCodeHash, payload.meta.sourceCodeHash);
@@ -728,7 +737,7 @@ test.skip('generated viewer opens visible member source snippets from scoped sou
   assert.equal(rendered.member.getAttribute('tabindex'), '0');
   assert.equal(rendered.member.getAttribute('aria-label'), 'Show source for App in src/app.jsx');
 
-  const viewport = document.getElementById('diagram-viewport');
+  const viewport = document.getElementById('module-diagram-viewport');
   viewport.dispatchEvent({
     type: 'pointerdown',
     pointerId: 17,
@@ -765,7 +774,7 @@ test.skip('generated viewer opens visible member source snippets from scoped sou
   assert.equal(dialog.open, false);
 });
 
-test.skip('generated viewer aligns counted Mermaid labels with source navigation metadata', async () => {
+test('generated viewer aligns counted Mermaid labels with source navigation metadata', async () => {
   const rootDir = await writeTempProject({
     'src/app.jsx': [
       "import { AlphaScript as AlphaLocal } from './shared.js';",
@@ -831,7 +840,7 @@ test.skip('generated viewer aligns counted Mermaid labels with source navigation
   assert.equal(document.getElementById('source-dialog-path').textContent, 'src/app.jsx:4-6');
 });
 
-test.skip('generated viewer renders source member metrics as compact badges from source payload metadata', async () => {
+test('generated viewer renders source member metrics as compact badges from source payload metadata', async () => {
   const rootDir = await writeTempProject({
     'src/app.jsx': [
       "import { AlphaScript as AlphaLocal } from './shared.js';",
@@ -866,8 +875,8 @@ test.skip('generated viewer renders source member metrics as compact badges from
   alphaDeclaration.startLine = 1;
   alphaDeclaration.endLine = 3;
 
-  assert.match(html, /\.diagram-canvas \.source-member-metrics/);
-  assert.match(html, /\.diagram-canvas \.source-member-metric/);
+  assert.match(html, /\.module-diagram-canvas \.source-member-metrics/);
+  assert.match(html, /\.module-diagram-canvas \.source-member-metric/);
 
   const { document, rendered } = await runGeneratedViewerWithClass({
     appJs,
@@ -900,7 +909,7 @@ test.skip('generated viewer renders source member metrics as compact badges from
   );
   assert.equal(rendered.member.textContent.includes('99'), false);
 
-  const viewport = document.getElementById('diagram-viewport');
+  const viewport = document.getElementById('module-diagram-viewport');
   viewport.dispatchEvent({
     type: 'pointerdown',
     pointerId: 31,
@@ -916,31 +925,23 @@ test.skip('generated viewer renders source member metrics as compact badges from
   assert.equal(document.getElementById('source-dialog').open, true);
   assert.equal(document.getElementById('source-dialog-title').textContent, 'AlphaLocal');
   assert.equal(document.getElementById('source-dialog-path').textContent, 'src/shared.js:1-3');
+  const dialogInsight = document.getElementById('source-dialog-insight');
+  const incomingMetric = dialogInsight.querySelector('span.connection-metric.is-incoming');
+  assert.ok(incomingMetric, 'expected incoming connection metric');
+  assert.equal(incomingMetric.querySelector('strong').textContent, '2');
+  assert.match(incomingMetric.textContent, /Used by/);
+  const outgoingMetric = dialogInsight.querySelector('span.connection-metric.is-outgoing');
+  assert.ok(outgoingMetric, 'expected outgoing connection metric');
+  assert.equal(outgoingMetric.querySelector('strong').textContent, '0');
+  assert.match(outgoingMetric.textContent, /Uses/);
   const relationships = document.getElementById('source-dialog-relationships');
-  const assessmentBadge = relationships.querySelector('div.placement-assessment-badge');
-  assert.ok(assessmentBadge, 'expected placement assessment badge');
-  assert.equal(assessmentBadge.getAttribute('data-assessment'), alphaDeclaration.placement.assessment.assessment);
-  const callerSignal = relationships.querySelector('div.placement-signal[data-signal="project-local-caller"]');
-  assert.ok(callerSignal, 'expected project-local caller signal');
-  assert.equal(
-    callerSignal.querySelector('strong').textContent,
-    String(alphaDeclaration.placement.evidence.projectLocalCallerCount),
-  );
-  const callersLane = relationships.querySelector('section.placement-lane[data-lane="callers"]');
-  assert.ok(callersLane, 'expected caller relationship lane');
-  assert.equal(
-    callersLane.getAttribute('data-count'),
-    String(
-      alphaDeclaration.placement.evidence.sameFileCallerCount
-        + alphaDeclaration.placement.evidence.projectLocalCallerCount,
-    ),
-  );
-  if (alphaDeclaration.placement.evidence.projectLocalCallerCount > 0) {
-    assert.ok(callersLane.querySelector('button.placement-relationship-tile[data-kind="function"]'));
-  }
+  const incomingGroup = relationships.querySelector('section.relationship-group');
+  assert.ok(incomingGroup, 'expected incoming relationship group');
+  assert.match(incomingGroup.textContent, /Used by/);
+  assert.equal(relationships.querySelectorAll('button.relationship-item').length, 2);
 });
 
-test.skip('generated viewer navigates imported script member source within its rendered sibling group', async () => {
+test('generated viewer navigates imported script member source within its rendered sibling group', async () => {
   const rootDir = await writeTempProject({
     'src/app.jsx': [
       "import { AlphaScript } from './shared.js';",
@@ -1037,7 +1038,7 @@ test.skip('generated viewer navigates imported script member source within its r
   assert.equal(document.getElementById('source-dialog-path').textContent, 'src/shared.js:1-3');
 });
 
-test.skip('generated viewer navigates current-file source without crossing into imported members', async () => {
+test('generated viewer navigates current-file source without crossing into imported members', async () => {
   const rootDir = await writeTempProject({
     'src/app.jsx': [
       "import { AlphaScript } from './shared.js';",
@@ -1126,7 +1127,7 @@ test.skip('generated viewer navigates current-file source without crossing into 
   assert.equal(document.getElementById('source-dialog-path').textContent, 'src/app.jsx:3-5');
 });
 
-test.skip('generated viewer supports source dialog keyboard navigation and restores trigger focus', async () => {
+test('generated viewer supports source dialog keyboard navigation and restores trigger focus', async () => {
   const rootDir = await writeTempProject({
     'src/app.jsx': [
       "import { AlphaScript } from './shared.js';",
@@ -1190,7 +1191,7 @@ test.skip('generated viewer supports source dialog keyboard navigation and resto
   assert.equal(document.activeElement, rendered.members[1]);
 });
 
-test.skip('generated viewer resolves source members from Mermaid class id variants', async () => {
+test('generated viewer resolves source members from Mermaid class id variants', async () => {
   const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
   const { appJs, payload, sourcePayload } = await generateTestSite({
     rootDir,
@@ -1212,7 +1213,7 @@ test.skip('generated viewer resolves source members from Mermaid class id varian
   assert.equal(document.getElementById('source-dialog').open, true);
 });
 
-test.skip('generated viewer adds non-scaling source member hit targets without duplicate semantics', async () => {
+test('generated viewer adds non-scaling source member hit targets without duplicate semantics', async () => {
   const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
   const { appJs, payload, sourcePayload } = await generateTestSite({
     rootDir,
@@ -1243,7 +1244,7 @@ test.skip('generated viewer adds non-scaling source member hit targets without d
   assert.equal(hitTarget.getAttribute('aria-label'), null);
   assert.match(hitTarget.getAttribute('d'), /^M96 153H220$/);
 
-  const viewport = document.getElementById('diagram-viewport');
+  const viewport = document.getElementById('module-diagram-viewport');
   viewport.dispatchEvent({
     type: 'pointerdown',
     pointerId: 23,
@@ -1259,7 +1260,7 @@ test.skip('generated viewer adds non-scaling source member hit targets without d
   assert.equal(document.getElementById('source-dialog').open, true);
 });
 
-test.skip('generated viewer resolves overlapping source hit targets to the visible or nearest source label', async () => {
+test('generated viewer resolves overlapping source hit targets to the visible or nearest source label', async () => {
   const rootDir = await writeTempProject({
     'src/app.jsx': [
       'export function CreatorShell() {',
@@ -1344,7 +1345,7 @@ test.skip('generated viewer resolves overlapping source hit targets to the visib
   assert.equal(document.getElementById('source-dialog-path').textContent, 'src/app.jsx:5-7');
 });
 
-test.skip('generated viewer disables source popups for mismatched or unavailable source payloads', async () => {
+test('generated viewer disables source popups for mismatched or unavailable source payloads', async () => {
   const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
   const { appJs, payload, sourcePayload } = await generateTestSite({
     rootDir,
@@ -1395,7 +1396,7 @@ test.skip('generated viewer disables source popups for mismatched or unavailable
   assert.equal(unavailable.rendered.member.getAttribute('role'), null);
 });
 
-test.skip('generated viewer copy controls copy raw output values and report success', async () => {
+test('generated viewer copy controls copy raw output values and report success', async () => {
   const { html, appJs, payload } = await generateTestSite({ prefix: 'ironglancer-static-copy-' });
 
   assert.match(html, />Copy JSX tree</);
@@ -1426,7 +1427,7 @@ test.skip('generated viewer copy controls copy raw output values and report succ
   assert.equal(document.getElementById('copy-mermaid-source-status').textContent, 'Copied Mermaid source.');
 });
 
-test.skip('generated viewer copy controls fall back and report copy failure', async () => {
+test('generated viewer copy controls fall back and report copy failure', async () => {
   const { appJs, payload } = await generateTestSite({ prefix: 'ironglancer-static-copy-fallback-' });
   const fallbackTexts = [];
   const fallbackHarness = await runGeneratedViewerApp({
@@ -1459,7 +1460,7 @@ test.skip('generated viewer copy controls fall back and report copy failure', as
   assert.match(statusEl.className, /is-error/);
 });
 
-test.skip('generated viewer activates edge hit targets and formats counted inline labels', async () => {
+test('generated viewer activates edge hit targets and formats counted inline labels', async () => {
   const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
   const { appJs, payload: basePayload } = await generateTestSite({
     rootDir,
@@ -1567,7 +1568,7 @@ test.skip('generated viewer activates edge hit targets and formats counted inlin
   assert.equal(hitPath.getAttribute('role'), null);
   assert.equal(hitPath.getAttribute('tabindex'), null);
   assert.equal(
-    document.getElementById('diagram').querySelectorAll('path.edge-hit-target').length,
+    document.getElementById('module-diagram').querySelectorAll('path.edge-hit-target').length,
     2,
   );
 
@@ -1579,7 +1580,7 @@ test.skip('generated viewer activates edge hit targets and formats counted inlin
   assert.match(selectedImport.textContent, /Direct Imports11 static-child\.jsx3 StaticNamed as StaticAlias\(\)3 StaticSame\(\)/);
 });
 
-test.skip('generated viewer keeps edge pointerdown from starting viewport drag', async () => {
+test('generated viewer keeps edge pointerdown from starting viewport drag', async () => {
   const rootDir = path.resolve('tests/fixtures/import-edge-metadata');
   const { appJs, payload: basePayload } = await generateTestSite({
     rootDir,
@@ -1616,7 +1617,7 @@ test.skip('generated viewer keeps edge pointerdown from starting viewport drag',
     },
   });
 
-  const viewport = document.getElementById('diagram-viewport');
+  const viewport = document.getElementById('module-diagram-viewport');
   const hitPath = rendered.group.querySelector('path.edge-hit-target');
   const pointerDown = (target, pointerId) => ({
     type: 'pointerdown',
