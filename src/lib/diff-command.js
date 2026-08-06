@@ -1,5 +1,5 @@
 import fs from 'node:fs/promises';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile as execFileCallback, spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -12,7 +12,7 @@ import {
   renderDiffSarif,
 } from './diff-snapshots.js';
 import { analyzeProject } from './analyze-project.js';
-import { normalizeString } from './utils.js';
+import { compareLocale, normalizeString } from './utils.js';
 
 const execFile = promisify(execFileCallback);
 const SNAPSHOT_SCHEMA_VERSION = '1.2.0';
@@ -49,7 +49,15 @@ async function snapshotPathForInput(input) {
   const resolved = path.resolve(normalizeString(input).trim());
   try {
     const stat = await fs.stat(resolved);
-    if (stat.isDirectory()) return path.join(resolved, 'output.json');
+    if (stat.isDirectory()) {
+      const outputPath = path.join(resolved, 'output.json');
+      try {
+        const outputStat = await fs.stat(outputPath);
+        return outputStat.isFile() ? outputPath : null;
+      } catch {
+        return null;
+      }
+    }
     if (stat.isFile()) return resolved;
   } catch {
     // Git-ref support is added by the CLI loader; missing paths fall through to a clear error here.
@@ -169,7 +177,7 @@ function analysisModulesPayload(analysis = {}) {
         })) : [],
       })) : [],
     }))
-    .sort((a, b) => a.path.localeCompare(b.path));
+    .sort((a, b) => compareLocale(a.path, b.path));
 }
 
 function snapshotFromAnalysis(analysis, { gitCommit, generatedAt }) {
@@ -265,9 +273,84 @@ function assertNoOutputCollision(outPath, sarifPath) {
   }
 }
 
-async function writeTextFile(filePath, text) {
-  await fs.mkdir(path.dirname(path.resolve(filePath)), { recursive: true });
-  await fs.writeFile(filePath, text, 'utf8');
+async function existingReportMode(resolvedPath) {
+  try {
+    const stats = await fs.lstat(resolvedPath);
+    if (!stats.isFile()) {
+      throw new SnapshotDiffError(`Diff output "${resolvedPath}" must be a regular file.`, 'invalid_output');
+    }
+    return stats.mode & 0o7777;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function stageTextFile(filePath, text) {
+  const resolvedPath = path.resolve(filePath);
+  const directory = path.dirname(resolvedPath);
+  const tempPath = path.join(directory, `.${path.basename(resolvedPath)}.${process.pid}.${randomUUID()}.tmp`);
+  await fs.mkdir(directory, { recursive: true });
+  const existingMode = await existingReportMode(resolvedPath);
+  try {
+    await fs.writeFile(tempPath, text, 'utf8');
+    if (existingMode !== null) await fs.chmod(tempPath, existingMode);
+    return { resolvedPath, tempPath };
+  } catch (error) {
+    await fs.rm(tempPath, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+async function restoreStagedReports(staged) {
+  const rollbackErrors = [];
+  for (const report of [...staged].reverse()) {
+    try {
+      if (report.committed) await fs.rm(report.resolvedPath, { force: true });
+      if (report.backupPath) await fs.rename(report.backupPath, report.resolvedPath);
+      await fs.rm(report.tempPath, { force: true });
+    } catch (error) {
+      rollbackErrors.push(error);
+    }
+  }
+  return rollbackErrors;
+}
+
+async function writeTextFiles(reports) {
+  const staged = [];
+  try {
+    for (const report of reports) staged.push(await stageTextFile(report.filePath, report.text));
+  } catch (error) {
+    await Promise.all(staged.map((report) => fs.rm(report.tempPath, { force: true }).catch(() => {})));
+    throw error;
+  }
+
+  try {
+    for (const report of staged) {
+      const currentMode = await existingReportMode(report.resolvedPath);
+      if (currentMode === null) continue;
+      await fs.chmod(report.tempPath, currentMode);
+      report.backupPath = path.join(
+        path.dirname(report.resolvedPath),
+        `.${path.basename(report.resolvedPath)}.${process.pid}.${randomUUID()}.backup`,
+      );
+      await fs.rename(report.resolvedPath, report.backupPath);
+    }
+    for (const report of staged) {
+      await fs.rename(report.tempPath, report.resolvedPath);
+      report.committed = true;
+    }
+  } catch (error) {
+    const rollbackErrors = await restoreStagedReports(staged);
+    if (rollbackErrors.length > 0) {
+      throw new AggregateError([error, ...rollbackErrors], 'Diff report transaction failed and could not be fully restored.');
+    }
+    throw error;
+  }
+
+  await Promise.all(staged.map((report) => (
+    report.backupPath ? fs.rm(report.backupPath, { force: true }) : Promise.resolve()
+  )));
 }
 
 export async function createArchitectureDiff({
@@ -299,24 +382,26 @@ export async function createArchitectureDiff({
 
   let stdoutText = null;
   let outputPath = null;
+  const reports = [];
   if (resolvedFormat === 'json') {
     const json = JSON.stringify(diff, null, 2) + '\n';
     if (effectiveOutPath) {
-      await writeTextFile(effectiveOutPath, json);
+      reports.push({ filePath: effectiveOutPath, text: json });
       outputPath = path.resolve(effectiveOutPath);
     } else {
       stdoutText = json;
     }
   } else {
-    await writeTextFile(effectiveOutPath, renderDiffHtml(diff));
+    reports.push({ filePath: effectiveOutPath, text: renderDiffHtml(diff) });
     outputPath = path.resolve(effectiveOutPath);
   }
 
   let resolvedSarifPath = null;
   if (sarifPath) {
-    await writeTextFile(sarifPath, JSON.stringify(renderDiffSarif(diff), null, 2) + '\n');
+    reports.push({ filePath: sarifPath, text: JSON.stringify(renderDiffSarif(diff), null, 2) + '\n' });
     resolvedSarifPath = path.resolve(sarifPath);
   }
+  if (reports.length > 0) await writeTextFiles(reports);
 
   return {
     diff,

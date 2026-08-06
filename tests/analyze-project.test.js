@@ -339,6 +339,46 @@ async function writeTempProject(files) {
   return rootDir;
 }
 
+test('analyzeProject emits privacy-safe implementation fingerprints for function nodes', async () => {
+  const movedAndRenamedRoot = await writeTempProject({
+    'src/new.js': [
+      'export function renamedApi(value) {',
+      "  return value + ':stable';",
+      '}',
+    ].join('\n'),
+  });
+  const originalRoot = await writeTempProject({
+    'src/old.js': [
+      'export function api(value) {',
+      "  return value + ':stable';",
+      '}',
+    ].join('\r\n'),
+  });
+  const changedImplementationRoot = await writeTempProject({
+    'src/new.js': [
+      'export function renamedApi(value) {',
+      "  return value + ':changed';",
+      '}',
+    ].join('\n'),
+  });
+
+  const original = await analyzeProject({ rootDir: originalRoot, entry: 'src/old.js' });
+  const movedAndRenamed = await analyzeProject({ rootDir: movedAndRenamedRoot, entry: 'src/new.js' });
+  const changedImplementation = await analyzeProject({ rootDir: changedImplementationRoot, entry: 'src/new.js' });
+  const originalNode = original.functionDependencyMap.functions.find((node) => node.name === 'api');
+  const renamedNode = movedAndRenamed.functionDependencyMap.functions.find((node) => node.name === 'renamedApi');
+  const changedNode = changedImplementation.functionDependencyMap.functions.find((node) => node.name === 'renamedApi');
+
+  assert.ok(originalNode);
+  assert.ok(renamedNode);
+  assert.ok(changedNode);
+  assert.match(originalNode.implementationFingerprint, /^impl_[a-f0-9]{16}$/);
+  assert.equal(originalNode.implementationFingerprint, renamedNode.implementationFingerprint);
+  assert.notEqual(originalNode.implementationFingerprint, changedNode.implementationFingerprint);
+  assert.equal(originalNode.implementationFingerprint.includes('api'), false);
+  assert.equal(originalNode.implementationFingerprint.includes('stable'), false);
+});
+
 test('analyzeProject resolves local modules, import-map aliases, and externals', async () => {
   const result = await analyzeProject({ rootDir: fixtureRoot, entry: 'src/app.jsx' });
 

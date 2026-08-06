@@ -555,6 +555,11 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.equal(helperSource.placement.evidence.projectLocalCallerCount, 1);
   const helperFunction = functionMapPayload.functions.find((item) => item.stableId === helperSource.functionStableId);
   assert.ok(helperFunction, 'expected source declaration to reference a saved function-map node');
+  assert.match(helperFunction.implementationFingerprint, /^impl_[a-f0-9]{16}$/);
+  assert.equal(
+    output.functionMap.functions.find((item) => item.stableId === helperFunction.stableId).implementationFingerprint,
+    helperFunction.implementationFingerprint,
+  );
   assert.equal(helperFunction.placement.evidence.projectLocalCallerCount, 1);
   assert.ok(!sourceOutput.declarations.some((item) => item.name === 'theme'));
   assert.ok(!sourceOutput.declarations.some((item) => item.name === 'remoteLib'));

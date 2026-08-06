@@ -33,6 +33,8 @@ Architecture diffs
 - compare saved snapshots:
   `ironglancer diff --base ./before/output.json --head ./after-site --format json`
 - inputs can be git refs resolvable in the project repo, an `output.json` file, or a generated-site directory containing `output.json`
+- precedence is explicit: an existing `output.json` file or directory containing `output.json` wins; otherwise the input is resolved as a Git ref, so a plain directory named `main` does not shadow the `main` branch
+- move and rename matching requires the analyzer's privacy-safe implementation fingerprint; older snapshots without that evidence remain conservative additions and removals
 - `--format json` writes machine-readable JSON to stdout unless `--out` is supplied; `--format html` writes one self-contained static report and defaults to `architecture-diff.html` when `--out` is omitted
 - `--sarif review.sarif` writes SARIF 2.1.0 findings alongside either JSON or HTML output
 - diff reports include schema/build/commit labels, module/function/edge deltas, structural findings, severity counts, static-analysis limitations, and `privacy.sourceMode = "none"`

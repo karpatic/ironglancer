@@ -114,6 +114,194 @@ function normalizeBool(value) {
   return value == null ? null : Boolean(value);
 }
 
+function invalidSnapshot(role, message) {
+  throw new SnapshotDiffError(`${role} snapshot invalid: ${message}`, 'invalid_snapshot');
+}
+
+function displayValue(value) {
+  return typeof value === 'string' ? `"${value}"` : String(value);
+}
+
+function hasOwnValue(object, field) {
+  return Object.prototype.hasOwnProperty.call(object, field) && object[field] != null;
+}
+
+function isValidSnapshotPath(value) {
+  const raw = normalizeString(value).trim();
+  if (!raw || /[\u0000-\u001f\u007f]/.test(raw)) return false;
+  if (raw.includes('\\') || raw.startsWith('/') || /^[A-Za-z]:[\\/]/.test(raw)) return false;
+  const segments = raw.split('/');
+  if (!segments.every((part) => part && part !== '.' && part !== '..')) return false;
+  try {
+    segments.forEach((segment) => encodeURIComponent(segment));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function assertValidPath(role, kind, value) {
+  const raw = normalizeString(value).trim();
+  if (!isValidSnapshotPath(raw)) invalidSnapshot(role, `malformed ${kind} path "${raw}".`);
+}
+
+function assertPositiveIntegerLocation(role, label, field, value) {
+  if (!Number.isInteger(value) || value <= 0) {
+    invalidSnapshot(role, `invalid ${label} ${field} ${displayValue(value)}.`);
+  }
+}
+
+function assertOptionalPositiveIntegerLocation(role, label, field, source = {}) {
+  if (!hasOwnValue(source, field)) return;
+  assertPositiveIntegerLocation(role, label, field, source[field]);
+}
+
+function assertOrderedLocations(role, label, source = {}, startField = 'startLine', endField = 'endLine') {
+  if (
+    hasOwnValue(source, startField)
+    && hasOwnValue(source, endField)
+    && Number.isInteger(source[startField])
+    && Number.isInteger(source[endField])
+    && source[endField] < source[startField]
+  ) {
+    invalidSnapshot(role, `${label} ${endField} must be greater than or equal to ${startField}.`);
+  }
+}
+
+function assertNoDuplicateNonemptyValues(role, values, label) {
+  const seen = new Set();
+  for (const value of values.map((item) => normalizeString(item).trim()).filter(Boolean).sort(compareLocale)) {
+    if (seen.has(value)) invalidSnapshot(role, `duplicate ${label} "${value}".`);
+    seen.add(value);
+  }
+}
+
+function assertNoDuplicateFunctionEdgeIdentities(role, functionEdges) {
+  const seen = new Set();
+  for (const identity of functionEdges.map(normalizedFunctionEdgeIdentity).filter(Boolean).sort(compareLocale)) {
+    if (seen.has(identity)) invalidSnapshot(role, 'duplicate function edge identity.');
+    seen.add(identity);
+  }
+}
+
+function assertKnownModulePath(role, modulePaths, kind, value) {
+  const pathValue = normalizeString(value).trim();
+  assertValidPath(role, kind, pathValue);
+  if (!modulePaths.has(pathValue)) invalidSnapshot(role, `${kind} "${pathValue}" is not declared in modules.`);
+}
+
+function functionLabel(node = {}) {
+  const modulePath = normalizeString(node.modulePath).trim() || 'unknown';
+  const name = normalizeString(node.name).trim() || normalizeString(node.id).trim() || 'unknown';
+  return `${modulePath}:${name}`;
+}
+
+function assertFunctionNodeLocations(role, rawNode = {}, node = {}) {
+  for (const field of ['startLine', 'endLine', 'declarationLine']) {
+    assertOptionalPositiveIntegerLocation(role, 'function', field, rawNode);
+  }
+  assertOrderedLocations(role, `function "${functionLabel(node)}"`, rawNode);
+}
+
+function assertFunctionEdgeLocations(role, rawEdge = {}) {
+  for (const field of ['sourceStartLine', 'sourceEndLine', 'targetStartLine', 'targetEndLine']) {
+    assertOptionalPositiveIntegerLocation(role, 'function edge', field, rawEdge);
+  }
+  assertOrderedLocations(role, 'function edge source', rawEdge, 'sourceStartLine', 'sourceEndLine');
+  assertOrderedLocations(role, 'function edge target', rawEdge, 'targetStartLine', 'targetEndLine');
+  if (hasOwnValue(rawEdge, 'usageLines')) {
+    const usageLines = Array.isArray(rawEdge.usageLines) ? rawEdge.usageLines : [];
+    for (const line of usageLines) {
+      assertPositiveIntegerLocation(role, 'function edge usage', 'line', line);
+    }
+  }
+  if (hasOwnValue(rawEdge, 'usages')) {
+    const usages = Array.isArray(rawEdge.usages) ? rawEdge.usages : [];
+    for (const usage of usages) {
+      if (!hasOwnValue(usage, 'line')) continue;
+      assertPositiveIntegerLocation(role, 'function edge usage', 'line', usage.line);
+    }
+  }
+}
+
+function normalizedEdgeImportIdentity(edge) {
+  const info = edge.import;
+  if (!info) return '';
+  return [
+    info.loadKind,
+    info.bindingKind,
+    info.importedName,
+    info.localName,
+    info.inferred,
+  ].join('\u0000');
+}
+
+function normalizedFunctionEdgeIdentity(edge) {
+  return [
+    edge.sourceId,
+    edge.targetId,
+    edge.scope,
+    normalizedEdgeImportIdentity(edge),
+  ].join('\u0000');
+}
+
+function validateSnapshotIdentity({
+  role,
+  rawSnapshot,
+  modules,
+  functions,
+  functionEdges,
+  importEdges,
+}) {
+  assertNoDuplicateNonemptyValues(role, modules.map((module) => module.path), 'module path');
+  for (const module of modules) {
+    assertValidPath(role, 'module', module.path);
+  }
+
+  const modulePaths = new Set(modules.map((module) => module.path));
+  for (const module of modules) {
+    for (const dependency of module.localDependencies) {
+      assertKnownModulePath(role, modulePaths, 'module dependency', dependency);
+    }
+  }
+
+  assertNoDuplicateNonemptyValues(role, functions.map((node) => node.id), 'function id');
+  assertNoDuplicateNonemptyValues(role, functions.map((node) => node.stableId), 'function stableId');
+  const rawFunctions = Array.isArray(rawSnapshot.functionMap?.functions) ? rawSnapshot.functionMap.functions : [];
+  functions.forEach((node) => {
+    assertKnownModulePath(role, modulePaths, 'function modulePath', node.modulePath);
+    if (node.implementationFingerprint && !/^impl_[a-f0-9]{16}$/.test(node.implementationFingerprint)) {
+      invalidSnapshot(role, `invalid function implementationFingerprint "${node.implementationFingerprint}".`);
+    }
+  });
+  rawFunctions.forEach((rawNode) => assertFunctionNodeLocations(role, rawNode, normalizeFunctionNode(rawNode)));
+
+  const functionById = new Map(functions.map((node) => [node.id, node]));
+  const functionIds = new Set(functionById.keys());
+  assertNoDuplicateNonemptyValues(role, functionEdges.map((edge) => edge.id), 'function edge id');
+  assertNoDuplicateFunctionEdgeIdentities(role, functionEdges);
+  const rawEdges = Array.isArray(rawSnapshot.functionMap?.edges) ? rawSnapshot.functionMap.edges : [];
+  functionEdges.forEach((edge) => {
+    if (!functionIds.has(edge.sourceId)) invalidSnapshot(role, `dangling function edge sourceId "${edge.sourceId}".`);
+    if (!functionIds.has(edge.targetId)) invalidSnapshot(role, `dangling function edge targetId "${edge.targetId}".`);
+    assertKnownModulePath(role, modulePaths, 'function edge sourceModulePath', edge.sourceModulePath);
+    assertKnownModulePath(role, modulePaths, 'function edge targetModulePath', edge.targetModulePath);
+    if (functionById.get(edge.sourceId)?.modulePath !== edge.sourceModulePath) {
+      invalidSnapshot(role, `function edge sourceModulePath "${edge.sourceModulePath}" does not match source function modulePath.`);
+    }
+    if (functionById.get(edge.targetId)?.modulePath !== edge.targetModulePath) {
+      invalidSnapshot(role, `function edge targetModulePath "${edge.targetModulePath}" does not match target function modulePath.`);
+    }
+  });
+  rawEdges.forEach((rawEdge) => assertFunctionEdgeLocations(role, rawEdge));
+
+  assertNoDuplicateNonemptyValues(role, importEdges.map(importEdgeKey), 'import edge identity');
+  for (const edge of importEdges) {
+    assertKnownModulePath(role, modulePaths, 'import edge sourcePath', edge.sourcePath);
+    assertKnownModulePath(role, modulePaths, 'import edge targetPath', edge.targetPath);
+  }
+}
+
 function normalizeModule(module = {}) {
   return {
     path: normalizeString(module.path).trim(),
@@ -152,6 +340,7 @@ function normalizeFunctionNode(node = {}) {
     name: normalizeString(node.name).trim(),
     declarationName: normalizeString(node.declarationName || node.name).trim(),
     kind: normalizeString(node.kind || 'function').trim() || 'function',
+    implementationFingerprint: normalizeString(node.implementationFingerprint).trim() || null,
     component: Boolean(node.component),
     reachable: normalizeBool(node.reachable),
     exported: normalizeBool(node.exported),
@@ -252,6 +441,15 @@ function normalizeSnapshot(rawSnapshot, role) {
   if (importEdges.some((edge) => !edge.sourcePath || !edge.targetPath)) {
     throw new SnapshotDiffError(`${role} snapshot contains an import edge without sourcePath or targetPath.`, 'malformed_snapshot');
   }
+
+  validateSnapshotIdentity({
+    role,
+    rawSnapshot,
+    modules,
+    functions,
+    functionEdges,
+    importEdges,
+  });
 
   return {
     entry: normalizeString(rawSnapshot.entry || meta.entry).trim() || null,
@@ -408,6 +606,11 @@ function functionSummary(node) {
   };
 }
 
+function hasMatchingImplementationFingerprint(baseNode, headNode) {
+  return Boolean(baseNode.implementationFingerprint)
+    && baseNode.implementationFingerprint === headNode.implementationFingerprint;
+}
+
 function compareFunctionPairs(base, head) {
   const baseByStableId = new Map(base.functions.map((node) => [node.stableId, node]));
   const headByStableId = new Map(head.functions.map((node) => [node.stableId, node]));
@@ -473,7 +676,8 @@ function compareFunctionPairs(base, head) {
       node.exportKinds.join(','),
     ].join('\u0000'),
     predicate: (baseNode, headNode) => baseNode.modulePath !== headNode.modulePath
-      && baseNode.name === headNode.name,
+      && baseNode.name === headNode.name
+      && hasMatchingImplementationFingerprint(baseNode, headNode),
   });
 
   pairUnique({
@@ -491,7 +695,8 @@ function compareFunctionPairs(base, head) {
       node.exportKinds.join(','),
     ].join('\u0000'),
     predicate: (baseNode, headNode) => baseNode.modulePath === headNode.modulePath
-      && baseNode.name !== headNode.name,
+      && baseNode.name !== headNode.name
+      && hasMatchingImplementationFingerprint(baseNode, headNode),
   });
 
   return {
@@ -834,22 +1039,15 @@ function stronglyConnectedComponents(nodes, outgoingForNode) {
   const components = [];
   let index = 0;
 
-  const visit = (node) => {
+  const beginNode = (node) => {
     indexByNode.set(node, index);
     lowLinkByNode.set(node, index);
     index += 1;
     stack.push(node);
     onStack.add(node);
+  };
 
-    for (const next of [...outgoingForNode(node)].sort(compareLocale)) {
-      if (!indexByNode.has(next)) {
-        visit(next);
-        lowLinkByNode.set(node, Math.min(lowLinkByNode.get(node), lowLinkByNode.get(next)));
-      } else if (onStack.has(next)) {
-        lowLinkByNode.set(node, Math.min(lowLinkByNode.get(node), indexByNode.get(next)));
-      }
-    }
-
+  const finishNode = (node) => {
     if (lowLinkByNode.get(node) !== indexByNode.get(node)) return;
     const component = [];
     let current = null;
@@ -859,6 +1057,40 @@ function stronglyConnectedComponents(nodes, outgoingForNode) {
       component.push(current);
     } while (current !== node);
     components.push(component.sort(compareLocale));
+  };
+
+  const visit = (startNode) => {
+    const frames = [{
+      node: startNode,
+      neighbors: null,
+      nextIndex: 0,
+    }];
+
+    while (frames.length > 0) {
+      const frame = frames[frames.length - 1];
+      if (!frame.neighbors) {
+        beginNode(frame.node);
+        frame.neighbors = [...outgoingForNode(frame.node)].sort(compareLocale);
+      }
+
+      if (frame.nextIndex < frame.neighbors.length) {
+        const next = frame.neighbors[frame.nextIndex];
+        frame.nextIndex += 1;
+        if (!indexByNode.has(next)) {
+          frames.push({ node: next, neighbors: null, nextIndex: 0 });
+        } else if (onStack.has(next)) {
+          lowLinkByNode.set(frame.node, Math.min(lowLinkByNode.get(frame.node), indexByNode.get(next)));
+        }
+        continue;
+      }
+
+      finishNode(frame.node);
+      frames.pop();
+      if (frames.length > 0) {
+        const parent = frames[frames.length - 1].node;
+        lowLinkByNode.set(parent, Math.min(lowLinkByNode.get(parent), lowLinkByNode.get(frame.node)));
+      }
+    }
   };
 
   for (const node of orderedNodes) {
@@ -1329,12 +1561,18 @@ export function renderDiffHtml(diff = {}) {
 }
 
 function safeArtifactUri(value) {
-  return normalizeString(value)
+  const portablePath = normalizeString(value)
     .replace(/\\/g, '/')
     .replace(/^[A-Za-z]:\//, '')
     .replace(/^\/+/, '')
     .replace(/(?:^|\/)\.\.(?=\/|$)/g, '')
     .trim();
+  if (!portablePath || /[\u0000-\u001f\u007f]/.test(portablePath)) return '';
+  try {
+    return portablePath.split('/').map((segment) => encodeURIComponent(segment)).join('/');
+  } catch {
+    return '';
+  }
 }
 
 function sarifRegion(location = {}) {

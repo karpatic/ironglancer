@@ -65,6 +65,7 @@ function fn(stableId, modulePath, name, options = {}) {
     name,
     declarationName: options.declarationName || name,
     kind: options.kind || 'function',
+    ...(options.implementationFingerprint ? { implementationFingerprint: options.implementationFingerprint } : {}),
     component: options.component ?? /^[A-Z]/.test(name),
     reachable: options.reachable ?? true,
     exported: options.exported ?? false,
@@ -258,15 +259,35 @@ test('compareSnapshots pairs unique function moves and renames with confidence',
   const base = snapshot({
     modules: [module('src/app.jsx'), module('src/helpers.js')],
     functions: [
-      fn('fn_move_base', 'src/app.jsx', 'movedHelper', { lineCount: 3, startLine: 10, endLine: 12 }),
-      fn('fn_rename_base', 'src/helpers.js', 'oldName', { lineCount: 2, startLine: 4, endLine: 5 }),
+      fn('fn_move_base', 'src/app.jsx', 'movedHelper', {
+        implementationFingerprint: 'impl_1111111111111111',
+        lineCount: 3,
+        startLine: 10,
+        endLine: 12,
+      }),
+      fn('fn_rename_base', 'src/helpers.js', 'oldName', {
+        implementationFingerprint: 'impl_2222222222222222',
+        lineCount: 2,
+        startLine: 4,
+        endLine: 5,
+      }),
     ],
   });
   const head = snapshot({
     modules: [module('src/app.jsx'), module('src/helpers.js'), module('src/moved.js')],
     functions: [
-      fn('fn_move_head', 'src/moved.js', 'movedHelper', { lineCount: 3, startLine: 1, endLine: 3 }),
-      fn('fn_rename_head', 'src/helpers.js', 'newName', { lineCount: 2, startLine: 4, endLine: 5 }),
+      fn('fn_move_head', 'src/moved.js', 'movedHelper', {
+        implementationFingerprint: 'impl_1111111111111111',
+        lineCount: 3,
+        startLine: 1,
+        endLine: 3,
+      }),
+      fn('fn_rename_head', 'src/helpers.js', 'newName', {
+        implementationFingerprint: 'impl_2222222222222222',
+        lineCount: 2,
+        startLine: 4,
+        endLine: 5,
+      }),
     ],
   });
 
@@ -332,9 +353,19 @@ test('compareSnapshots leaves ambiguous move and rename candidates unpaired', ()
 
 test('compareSnapshots preserves function edge identity across unique moves and reports relation changes', () => {
   const baseCaller = fn('fn_caller', 'src/app.js', 'caller', { startLine: 1, endLine: 3, lineCount: 3 });
-  const baseCallee = fn('fn_callee_base', 'src/helpers.js', 'callee', { startLine: 1, endLine: 2, lineCount: 2 });
+  const baseCallee = fn('fn_callee_base', 'src/helpers.js', 'callee', {
+    implementationFingerprint: 'impl_3333333333333333',
+    startLine: 1,
+    endLine: 2,
+    lineCount: 2,
+  });
   const headCaller = fn('fn_caller', 'src/app.js', 'caller', { startLine: 1, endLine: 3, lineCount: 3 });
-  const headCallee = fn('fn_callee_head', 'src/moved/helpers.js', 'callee', { startLine: 1, endLine: 2, lineCount: 2 });
+  const headCallee = fn('fn_callee_head', 'src/moved/helpers.js', 'callee', {
+    implementationFingerprint: 'impl_3333333333333333',
+    startLine: 1,
+    endLine: 2,
+    lineCount: 2,
+  });
   const base = snapshot({
     modules: [module('src/app.js'), module('src/helpers.js')],
     functions: [baseCaller, baseCallee],
@@ -355,6 +386,50 @@ test('compareSnapshots preserves function edge identity across unique moves and 
   assert.equal(diff.edges.changed[0].head.target.stableId, 'fn_callee_head');
   assert.deepEqual(diff.edges.changed[0].changedFields, ['relationKind', 'syntaxKinds', 'referenceCount']);
   assert.equal(diff.summary.edges.changed, 1);
+});
+
+test('compareSnapshots requires matching implementation fingerprints for move or rename pairing', () => {
+  for (const headFingerprint of [undefined, 'impl_5555555555555555']) {
+    const baseApi = fn('fn_api_base', 'src/old.js', 'api', {
+      implementationFingerprint: 'impl_4444444444444444',
+      exported: true,
+      exportedNames: ['api'],
+      exportKinds: ['named-export'],
+      lineCount: 3,
+      startLine: 1,
+      endLine: 3,
+    });
+    const headApi = fn('fn_api_head', 'src/new.js', 'api', {
+      implementationFingerprint: headFingerprint,
+      exported: true,
+      exportedNames: ['api'],
+      exportKinds: ['named-export'],
+      lineCount: 3,
+      startLine: 1,
+      endLine: 3,
+    });
+    const diff = compareSnapshots(
+      snapshot({
+        label: `base-${headFingerprint || 'missing'}`,
+        modules: [module('src/old.js')],
+        functions: [baseApi],
+      }),
+      snapshot({
+        label: `head-${headFingerprint || 'missing'}`,
+        modules: [module('src/new.js')],
+        functions: [headApi],
+      }),
+    );
+
+    assert.deepEqual(diff.functions.moves, []);
+    assert.deepEqual(diff.functions.renames, []);
+    assert.deepEqual(diff.functions.removed.map((item) => `${item.modulePath}:${item.name}`), ['src/old.js:api']);
+    assert.deepEqual(diff.functions.added.map((item) => `${item.modulePath}:${item.name}`), ['src/new.js:api']);
+    assert.ok(diff.findings.some((finding) => (
+      finding.ruleId === 'IRONG_DIFF_EXPORT_REMOVED'
+      && finding.location.path === 'src/old.js'
+    )));
+  }
 });
 
 test('compareSnapshots flags exported function removal and export surface narrowing', () => {
@@ -450,6 +525,21 @@ test('compareSnapshots flags newly introduced module and function dependency cyc
     ['src/a.js:a', 'src/b.js:b'],
   ]);
   assert.ok(cycleFindings.every((finding) => finding.severity === 'warning'));
+});
+
+test('compareSnapshots handles a 12000 module acyclic chain without recursive stack overflow', { timeout: 20000 }, () => {
+  const modules = Array.from({ length: 12000 }, (_, index) => {
+    const current = `src/m${String(index).padStart(5, '0')}.js`;
+    const next = index + 1 < 12000 ? [`src/m${String(index + 1).padStart(5, '0')}.js`] : [];
+    return module(current, { localDependencies: next });
+  });
+
+  const diff = compareSnapshots(
+    snapshot({ label: 'base-chain', modules }),
+    snapshot({ label: 'head-chain', modules: structuredClone(modules) }),
+  );
+
+  assert.deepEqual(diff.findings.filter((finding) => finding.ruleId === 'IRONG_DIFF_MODULE_CYCLE_ADDED'), []);
 });
 
 test('compareSnapshots flags newly added cross-file function edges as static evidence notes', () => {
@@ -580,6 +670,181 @@ test('compareSnapshots rejects malformed or incompatible snapshots', () => {
   );
 });
 
+test('compareSnapshots rejects invalid snapshot identities and SARIF-unsafe locations fail-closed', () => {
+  const valid = () => {
+    const source = fn('fn_source', 'src/app.js', 'source');
+    const target = fn('fn_target', 'src/app.js', 'target');
+    return snapshot({
+      modules: [module('src/app.js'), module('src/dep.js')],
+      functions: [source, target],
+      edges: [edge(source, target, { id: 'edge_valid' })],
+      importEdges: [{
+        sourcePath: 'src/app.js',
+        targetPath: 'src/dep.js',
+        loadKinds: ['static'],
+        imports: [],
+      }],
+    });
+  };
+  const invalidCases = [
+    {
+      name: 'duplicate module path',
+      mutate: (candidate) => candidate.modules.push(module('src/app.js')),
+      pattern: /duplicate module path "src\/app\.js"/,
+    },
+    {
+      name: 'duplicate function id',
+      mutate: (candidate) => candidate.functionMap.functions.push(fn('fn_other_stable', 'src/dep.js', 'other', {
+        id: candidate.functionMap.functions[0].id,
+      })),
+      pattern: /duplicate function id/,
+    },
+    {
+      name: 'duplicate function stableId',
+      mutate: (candidate) => candidate.functionMap.functions.push(fn(candidate.functionMap.functions[0].stableId, 'src/dep.js', 'other', {
+        id: 'other-id',
+      })),
+      pattern: /duplicate function stableId/,
+    },
+    {
+      name: 'duplicate function-edge id',
+      mutate: (candidate) => candidate.functionMap.edges.push({
+        ...structuredClone(candidate.functionMap.edges[0]),
+        id: 'edge_valid',
+        scope: 'imported',
+      }),
+      pattern: /duplicate function edge id/,
+    },
+    {
+      name: 'duplicate function-edge identity',
+      mutate: (candidate) => candidate.functionMap.edges.push({
+        ...structuredClone(candidate.functionMap.edges[0]),
+        id: 'edge_duplicate_identity',
+      }),
+      pattern: /duplicate function edge identity/,
+    },
+    {
+      name: 'dangling sourceId',
+      mutate: (candidate) => {
+        candidate.functionMap.edges[0].sourceId = 'missing-source';
+      },
+      pattern: /dangling function edge sourceId "missing-source"/,
+    },
+    {
+      name: 'dangling targetId',
+      mutate: (candidate) => {
+        candidate.functionMap.edges[0].targetId = 'missing-target';
+      },
+      pattern: /dangling function edge targetId "missing-target"/,
+    },
+    {
+      name: 'function edge source module does not match source function',
+      mutate: (candidate) => {
+        candidate.functionMap.edges[0].sourceModulePath = 'src/dep.js';
+      },
+      pattern: /function edge sourceModulePath .* does not match source function modulePath/,
+    },
+    {
+      name: 'duplicate import-edge identity',
+      mutate: (candidate) => {
+        candidate.importEdges.push(structuredClone(candidate.importEdges[0]));
+      },
+      pattern: /duplicate import edge identity/,
+    },
+    {
+      name: 'malformed implementation fingerprint',
+      mutate: (candidate) => {
+        candidate.functionMap.functions[0].implementationFingerprint = 'same-shape-is-not-evidence';
+      },
+      pattern: /invalid function implementationFingerprint/,
+    },
+    {
+      name: 'module dependency path refers to missing module',
+      mutate: (candidate) => {
+        candidate.modules[0].localDependencies = ['src/missing.js'];
+      },
+      pattern: /module dependency "src\/missing\.js" is not declared/,
+    },
+    {
+      name: 'function modulePath refers to missing module',
+      mutate: (candidate) => {
+        candidate.functionMap.functions[0].modulePath = 'src/missing.js';
+      },
+      pattern: /function modulePath "src\/missing\.js" is not declared/,
+    },
+    {
+      name: 'malformed path',
+      mutate: (candidate) => {
+        candidate.modules[0].path = '../escape.js';
+      },
+      pattern: /malformed module path "\.\.\/escape\.js"/,
+    },
+    {
+      name: 'control character in path',
+      mutate: (candidate) => {
+        candidate.modules[0].path = 'src/control\u0000.js';
+      },
+      pattern: /malformed module path/,
+    },
+    {
+      name: 'line zero',
+      mutate: (candidate) => {
+        candidate.functionMap.functions[0].startLine = 0;
+      },
+      pattern: /invalid function startLine 0/,
+    },
+    {
+      name: 'noninteger line',
+      mutate: (candidate) => {
+        candidate.functionMap.functions[0].endLine = 1.5;
+      },
+      pattern: /invalid function endLine 1\.5/,
+    },
+    {
+      name: 'usage line zero',
+      mutate: (candidate) => {
+        candidate.functionMap.edges[0].usageLines = [0];
+        candidate.functionMap.edges[0].usages = [{ line: 0, syntax: 'call' }];
+      },
+      pattern: /invalid function edge usage line 0/,
+    },
+  ];
+
+  for (const { name, mutate, pattern } of invalidCases) {
+    const candidate = valid();
+    mutate(candidate);
+    assert.throws(
+      () => compareSnapshots(candidate, valid()),
+      (error) => error instanceof SnapshotDiffError
+        && error.code === 'invalid_snapshot'
+        && pattern.test(error.message),
+      name,
+    );
+  }
+});
+
+test('compareSnapshots accepts valid snapshots with omitted optional function locations', () => {
+  const noLocation = fn('fn_no_location', 'src/app.js', 'noLocation');
+  delete noLocation.startLine;
+  delete noLocation.endLine;
+  delete noLocation.lineCount;
+  delete noLocation.declarationLine;
+  delete noLocation.declarationColumn;
+
+  const diff = compareSnapshots(
+    snapshot({
+      modules: [module('src/app.js')],
+      functions: [noLocation],
+    }),
+    snapshot({
+      modules: [module('src/app.js')],
+      functions: [structuredClone(noLocation)],
+    }),
+  );
+
+  assert.deepEqual(diff.findings, []);
+});
+
 test('renderDiffHtml escapes snapshot content and omits private roots and source text', () => {
   const base = snapshot({
     label: 'base',
@@ -644,6 +909,27 @@ test('renderDiffSarif emits valid SARIF 2.1.0 structure with relative locations 
   assert.deepEqual(result.locations[0].physicalLocation.region, { startLine: 7, endLine: 9 });
   assert.equal(JSON.stringify(sarif).includes('/tmp/private'), false);
   assert.equal(JSON.stringify(sarif).includes('snippet'), false);
+});
+
+test('renderDiffSarif percent-encodes reserved filename characters in artifact URIs', () => {
+  const specialPath = 'src/a#fragment?query%value.js';
+  const base = snapshot({
+    modules: [module(specialPath)],
+    functions: [fn('fn_special', specialPath, 'specialApi', {
+      exported: true,
+      exportedNames: ['specialApi'],
+      startLine: 1,
+      endLine: 1,
+    })],
+  });
+  const diff = compareSnapshots(base, snapshot({ modules: [], functions: [] }));
+  const sarif = renderDiffSarif(diff);
+  const result = sarif.runs[0].results.find((candidate) => candidate.ruleId === 'IRONG_DIFF_EXPORT_REMOVED');
+
+  assert.equal(
+    result.locations[0].physicalLocation.artifactLocation.uri,
+    'src/a%23fragment%3Fquery%25value.js',
+  );
 });
 
 test('package public API exports architecture diff helpers', async () => {

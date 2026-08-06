@@ -2789,6 +2789,26 @@ function functionIdForSpan(record, span, identityKey = legacyFunctionSpanKey(rec
   return encodedStaticId(`function\u0000${identityKey}`);
 }
 
+function normalizedImplementationSourceForSpan(record, span) {
+  const source = normalizeString(record?.source);
+  const endIndex = declarationSpanExclusiveEnd(span);
+  if (!Number.isInteger(span?.startIndex) || !Number.isInteger(endIndex) || endIndex <= span.startIndex) {
+    return '';
+  }
+  const declarationSource = source.slice(span.startIndex, endIndex);
+  const nameStart = Number.isInteger(span.nameStartIndex) ? span.nameStartIndex - span.startIndex : -1;
+  const nameEnd = Number.isInteger(span.nameEndIndex) ? span.nameEndIndex - span.startIndex : -1;
+  const nameMasked = nameStart >= 0 && nameEnd > nameStart && nameEnd <= declarationSource.length
+    ? `${declarationSource.slice(0, nameStart)}__IRONG_DECLARATION_NAME__${declarationSource.slice(nameEnd)}`
+    : declarationSource;
+  return nameMasked.replace(/\r\n?/g, '\n');
+}
+
+function implementationFingerprintForSpan(record, span) {
+  const implementationSource = normalizedImplementationSourceForSpan(record, span);
+  return compactStableId('impl', [implementationSource]);
+}
+
 function functionDependencyEdgeId({ sourceNode, targetNode, scope, importInfo }) {
   return encodedStaticId([
     'function-edge',
@@ -2846,6 +2866,7 @@ function functionNodeForSpan(record, span, { nested = false, scopePath = '', ide
     exportKinds: publicApi.exportKinds,
     declarationType,
     standalone: !nested && declarationType !== 'function-expression-name',
+    implementationFingerprint: implementationFingerprintForSpan(record, span),
     scopePath,
     declarationLine: lineNumberAtSourceIndex(record.source, span.nameStartIndex),
     declarationColumn: sourceColumnAtIndex(record.source, span.nameStartIndex),

@@ -90,6 +90,7 @@ test('cli documents localhost serve mode flags', async () => {
   assert.match(stdout.text(), /--port 4173/);
   assert.match(stdout.text(), /ironglancer diff/);
   assert.match(stdout.text(), /--base <input>/);
+  assert.match(stdout.text(), /output\.json file or directory containing output\.json wins; otherwise inputs resolve as Git refs/i);
 });
 
 test('cli diff compares saved snapshot file and directory inputs as JSON stdout', async () => {
@@ -177,6 +178,59 @@ test('cli diff compares git refs without mutating branch, HEAD, or worktree', as
   assert.deepEqual(output.modules.added.map((item) => item.path), ['src/feature.js']);
   assert.equal(output.base.gitCommit, baseCommit);
   assert.equal(output.head.gitCommit, headBefore);
+  assert.equal(await git(projectDir, ['rev-parse', '--abbrev-ref', 'HEAD']), branchBefore);
+  assert.equal(await git(projectDir, ['rev-parse', 'HEAD']), headBefore);
+  assert.equal(await git(projectDir, ['status', '--short']), statusBefore);
+});
+
+test('cli diff resolves a same-named directory without output.json as a git ref', async () => {
+  const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-ref-directory-precedence-'));
+  await git(projectDir, ['init', '-b', 'main']);
+  await git(projectDir, ['config', 'user.email', 'tests@example.test']);
+  await git(projectDir, ['config', 'user.name', 'IronGlancer Tests']);
+  await writeText(path.join(projectDir, 'src/app.js'), [
+    'export function App() {',
+    "  return 'base';",
+    '}',
+  ].join('\n'));
+  await writeText(path.join(projectDir, 'main', 'README.md'), 'same-named directory without snapshot output\n');
+  await git(projectDir, ['add', '.']);
+  await git(projectDir, ['commit', '-m', 'base']);
+  await git(projectDir, ['checkout', '-b', 'feature']);
+  await writeText(path.join(projectDir, 'src/app.js'), [
+    "import { feature } from './feature.js';",
+    'export function App() {',
+    '  return feature();',
+    '}',
+  ].join('\n'));
+  await writeText(path.join(projectDir, 'src/feature.js'), [
+    'export function feature() {',
+    "  return 'head';",
+    '}',
+  ].join('\n'));
+  await git(projectDir, ['add', '.']);
+  await git(projectDir, ['commit', '-m', 'head']);
+  const branchBefore = await git(projectDir, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  const headBefore = await git(projectDir, ['rev-parse', 'HEAD']);
+  const statusBefore = await git(projectDir, ['status', '--short']);
+
+  const { stdout } = await execFile('node', [
+    path.resolve('src/cli.mjs'),
+    'diff',
+    '--base',
+    'main',
+    '--head',
+    'HEAD',
+    '--entry',
+    'src/app.js',
+    '--format',
+    'json',
+  ], { cwd: projectDir });
+  const output = JSON.parse(stdout);
+
+  assert.deepEqual(output.modules.added.map((item) => item.path), ['src/feature.js']);
+  assert.equal(output.base.label, 'main');
+  assert.equal(output.head.label, 'HEAD');
   assert.equal(await git(projectDir, ['rev-parse', '--abbrev-ref', 'HEAD']), branchBefore);
   assert.equal(await git(projectDir, ['rev-parse', 'HEAD']), headBefore);
   assert.equal(await git(projectDir, ['status', '--short']), statusBefore);
@@ -271,6 +325,87 @@ test('cli diff writes HTML and SARIF files for saved snapshots', async () => {
   assert.equal(sarif.runs[0].results[0].ruleId, 'IRONG_DIFF_EXPORT_REMOVED');
 });
 
+test('cli diff replaces report files atomically without sibling temporary residue', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-atomic-files-'));
+  const basePath = path.join(tempDir, 'base.json');
+  const headPath = path.join(tempDir, 'head.json');
+  const htmlPath = path.join(tempDir, 'architecture-diff.html');
+  const sarifPath = path.join(tempDir, 'review.sarif');
+  await writeJson(basePath, diffSnapshot({ label: 'base', modules: [] }));
+  await writeJson(headPath, diffSnapshot({
+    label: 'head',
+    modules: [{ path: 'src/app.js', lineCount: 1, reachable: true, isJsx: false, localDependencies: [], externalDependencies: [] }],
+  }));
+  await writeText(htmlPath, 'old html report\n');
+  await writeText(sarifPath, 'old sarif report\n');
+  const htmlBefore = await fs.stat(htmlPath);
+  const sarifBefore = await fs.stat(sarifPath);
+
+  const exitCode = await runCli([
+    'diff',
+    '--base',
+    basePath,
+    '--head',
+    headPath,
+    '--format',
+    'html',
+    '--out',
+    htmlPath,
+    '--sarif',
+    sarifPath,
+  ], { stdout: memoryStream() });
+
+  assert.equal(exitCode, 0);
+  assert.notEqual((await fs.stat(htmlPath)).ino, htmlBefore.ino);
+  assert.notEqual((await fs.stat(sarifPath)).ino, sarifBefore.ino);
+  assert.match(await fs.readFile(htmlPath, 'utf8'), /IronGlancer Architecture Diff/);
+  assert.equal(JSON.parse(await fs.readFile(sarifPath, 'utf8')).version, '2.1.0');
+  assert.equal((await fs.readdir(tempDir)).some((name) => name.includes('.tmp')), false);
+});
+
+test('cli diff preserves private permissions when atomically replacing reports', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-private-reports-'));
+  const basePath = path.join(tempDir, 'base.json');
+  const headPath = path.join(tempDir, 'head.json');
+  const htmlPath = path.join(tempDir, 'architecture-diff.html');
+  const sarifPath = path.join(tempDir, 'review.sarif');
+  await writeJson(basePath, diffSnapshot({ label: 'base', modules: [] }));
+  await writeJson(headPath, diffSnapshot({ label: 'head', modules: [] }));
+  await writeText(htmlPath, 'private html\n');
+  await writeText(sarifPath, 'private sarif\n');
+  await fs.chmod(htmlPath, 0o600);
+  await fs.chmod(sarifPath, 0o600);
+
+  await runCli([
+    'diff', '--base', basePath, '--head', headPath,
+    '--format', 'html', '--out', htmlPath, '--sarif', sarifPath,
+  ], { stdout: memoryStream() });
+
+  assert.equal((await fs.stat(htmlPath)).mode & 0o777, 0o600);
+  assert.equal((await fs.stat(sarifPath)).mode & 0o777, 0o600);
+});
+
+test('cli diff leaves every prior report intact when any output cannot be staged', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-report-transaction-'));
+  const basePath = path.join(tempDir, 'base.json');
+  const headPath = path.join(tempDir, 'head.json');
+  const htmlPath = path.join(tempDir, 'architecture-diff.html');
+  const blockedParent = path.join(tempDir, 'not-a-directory');
+  await writeJson(basePath, diffSnapshot({ label: 'base', modules: [] }));
+  await writeJson(headPath, diffSnapshot({ label: 'head', modules: [] }));
+  await writeText(htmlPath, 'ORIGINAL PRIMARY\n');
+  await writeText(blockedParent, 'regular file\n');
+
+  await assert.rejects(runCli([
+    'diff', '--base', basePath, '--head', headPath,
+    '--format', 'html', '--out', htmlPath,
+    '--sarif', path.join(blockedParent, 'review.sarif'),
+  ], { stdout: memoryStream() }));
+
+  assert.equal(await fs.readFile(htmlPath, 'utf8'), 'ORIGINAL PRIMARY\n');
+  assert.equal((await fs.readdir(tempDir)).some((name) => name.includes('.tmp') || name.includes('.backup')), false);
+});
+
 test('cli diff uses architecture-diff.html when HTML output is omitted', async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-default-html-'));
   const basePath = path.join(tempDir, 'base.json');
@@ -340,6 +475,8 @@ test('cli diff rejects unsupported formats and output path collisions', async ()
     runCli(['diff', '--base', basePath, '--head', headPath, '--format', 'xml'], { stdout: memoryStream() }),
     /Unsupported diff format/,
   );
+  const samePath = path.join(tempDir, 'same.out');
+  await writeText(samePath, 'pre-existing report\n');
   await assert.rejects(
     runCli([
       'diff',
@@ -350,12 +487,13 @@ test('cli diff rejects unsupported formats and output path collisions', async ()
       '--format',
       'html',
       '--out',
-      path.join(tempDir, 'same.out'),
+      samePath,
       '--sarif',
-      path.join(tempDir, 'same.out'),
+      samePath,
     ], { stdout: memoryStream() }),
     /must not point to the same path/,
   );
+  assert.equal(await fs.readFile(samePath, 'utf8'), 'pre-existing report\n');
 });
 
 test('cli diff reports missing entry at a git ref without leaving temp residue', async () => {

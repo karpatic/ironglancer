@@ -6,6 +6,7 @@ import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
 
 import { analyzeProject } from './analyze-project.js';
+import { compareLocale } from './utils.js';
 import { viewerHtml } from '../viewer/html.js';
 
 const require = createRequire(import.meta.url);
@@ -231,7 +232,7 @@ function analysisModulesPayload(analysis = {}) {
       externalDependencies: Array.isArray(record.externalDeps) ? record.externalDeps : [],
       importRefs: Array.isArray(record.importRefs) ? record.importRefs.map(sanitizedImportRef) : [],
     }))
-    .sort((a, b) => a.path.localeCompare(b.path));
+    .sort((a, b) => compareLocale(a.path, b.path));
 }
 
 export async function generateStaticSite({ rootDir, entry, outDir, routeAliases } = {}) {
