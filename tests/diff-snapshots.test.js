@@ -606,6 +606,80 @@ test('compareSnapshots flags material fan-out increases using the documented con
   assert.equal(diff.summary.findingsBySeverity.warning, 1);
 });
 
+test('compareSnapshots finding IDs use semantic identities instead of mutable location or count evidence', () => {
+  const removedAtLineOne = fn('fn_removed_public', 'src/api.js', 'removedPublic', {
+    exported: true,
+    exportedNames: ['removedPublic'],
+    exportKinds: ['named'],
+    startLine: 1,
+    endLine: 3,
+  });
+  const removedAfterBlankLines = fn('fn_removed_public', 'src/api.js', 'removedPublic', {
+    exported: true,
+    exportedNames: ['removedPublic'],
+    exportKinds: ['named'],
+    startLine: 10,
+    endLine: 12,
+  });
+  const head = snapshot({ modules: [module('src/api.js')], functions: [] });
+  const firstRemoval = compareSnapshots(
+    snapshot({ modules: [module('src/api.js')], functions: [removedAtLineOne] }),
+    head,
+  ).findings.find((finding) => finding.ruleId === 'IRONG_DIFF_EXPORT_REMOVED');
+  const secondRemoval = compareSnapshots(
+    snapshot({ modules: [module('src/api.js')], functions: [removedAfterBlankLines] }),
+    head,
+  ).findings.find((finding) => finding.ruleId === 'IRONG_DIFF_EXPORT_REMOVED');
+
+  assert.equal(firstRemoval.id, secondRemoval.id);
+  assert.equal(firstRemoval.identityVersion, '2');
+  assert.equal(firstRemoval.identity.functionStableId, 'fn_removed_public');
+
+  const source = fn('fn_source', 'src/app.js', 'source');
+  const targets = [1, 2, 3, 4, 5].map((index) => fn(`fn_target_${index}`, 'src/app.js', `target${index}`));
+  const fanDiff = (baseCount, headCount) => compareSnapshots(
+    snapshot({
+      modules: [module('src/app.js')],
+      functions: [source, ...targets],
+      edges: targets.slice(0, baseCount).map((target) => edge(source, target)),
+    }),
+    snapshot({
+      modules: [module('src/app.js')],
+      functions: [source, ...targets],
+      edges: targets.slice(0, headCount).map((target) => edge(source, target)),
+    }),
+  ).findings.find((finding) => finding.ruleId === 'IRONG_DIFF_FAN_INCREASE');
+  const fanFour = fanDiff(1, 4);
+  const fanFive = fanDiff(2, 5);
+
+  assert.equal(fanFour.id, fanFive.id);
+  assert.deepEqual(fanFour.identity, {
+    version: '2',
+    ruleId: 'IRONG_DIFF_FAN_INCREASE',
+    entityType: 'function',
+    functionStableId: 'fn_source',
+    modulePath: 'src/app.js',
+    name: 'source',
+    metric: 'fanOut',
+  });
+
+  const otherFunction = fn('fn_other_source', 'src/app.js', 'otherSource');
+  const otherFan = compareSnapshots(
+    snapshot({
+      modules: [module('src/app.js')],
+      functions: [otherFunction, ...targets],
+      edges: [edge(otherFunction, targets[0])],
+    }),
+    snapshot({
+      modules: [module('src/app.js')],
+      functions: [otherFunction, ...targets],
+      edges: targets.slice(0, 4).map((target) => edge(otherFunction, target)),
+    }),
+  ).findings.find((finding) => finding.ruleId === 'IRONG_DIFF_FAN_INCREASE');
+
+  assert.notEqual(fanFour.id, otherFan.id);
+});
+
 test('compareSnapshots output is deterministic for shuffled snapshot collections', () => {
   const a = fn('fn_a', 'src/a.js', 'a');
   const b = fn('fn_b', 'src/b.js', 'b');

@@ -3,9 +3,17 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import crypto from 'node:crypto';
 import { execFile as execFileCallback } from 'node:child_process';
+import os from 'node:os';
 import { promisify } from 'node:util';
 
 import { analyzeProject } from './analyze-project.js';
+import {
+  DEFAULT_MODULE_LIMIT,
+  DEFAULT_SOURCE_MODE,
+  normalizeModuleLimit,
+  normalizeSourceMode,
+  sourcePrivacyMetadata,
+} from './options.js';
 import { compareLocale } from './utils.js';
 import { viewerHtml } from '../viewer/html.js';
 
@@ -14,8 +22,9 @@ const execFile = promisify(execFileCallback);
 const packageMeta = require('../../package.json');
 const viewerAppUrl = new URL('../viewer/app.js', import.meta.url);
 const API_VERSION = 'v1';
-const SCHEMA_VERSION = '1.2.0';
+const SCHEMA_VERSION = '0.2.0';
 const API_DATA_DIR = '.ironglancer-api';
+const OUTPUT_MARKER_FILE = '.ironglancer-output.json';
 
 const CREDENTIAL_VALUE_PATTERNS = [
   /\bAKIA[0-9A-Z]{16}\b/,
@@ -161,8 +170,10 @@ async function gitCommitForRoot(rootDir) {
 
 function analysisPayload(analysis) {
   return {
-    rootDir: analysis.rootDir,
+    rootDir: null,
     entry: analysis.entryRel,
+    entryKind: analysis.entryKind || 'module',
+    entryModules: Array.isArray(analysis.entryModules) ? analysis.entryModules : [analysis.entryRel].filter(Boolean),
     modules: analysisModulesPayload(analysis),
     treeText: analysis.treeText,
     jsxTreeText: analysis.jsxTreeText,
@@ -170,6 +181,17 @@ function analysisPayload(analysis) {
     jsxScripts: analysis.jsxScripts,
     mermaid: analysis.mermaid,
     importEdges: analysis.importEdges,
+    components: Array.isArray(analysis.components) ? analysis.components : [],
+    componentEdges: Array.isArray(analysis.componentEdges) ? analysis.componentEdges : [],
+    routes: Array.isArray(analysis.routes) ? analysis.routes : [],
+    lazyBoundaries: Array.isArray(analysis.lazyBoundaries) ? analysis.lazyBoundaries : [],
+    assets: Array.isArray(analysis.assets) ? analysis.assets : [],
+    browserApis: Array.isArray(analysis.browserApis) ? analysis.browserApis : [],
+    remoteImports: Array.isArray(analysis.remoteImports) ? analysis.remoteImports : [],
+    unresolvedImports: Array.isArray(analysis.unresolvedImports) ? analysis.unresolvedImports : [],
+    browserIncompatibleImports: Array.isArray(analysis.browserIncompatibleImports) ? analysis.browserIncompatibleImports : [],
+    commonJsSyntax: Array.isArray(analysis.commonJsSyntax) ? analysis.commonJsSyntax : [],
+    findings: Array.isArray(analysis.findings) ? analysis.findings : [],
     functionMap: functionDependencyPayload(analysis.functionDependencyMap),
     summary: analysis.summary,
   };
@@ -203,8 +225,15 @@ function sanitizedImportRef(ref = {}) {
   return {
     specifier: typeof ref.specifier === 'string' ? ref.specifier : '',
     kind: typeof ref.kind === 'string' ? ref.kind : '',
+    typeOnly: Boolean(ref.typeOnly),
     localRel: typeof ref.localRel === 'string' ? ref.localRel : null,
-    resolution: ['local', 'external', 'unresolved'].includes(ref.resolution) ? ref.resolution : null,
+    assetRel: typeof ref.assetRel === 'string' ? ref.assetRel : null,
+    assetKind: typeof ref.assetKind === 'string' ? ref.assetKind : null,
+    remoteUrl: typeof ref.remoteUrl === 'string' ? ref.remoteUrl : null,
+    nodeBuiltin: typeof ref.nodeBuiltin === 'string' ? ref.nodeBuiltin : null,
+    resolution: ['local', 'asset', 'external', 'remote', 'browser-incompatible', 'unresolved'].includes(ref.resolution)
+      ? ref.resolution
+      : null,
     unresolvedReason: typeof ref.unresolvedReason === 'string' ? ref.unresolvedReason : null,
     bindings: Array.isArray(ref.bindings)
       ? ref.bindings.map((binding) => ({
@@ -212,6 +241,7 @@ function sanitizedImportRef(ref = {}) {
         local: typeof binding.local === 'string' ? binding.local : '',
         kind: typeof binding.kind === 'string' ? binding.kind : '',
         inferred: Boolean(binding.inferred),
+        typeOnly: Boolean(binding.typeOnly),
       }))
       : [],
   };
@@ -235,10 +265,116 @@ function analysisModulesPayload(analysis = {}) {
     .sort((a, b) => compareLocale(a.path, b.path));
 }
 
-export async function generateStaticSite({ rootDir, entry, outDir, routeAliases } = {}) {
+function samePath(a, b) {
+  return path.resolve(a) === path.resolve(b);
+}
+
+function isPathInside(parent, child) {
+  const relative = path.relative(parent, child);
+  return relative && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+function unsafeOutputReason({ outDir, rootDir }) {
+  const resolvedOut = path.resolve(outDir);
+  const resolvedRoot = path.resolve(rootDir);
+  const home = path.resolve(os.homedir());
+  const cwd = path.resolve(process.cwd());
+  if (samePath(resolvedOut, path.parse(resolvedOut).root)) return 'filesystem root';
+  if (samePath(resolvedOut, home)) return 'home directory';
+  if (samePath(resolvedOut, cwd)) return 'current working directory';
+  if (samePath(resolvedOut, resolvedRoot)) return 'project/source root';
+  if (isPathInside(resolvedOut, resolvedRoot)) return 'source ancestor';
+  return '';
+}
+
+async function assertReplaceableOutputDir(outDir) {
+  try {
+    const stat = await fs.stat(outDir);
+    if (!stat.isDirectory()) {
+      throw new Error(`Refusing to replace output target ${outDir}: target exists and is not a directory.`);
+    }
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+
+  const entries = await fs.readdir(outDir);
+  if (entries.length === 0) return;
+
+  try {
+    const marker = JSON.parse(await fs.readFile(path.join(outDir, OUTPUT_MARKER_FILE), 'utf8'));
+    if (marker?.packageName !== packageMeta.name || marker?.owner !== 'IronGlancer') {
+      throw new Error('marker does not belong to IronGlancer');
+    }
+  } catch (error) {
+    throw new Error(
+      `Refusing to replace ${outDir}: existing directory lacks a valid IronGlancer ownership marker (${OUTPUT_MARKER_FILE}).`,
+    );
+  }
+}
+
+async function replaceOutputDirAtomically(tempDir, outDir) {
+  let backupDir = '';
+  try {
+    await fs.stat(outDir);
+    backupDir = path.join(path.dirname(outDir), `.${path.basename(outDir)}.previous-${process.pid}-${Date.now()}`);
+    await fs.rename(outDir, backupDir);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+
+  try {
+    await fs.rename(tempDir, outDir);
+  } catch (error) {
+    if (backupDir) {
+      await fs.rename(backupDir, outDir).catch(() => {});
+    }
+    throw error;
+  }
+
+  if (backupDir) await fs.rm(backupDir, { recursive: true, force: true });
+}
+
+export async function generateStaticSite({
+  rootDir,
+  entry,
+  outDir,
+  routeAliases,
+  aliases,
+  framework,
+  sourceRoot,
+  includeSource = false,
+  includeUnreachable = false,
+  exclude = [],
+  sourceMode = DEFAULT_SOURCE_MODE,
+  moduleLimit = DEFAULT_MODULE_LIMIT,
+} = {}) {
+  const effectiveSourceMode = includeSource ? 'full' : normalizeSourceMode(sourceMode);
+  const effectiveModuleLimit = normalizeModuleLimit(moduleLimit);
   const resolvedOutDir = path.resolve(outDir || 'ironglancer-site');
-  const analysis = await analyzeProject({ rootDir, entry, routeAliases });
-  assertNoCredentialLiterals(analysis.sourceCode);
+  const analysis = await analyzeProject({
+    rootDir,
+    entry,
+    routeAliases,
+    aliases,
+    framework,
+    sourceRoot,
+    includeUnreachable,
+    exclude,
+    moduleLimit: effectiveModuleLimit,
+  });
+  const unsafeReason = unsafeOutputReason({ outDir: resolvedOutDir, rootDir: analysis.rootDir });
+  if (unsafeReason) {
+    throw new Error(`Refusing destructive IronGlancer output target ${resolvedOutDir}: ${unsafeReason}.`);
+  }
+  await assertReplaceableOutputDir(resolvedOutDir);
+  const declarationSource = declarationSourcePayload(analysis.sourceCode);
+  const moduleSource = moduleSourcePayload(analysis.sourceCode);
+  if (effectiveSourceMode === 'declarations') {
+    assertNoCredentialLiterals(declarationSource);
+  } else if (effectiveSourceMode === 'full') {
+    assertNoCredentialLiterals(analysis.sourceCode);
+  }
   const generatedAt = new Date().toISOString();
   const sourceCodeHash = contentHash(analysis.sourceCode);
   const output = analysisPayload(analysis);
@@ -257,31 +393,63 @@ export async function generateStaticSite({ rootDir, entry, outDir, routeAliases 
     packageName: packageMeta.name,
     version: packageMeta.version,
     generatedAt,
-    rootDir: analysis.rootDir,
+    rootDir: effectiveSourceMode === 'full' ? analysis.rootDir : null,
     entry: analysis.entryRel,
+    entryKind: analysis.entryKind || 'module',
+    entryModules: Array.isArray(analysis.entryModules) ? analysis.entryModules : [analysis.entryRel].filter(Boolean),
     gitCommit,
     buildId,
     sourceCodeHash,
+    privacy: sourcePrivacyMetadata(effectiveSourceMode, {
+      declarationCount: declarationSource.declarations.length,
+      moduleSourceCount: moduleSource.modules.length,
+    }),
+    analysis: {
+      analyzer: analysis.metadata?.analyzer
+        || analysis.metadata?.backend
+        || { name: 'javascript-ast', parser: '@babel/parser', language: 'browser-jsx' },
+      backend: analysis.metadata?.backend
+        || analysis.metadata?.analyzer
+        || { name: 'javascript-ast', parser: '@babel/parser', language: 'browser-jsx' },
+      framework: analysis.metadata?.framework || 'auto',
+      includeUnreachable: Boolean(analysis.metadata?.includeUnreachable),
+      moduleLimit: analysis.metadata?.moduleLimit || {
+        limit: effectiveModuleLimit,
+        count: output.modules.length,
+      },
+    },
   };
-  await fs.rm(resolvedOutDir, { recursive: true, force: true });
-  await fs.mkdir(resolvedOutDir, { recursive: true });
-  await fs.writeFile(path.join(resolvedOutDir, 'index.html'), viewerHtml({ appScriptSrc }), 'utf8');
-  await fs.writeFile(path.join(resolvedOutDir, 'app.js'), appJs, 'utf8');
-  await fs.writeFile(path.join(resolvedOutDir, 'diagram.mmd'), analysis.mermaid + '\n', 'utf8');
-  await writeJson(path.join(resolvedOutDir, 'source-code.json'), {
-    ...declarationSourcePayload(analysis.sourceCode),
-    meta,
-  });
-  await fs.mkdir(path.join(resolvedOutDir, API_DATA_DIR), { recursive: true });
-  await writeJson(path.join(resolvedOutDir, API_DATA_DIR, 'source-modules.json'), {
-    ...moduleSourcePayload(analysis.sourceCode),
-    meta,
-  });
-  await writeJson(path.join(resolvedOutDir, API_DATA_DIR, 'function-map.json'), {
+  const tempOutDir = path.join(path.dirname(resolvedOutDir), `.${path.basename(resolvedOutDir)}.tmp-${process.pid}-${Date.now()}`);
+  await fs.rm(tempOutDir, { recursive: true, force: true });
+  await fs.mkdir(tempOutDir, { recursive: true });
+  await fs.writeFile(path.join(tempOutDir, OUTPUT_MARKER_FILE), JSON.stringify({
+    owner: 'IronGlancer',
+    packageName: packageMeta.name,
+    version: packageMeta.version,
+    generatedAt,
+  }, null, 2) + '\n', 'utf8');
+  await fs.writeFile(path.join(tempOutDir, 'index.html'), viewerHtml({ appScriptSrc }), 'utf8');
+  await fs.writeFile(path.join(tempOutDir, 'app.js'), appJs, 'utf8');
+  await fs.writeFile(path.join(tempOutDir, 'diagram.mmd'), analysis.mermaid + '\n', 'utf8');
+  await fs.mkdir(path.join(tempOutDir, API_DATA_DIR), { recursive: true });
+  if (effectiveSourceMode === 'declarations' || effectiveSourceMode === 'full') {
+    await writeJson(path.join(tempOutDir, 'source-code.json'), {
+      ...declarationSource,
+      meta,
+    });
+  }
+  if (effectiveSourceMode === 'full') {
+    await writeJson(path.join(tempOutDir, API_DATA_DIR, 'source-modules.json'), {
+      ...moduleSource,
+      meta,
+    });
+  }
+  await writeJson(path.join(tempOutDir, API_DATA_DIR, 'function-map.json'), {
     ...functionDependencyPayload(analysis.functionDependencyMap),
     meta,
   });
-  await writeJson(path.join(resolvedOutDir, 'output.json'), { ...output, meta });
-  await copyMermaidAsset(resolvedOutDir);
+  await writeJson(path.join(tempOutDir, 'output.json'), { ...output, meta });
+  await copyMermaidAsset(tempOutDir);
+  await replaceOutputDirAtomically(tempOutDir, resolvedOutDir);
   return { outDir: resolvedOutDir, ...analysis };
 }

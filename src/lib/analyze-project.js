@@ -3,26 +3,22 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 
 import {
-  extractDeclarationSpans,
-  extractImportRefs,
   identifierReferenceLocations,
   maskIgnorableSyntax,
 } from './import-parser.js';
+import { DEFAULT_FRAMEWORK, DEFAULT_MODULE_LIMIT, normalizeFramework, normalizeModuleLimit } from './options.js';
+import { createJavaScriptAstAnalysisContext } from './javascript-ast-analysis.js';
 import { compareLocale, extensionCandidates, fileExists, isWithinPath, normalizeString, toPosixPath } from './utils.js';
 
 const DEFAULT_ENTRY_CANDIDATES = [
-  'app.jsx',
-  'app.js',
-  'index.jsx',
-  'index.js',
-  'main.jsx',
-  'main.js',
-  'src/app.jsx',
-  'src/app.js',
-  'src/index.jsx',
-  'src/index.js',
+  'index.html',
+  'src/index.html',
   'src/main.jsx',
   'src/main.js',
+  'src/index.jsx',
+  'src/index.js',
+  'src/app.jsx',
+  'src/app.js',
 ];
 
 const DEFAULT_ROUTE_ALIASES = [
@@ -30,7 +26,30 @@ const DEFAULT_ROUTE_ALIASES = [
   { from: '/', to: 'public' },
 ];
 
-const ANALYZABLE_MODULE_EXTENSIONS = new Set(['.js', '.jsx', '.mjs', '.cjs']);
+const HTML_ENTRY_EXTENSIONS = new Set(['.html', '.htm']);
+const ANALYZABLE_MODULE_EXTENSIONS = new Set(['.js', '.jsx', '.mjs']);
+const ASSET_EXTENSIONS = new Set([
+  '.css',
+  '.scss',
+  '.sass',
+  '.less',
+  '.json',
+  '.svg',
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.gif',
+  '.webp',
+  '.avif',
+  '.ico',
+  '.woff',
+  '.woff2',
+  '.ttf',
+  '.otf',
+  '.wasm',
+  '.worker.js',
+  '.worker.mjs',
+]);
 const EXCLUDED_DISCOVERY_DIRS = new Set([
   '.git',
   '.hg',
@@ -59,7 +78,7 @@ const visibleLocalBindingLocationCache = new WeakMap();
 const FUNCTION_DEPENDENCY_LIMITATIONS = [
   'Static function dependencies are based on identifier references inside saved declaration spans; IronGlancer does not execute code or prove runtime control flow.',
   'Usage syntax is labeled as call, optional-call, tagged-template, jsx-element, or reference from nearby source syntax; reference entries are not claimed to be definite runtime calls.',
-  'Imported targets are limited to statically resolved local imports, dynamic imports, require calls, exact supported Faculty browser import wrappers, and supported lazy-module patterns with resolvable bindings.',
+  'Imported targets are limited to browser ESM imports, dynamic imports, React.lazy boundaries, and module worker entries with statically resolvable bindings.',
   'Same-module targets are limited to named function declarations and named arrow-function variable declarations discovered in the same file; dynamic property dispatch, aliasing through arbitrary values, and unresolved re-exports are outside this map.',
   'Placement review is deterministic static affinity evidence; it is a review aid, not a runtime ownership proof or definitive dead-code detector.',
 ];
@@ -104,6 +123,7 @@ const PLATFORM_IMPORT_SPECIFIERS = new Set([
   'worker_threads',
   'zlib',
 ]);
+const UNSUPPORTED_SOURCE_EXTENSIONS = new Set(['.cjs', '.cts', '.mts', '.ts', '.tsx']);
 const BROWSER_PLATFORM_NAMESPACES = new Map([
   ['window', 'browser:window'],
   ['document', 'browser:document'],
@@ -125,6 +145,100 @@ const BROWSER_PLATFORM_IDENTIFIERS = new Map([
   ['requestAnimationFrame', 'browser:animation-frame'],
 ]);
 
+function normalizeImportAliasTarget(value) {
+  return toPosixPath(normalizeString(value).trim());
+}
+
+function parseAliasString(value) {
+  const raw = normalizeString(value).trim();
+  const separatorIndex = raw.indexOf('=');
+  if (separatorIndex === -1) {
+    throw new Error(`Invalid alias "${raw}". Use specifier=path.`);
+  }
+  const from = raw.slice(0, separatorIndex).trim();
+  const to = raw.slice(separatorIndex + 1).trim();
+  if (!from || !to) throw new Error('Aliases must include both a specifier and target path.');
+  return [from, normalizeImportAliasTarget(to)];
+}
+
+function normalizeImportAliases(values = []) {
+  const aliases = new Map();
+  const entries = Array.isArray(values) ? values : [values].filter(Boolean);
+  for (const entry of entries) {
+    if (typeof entry === 'string') {
+      const [from, to] = parseAliasString(entry);
+      aliases.set(from, to);
+    } else if (Array.isArray(entry)) {
+      aliases.set(normalizeString(entry[0]).trim(), normalizeImportAliasTarget(entry[1]));
+    } else if (entry && typeof entry === 'object') {
+      aliases.set(normalizeString(entry.from ?? entry.alias ?? entry.specifier).trim(), normalizeImportAliasTarget(entry.to ?? entry.path));
+    }
+  }
+  for (const [key, value] of aliases) {
+    if (!key || !value) aliases.delete(key);
+  }
+  return aliases;
+}
+
+function aliasesFromImportMap(importMap = {}) {
+  const aliases = new Map();
+  const imports = importMap && typeof importMap.imports === 'object' && !Array.isArray(importMap.imports)
+    ? importMap.imports
+    : {};
+  for (const [key, value] of Object.entries(imports)) {
+    const rawValue = normalizeImportAliasTarget(value);
+    if (!rawValue) continue;
+    aliases.set(key, rawValue);
+  }
+  return aliases;
+}
+
+function mergeAliasMaps(...maps) {
+  const aliases = new Map();
+  for (const map of maps) {
+    for (const [key, value] of map instanceof Map ? map : []) {
+      if (key && value) aliases.set(key, value);
+    }
+  }
+  return aliases;
+}
+
+function parseHtmlAttributes(rawAttributes) {
+  const attrs = new Map();
+  const pattern = /([A-Za-z_:][-A-Za-z0-9_:.]*)\s*(?:=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+  let match;
+  while ((match = pattern.exec(normalizeString(rawAttributes)))) {
+    attrs.set(match[1].toLowerCase(), match[2] ?? match[3] ?? match[4] ?? '');
+  }
+  return attrs;
+}
+
+function parseHtmlEntry(source) {
+  const html = normalizeString(source);
+  const importMaps = [];
+  const moduleScriptSrcs = [];
+  const importMapPattern = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
+  let match;
+  while ((match = importMapPattern.exec(html))) {
+    const attrs = parseHtmlAttributes(match[1]);
+    const type = normalizeString(attrs.get('type')).trim().toLowerCase();
+    const src = normalizeString(attrs.get('src')).trim();
+    if (type === 'importmap') {
+      try {
+        importMaps.push(JSON.parse(match[2]));
+      } catch (error) {
+        throw new Error(`Invalid HTML import map JSON: ${error.message}`);
+      }
+    } else if (type === 'module' && src) {
+      moduleScriptSrcs.push(src);
+    }
+  }
+  return {
+    importAliases: mergeAliasMaps(...importMaps.map(aliasesFromImportMap)),
+    moduleScriptSrcs,
+  };
+}
+
 async function loadImportAliases(rootDir, entryRel = '') {
   const aliases = new Map();
   const htmlCandidates = [
@@ -135,17 +249,7 @@ async function loadImportAliases(rootDir, entryRel = '') {
   for (const htmlPath of htmlCandidates) {
     try {
       const html = await fs.readFile(htmlPath, 'utf8');
-      const match = html.match(/<script\s+type=["']importmap["'][^>]*>([\s\S]*?)<\/script>/i);
-      if (!match) continue;
-      const importMap = JSON.parse(match[1]);
-      const imports = importMap && typeof importMap.imports === 'object' && !Array.isArray(importMap.imports)
-        ? importMap.imports
-        : {};
-      for (const [key, value] of Object.entries(imports)) {
-        const rawValue = normalizeString(value).trim();
-        if (!rawValue || /^https?:\/\//i.test(rawValue)) continue;
-        aliases.set(key, rawValue);
-      }
+      for (const [key, value] of parseHtmlEntry(html).importAliases) aliases.set(key, value);
     } catch {
       // best effort only
     }
@@ -230,6 +334,11 @@ function importAliasTargetForSpecifier(specifier, aliases) {
   return best ? joinImportAliasPrefixTarget(best.target, best.rest) : '';
 }
 
+function remoteAliasTargetForSpecifier(specifier, aliases) {
+  const aliasTarget = importAliasTargetForSpecifier(specifier, aliases);
+  return isRemoteSpecifier(aliasTarget) ? aliasTarget : '';
+}
+
 async function resolveFromRoot(rootDir, relativePath) {
   for (const candidate of extensionCandidates(relativePath)) {
     const filePath = path.resolve(rootDir, candidate);
@@ -244,26 +353,87 @@ async function resolveFromRoot(rootDir, relativePath) {
   return null;
 }
 
-async function resolveEntry(rootDir, entry) {
+async function resolveExactFromRoot(rootDir, relativePath) {
+  const normalized = toPosixPath(normalizeString(relativePath).trim()).replace(/^\.\//, '').replace(/^\/+/, '');
+  if (!normalized) return null;
+  const filePath = path.resolve(rootDir, normalized);
+  if (!isWithinPath(rootDir, filePath)) return null;
+  if (!await fileExists(filePath)) return null;
+  return {
+    rel: toPosixPath(path.relative(rootDir, filePath)),
+    filePath,
+  };
+}
+
+async function resolveEntry(rootDir, entry, { allowHtml = true } = {}) {
   const requested = normalizeString(entry).trim();
   const candidates = requested ? [requested] : DEFAULT_ENTRY_CANDIDATES;
   for (const candidate of candidates) {
-    const resolved = await resolveFromRoot(rootDir, candidate.replace(/^\.\//, '').replace(/^\//, ''));
-    if (resolved) return resolved;
+    const normalized = candidate.replace(/^\.\//, '').replace(/^\//, '');
+    const ext = path.posix.extname(toPosixPath(normalized)).toLowerCase();
+    if (!allowHtml && HTML_ENTRY_EXTENSIONS.has(ext)) continue;
+    const resolved = HTML_ENTRY_EXTENSIONS.has(ext)
+      ? await resolveExactFromRoot(rootDir, normalized)
+      : await resolveFromRoot(rootDir, normalized);
+    if (!resolved) continue;
+    return {
+      ...resolved,
+      kind: HTML_ENTRY_EXTENSIONS.has(path.posix.extname(toPosixPath(resolved.rel)).toLowerCase())
+        ? 'html'
+        : 'module',
+    };
   }
-  throw new Error(`Unable to resolve entry inside ${rootDir}`);
+  throw new Error(`Unable to resolve browser entry inside ${rootDir}`);
 }
 
 function isAnalyzableModulePath(relativePath) {
   return ANALYZABLE_MODULE_EXTENSIONS.has(path.posix.extname(toPosixPath(relativePath)).toLowerCase());
 }
 
-function isExcludedDiscoveryDir(name) {
-  return EXCLUDED_DISCOVERY_DIRS.has(normalizeString(name).trim());
+function localAssetKind(relativePath) {
+  const normalized = toPosixPath(relativePath).toLowerCase();
+  if (normalized.endsWith('.worker.js') || normalized.endsWith('.worker.mjs')) return 'worker';
+  const ext = path.posix.extname(normalized);
+  if (!ASSET_EXTENSIONS.has(ext)) return '';
+  if (ext === '.css' || ext === '.scss' || ext === '.sass' || ext === '.less') return 'style';
+  if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.svg', '.ico'].includes(ext)) return 'image';
+  if (['.woff', '.woff2', '.ttf', '.otf'].includes(ext)) return 'font';
+  if (ext === '.json') return 'json';
+  if (ext === '.wasm') return 'wasm';
+  return 'unknown';
 }
 
-async function discoverAnalyzableModules(rootDir, moduleLimit) {
-  const discovered = [];
+function isSupportedBrowserModulePath(relativePath) {
+  return isAnalyzableModulePath(relativePath);
+}
+
+function normalizeExclude(value) {
+  return toPosixPath(normalizeString(value).trim())
+    .replace(/^\.\//, '')
+    .replace(/^\/+/, '')
+    .replace(/\/+$/g, '');
+}
+
+function normalizeExcludes(values = []) {
+  return (Array.isArray(values) ? values : [values].filter(Boolean))
+    .flatMap((value) => normalizeString(value).split(','))
+    .map(normalizeExclude)
+    .filter(Boolean)
+    .sort(compareLocale);
+}
+
+function pathMatchesExclude(relativePath, excludes) {
+  const rel = normalizeExclude(relativePath);
+  return excludes.some((exclude) => rel === exclude || rel.startsWith(`${exclude}/`));
+}
+
+function isExcludedDiscoveryDir(name, relativePath, excludes) {
+  return EXCLUDED_DISCOVERY_DIRS.has(normalizeString(name).trim())
+    || pathMatchesExclude(relativePath, excludes);
+}
+
+async function discoverAnalyzableModules(rootDir, moduleLimit, excludes = [], roots = ['']) {
+  const discovered = new Map();
 
   const visit = async (dirPath) => {
     const entries = (await fs.readdir(dirPath, { withFileTypes: true }))
@@ -272,19 +442,31 @@ async function discoverAnalyzableModules(rootDir, moduleLimit) {
       const filePath = path.join(dirPath, entry.name);
       const rel = toPosixPath(path.relative(rootDir, filePath));
       if (entry.isDirectory()) {
-        if (isExcludedDiscoveryDir(entry.name)) continue;
+        if (isExcludedDiscoveryDir(entry.name, rel, excludes)) continue;
         await visit(filePath);
-      } else if (entry.isFile() && isAnalyzableModulePath(rel)) {
-        discovered.push({ rel, filePath });
-        if (discovered.length > moduleLimit) {
+      } else if (entry.isFile() && !pathMatchesExclude(rel, excludes) && isAnalyzableModulePath(rel)) {
+        discovered.set(rel, { rel, filePath });
+        if (discovered.size > moduleLimit) {
           throw new Error(`Module limit exceeded (${moduleLimit}).`);
         }
       }
     }
   };
 
-  await visit(rootDir);
-  return discovered.sort((a, b) => compareLocale(a.rel, b.rel));
+  const normalizedRoots = Array.from(new Set((Array.isArray(roots) ? roots : [roots])
+    .map(normalizeExclude))).sort(compareLocale);
+  for (const root of normalizedRoots.length > 0 ? normalizedRoots : ['']) {
+    const dirPath = path.resolve(rootDir, root || '.');
+    if (!isWithinPath(rootDir, dirPath)) continue;
+    try {
+      const stat = await fs.stat(dirPath);
+      if (!stat.isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    await visit(dirPath);
+  }
+  return Array.from(discovered.values()).sort((a, b) => compareLocale(a.rel, b.rel));
 }
 
 function localPathFromRouteAlias(specifier, alias) {
@@ -308,22 +490,68 @@ async function resolveRouteAlias({ rootDir, specifier, routeAliases }) {
   for (const alias of routeAliases) {
     const localPath = localPathFromRouteAlias(specifier, alias);
     if (localPath == null) continue;
-    const resolved = await resolveFromRoot(rootDir, localPath);
+    const resolved = await resolveBrowserPathFromRoot(rootDir, localPath);
     if (resolved) return resolved;
+  }
+  return null;
+}
+
+function isRemoteSpecifier(specifier) {
+  return /^(?:https?:)?\/\//i.test(normalizeString(specifier).trim());
+}
+
+function nodeBuiltinSpecifier(specifier) {
+  const raw = normalizeString(specifier).trim();
+  const normalized = raw.startsWith('node:') ? raw.slice('node:'.length) : raw;
+  return PLATFORM_IMPORT_SPECIFIERS.has(normalized) ? normalized : '';
+}
+
+function unsupportedSourceExtension(relativePath) {
+  const ext = path.posix.extname(toPosixPath(relativePath)).toLowerCase();
+  return UNSUPPORTED_SOURCE_EXTENSIONS.has(ext) ? ext : '';
+}
+
+async function resolveBrowserPathFromRoot(rootDir, relativePath) {
+  const exact = await resolveExactFromRoot(rootDir, relativePath);
+  if (exact) {
+    const unsupportedExtension = unsupportedSourceExtension(exact.rel);
+    if (unsupportedExtension) {
+      return {
+        ...exact,
+        kind: 'unsupported-module',
+        assetKind: null,
+        unsupportedExtension,
+      };
+    }
+    const assetKind = localAssetKind(exact.rel);
+    return {
+      ...exact,
+      kind: isSupportedBrowserModulePath(exact.rel) ? 'module' : 'asset',
+      assetKind: isSupportedBrowserModulePath(exact.rel) ? null : assetKind || 'unknown',
+    };
+  }
+  const module = await resolveFromRoot(rootDir, relativePath);
+  if (module) {
+    return {
+      ...module,
+      kind: 'module',
+      assetKind: null,
+    };
   }
   return null;
 }
 
 async function resolveImport({ rootDir, specifier, importerRel, aliases, routeAliases }) {
   const raw = normalizeString(specifier).trim();
-  if (!raw || /^https?:\/\//i.test(raw)) return null;
+  if (!raw || isRemoteSpecifier(raw) || nodeBuiltinSpecifier(raw)) return null;
   const aliasTarget = importAliasTargetForSpecifier(raw, aliases);
   if (aliasTarget) {
     const expandedAlias = expandImportAliasTarget(aliasTarget);
+    if (isRemoteSpecifier(expandedAlias)) return null;
     const routedAlias = await resolveRouteAlias({ rootDir, specifier: expandedAlias, routeAliases });
     if (routedAlias) return routedAlias;
     const normalizedAlias = normalizeRouteAliasTarget(expandedAlias);
-    return resolveFromRoot(rootDir, normalizedAlias);
+    return resolveBrowserPathFromRoot(rootDir, normalizedAlias);
   }
   if (raw.startsWith('/')) {
     return resolveRouteAlias({ rootDir, specifier: raw, routeAliases });
@@ -331,7 +559,7 @@ async function resolveImport({ rootDir, specifier, importerRel, aliases, routeAl
   if (raw.startsWith('./') || raw.startsWith('../')) {
     const importerDir = path.posix.dirname(toPosixPath(importerRel));
     const relativePath = path.posix.normalize(path.posix.join(importerDir, raw));
-    return resolveFromRoot(rootDir, relativePath);
+    return resolveBrowserPathFromRoot(rootDir, relativePath);
   }
   return null;
 }
@@ -425,18 +653,6 @@ function parseNamedExportSpecifier(part) {
   if (aliasMatch) return { local: aliasMatch[1], exported: aliasMatch[2] };
   const local = normalizeIdentifier(cleaned);
   return local ? { local, exported: local } : null;
-}
-
-function parseCommonJsObjectSpecifier(part) {
-  const cleaned = normalizeString(part)
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/\/\/.*$/g, '')
-    .trim();
-  if (!cleaned) return null;
-  const aliasMatch = cleaned.match(/^([A-Za-z_$][A-Za-z0-9_$]*)\s*:\s*([A-Za-z_$][A-Za-z0-9_$]*)$/);
-  if (aliasMatch) return { exported: aliasMatch[1], local: aliasMatch[2] };
-  const local = normalizeIdentifier(cleaned);
-  return local ? { exported: local, local } : null;
 }
 
 function findNextNonWhitespaceIndex(text, start) {
@@ -622,10 +838,6 @@ function declarationPublicApiInfo(record, declarationName) {
   const directFunctionExportPattern = new RegExp(`\\bexport\\s+(default\\s+)?(?:async\\s+)?function\\s*\\*?\\s+${escaped}\\s*\\(`, 'g');
   const directArrowExportPattern = new RegExp(`\\bexport\\s+(?:const|let|var)\\s+${escaped}\\s*=`, 'g');
   const defaultIdentifierExportPattern = new RegExp(`\\bexport\\s+default\\s+${escaped}\\b`, 'g');
-  const commonJsPropertyPattern = new RegExp(`\\b(?:module\\.)?exports\\s*\\.\\s*([A-Za-z_$][A-Za-z0-9_$]*)\\s*=\\s*${escaped}\\b`, 'g');
-  const commonJsFunctionExpressionPattern = new RegExp(`\\b(?:module\\.)?exports\\s*\\.\\s*([A-Za-z_$][A-Za-z0-9_$]*)\\s*=\\s*(?:async\\s+)?function\\s*\\*?\\s+${escaped}\\s*\\(`, 'g');
-  const commonJsDefaultPattern = new RegExp(`\\bmodule\\s*\\.\\s*exports\\s*=\\s*${escaped}\\b`, 'g');
-  const commonJsObjectPattern = /\bmodule\s*\.\s*exports\s*=\s*\{([\s\S]*?)\}/g;
 
   let match;
   while ((match = directFunctionExportPattern.exec(masked))) {
@@ -669,47 +881,6 @@ function declarationPublicApiInfo(record, declarationName) {
       });
     }
   }
-  while ((match = commonJsPropertyPattern.exec(masked))) {
-    info.exported = true;
-    addPublicApiSignal(info, {
-      kind: 'commonjs-export',
-      exportedName: match[1],
-      startIndex: match.index,
-      endIndex: commonJsPropertyPattern.lastIndex,
-    });
-  }
-  while ((match = commonJsFunctionExpressionPattern.exec(masked))) {
-    info.exported = true;
-    addPublicApiSignal(info, {
-      kind: 'commonjs-export',
-      exportedName: match[1],
-      startIndex: match.index,
-      endIndex: commonJsFunctionExpressionPattern.lastIndex,
-    });
-  }
-  while ((match = commonJsDefaultPattern.exec(masked))) {
-    info.exported = true;
-    addPublicApiSignal(info, {
-      kind: 'commonjs-export',
-      exportedName: 'module.exports',
-      startIndex: match.index,
-      endIndex: commonJsDefaultPattern.lastIndex,
-    });
-  }
-  while ((match = commonJsObjectPattern.exec(masked))) {
-    for (const part of identifierListParts(match[1])) {
-      const specifier = parseCommonJsObjectSpecifier(part);
-      if (!specifier || specifier.local !== name) continue;
-      info.exported = true;
-      addPublicApiSignal(info, {
-        kind: 'commonjs-export',
-        exportedName: specifier.exported,
-        startIndex: match.index,
-        endIndex: commonJsObjectPattern.lastIndex,
-      });
-    }
-  }
-
   info.exportKinds.sort(compareLocale);
   info.exportedNames.sort(compareLocale);
   return info;
@@ -1558,6 +1729,18 @@ function cachedIdentifierReferenceLocations(record, identifier) {
   return recordCache.get(name);
 }
 
+function locationInTypeOnlyRange(record, location) {
+  const ranges = Array.isArray(record?.typeOnlyRanges) ? record.typeOnlyRanges : [];
+  return ranges.some((range) => (
+    Number.isInteger(range?.startIndex)
+    && Number.isInteger(range?.endIndex)
+    && Number.isInteger(location?.index)
+    && Number.isInteger(location?.endIndex)
+    && location.index >= range.startIndex
+    && location.endIndex <= range.endIndex
+  ));
+}
+
 function lineStartIndexesForSource(source) {
   const text = normalizeString(source);
   const starts = [0];
@@ -1617,15 +1800,8 @@ function stringConstantValues(record) {
   return constants;
 }
 
-function normalizeSpecifierExpression(expression) {
-  let text = normalizeString(expression).trim();
-  const paneUrlMatch = text.match(/^paneUrl\s*\(\s*([\s\S]*?)\s*\)$/);
-  if (paneUrlMatch) text = paneUrlMatch[1].trim();
-  return text;
-}
-
 function specifierExpressionMatchesRef(record, expression, specifier) {
-  const text = normalizeSpecifierExpression(expression);
+  const text = normalizeString(expression).trim();
   if (!text) return false;
   const literalValue = stringLiteralExpressionValue(text);
   if (literalValue) return literalValue === specifier;
@@ -1633,11 +1809,9 @@ function specifierExpressionMatchesRef(record, expression, specifier) {
   return Boolean(identifierMatch) && stringConstantValues(record).get(text) === specifier;
 }
 
-function declarationSpecifierMatchesRef(record, declaration, refKind, specifier) {
-  const specifierExpression = `((?:paneUrl\\s*\\(\\s*)?(?:['"](?:\\\\.|[^'"])*['"]|[A-Za-z_$][A-Za-z0-9_$]*)\\s*\\)?)`;
-  const callPattern = refKind === 'require'
-    ? new RegExp(`\\brequire\\s*\\(\\s*${specifierExpression}\\s*\\)`, 'g')
-    : new RegExp(`\\b(?:import|window\\.import)\\s*\\(\\s*${specifierExpression}\\s*\\)`, 'g');
+function declarationSpecifierMatchesRef(record, declaration, specifier) {
+  const specifierExpression = `(['"](?:\\\\.|[^'"])*['"]|[A-Za-z_$][A-Za-z0-9_$]*)`;
+  const callPattern = new RegExp(`\\b(?:import|window\\.import)\\s*\\(\\s*${specifierExpression}\\s*\\)`, 'g');
   let match;
   while ((match = callPattern.exec(declaration))) {
     if (specifierExpressionMatchesRef(record, match[1], specifier)) return true;
@@ -1667,14 +1841,12 @@ function localBindingIsImportDeclaration(record, localBinding, binding, ref) {
   const declaration = localBindingDeclarationSource(record, localBinding);
   const maskedDeclaration = maskIgnorableSyntax(declaration);
   const refKind = normalizeString(ref?.kind).trim();
-  if (refKind === 'dynamic' || refKind === 'require') {
-    const loaderPattern = refKind === 'require'
-      ? /\brequire\s*\(/
-      : /\b(?:import|window\.import)\s*\(/;
+  if (refKind === 'dynamic') {
+    const loaderPattern = /\b(?:import|window\.import)\s*\(/;
     const specifier = normalizeString(ref?.specifier).trim();
     return Boolean(specifier)
       && loaderPattern.test(maskedDeclaration)
-      && declarationSpecifierMatchesRef(record, declaration, refKind, specifier);
+      && declarationSpecifierMatchesRef(record, declaration, specifier);
   }
   if (refKind === 'lazy' && binding?.inferred) {
     const imported = escapeRegExp(normalizeIdentifier(binding.imported));
@@ -1813,9 +1985,6 @@ function namedExportDeclarationTargetMap(record) {
 
   const directFunctionExportPattern = /\bexport\s+(?:async\s+)?function\s*\*?\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g;
   const directArrowExportPattern = /\bexport\s+(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=/g;
-  const commonJsFunctionExpressionPattern = /\b(?:module\.)?exports\s*\.\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s+)?function\s*\*?\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g;
-  const commonJsPropertyPattern = /\b(?:module\.)?exports\s*\.\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\b/g;
-  const commonJsObjectPattern = /\bmodule\s*\.\s*exports\s*=\s*\{([\s\S]*?)\}/g;
   let match;
   while ((match = directFunctionExportPattern.exec(masked))) {
     const nameStartIndex = match.index + match[0].lastIndexOf(match[1]);
@@ -1824,27 +1993,6 @@ function namedExportDeclarationTargetMap(record) {
   while ((match = directArrowExportPattern.exec(masked))) {
     const nameStartIndex = match.index + match[0].lastIndexOf(match[1]);
     add(match[1], match[1], declarationSpanAtNameStart(record, match[1], nameStartIndex));
-  }
-  while ((match = commonJsFunctionExpressionPattern.exec(masked))) {
-    const nameStartIndex = match.index + match[0].lastIndexOf(match[2]);
-    add(match[1], match[2], declarationSpanAtNameStart(record, match[2], nameStartIndex));
-  }
-  while ((match = commonJsPropertyPattern.exec(masked))) {
-    addVisible(match[1], match[2], {
-      index: match.index,
-      endIndex: commonJsPropertyPattern.lastIndex,
-    });
-  }
-  while ((match = commonJsObjectPattern.exec(masked))) {
-    for (const part of identifierListParts(match[1])) {
-      const specifier = parseCommonJsObjectSpecifier(part);
-      if (specifier) {
-        addVisible(specifier.exported, specifier.local, {
-          index: match.index,
-          endIndex: commonJsObjectPattern.lastIndex,
-        });
-      }
-    }
   }
   for (const entry of namedExportListEntries(masked)) {
     for (const part of identifierListParts(entry.specifiersText)) {
@@ -2060,6 +2208,7 @@ function declarationReferenceLocations(record, span, identifier, {
 } = {}) {
   const locations = cachedIdentifierReferenceLocations(record, identifier)
     .filter((location) => !isAnyDeclarationNameLocation(record, location))
+    .filter((location) => !locationInTypeOnlyRange(record, location))
     .filter((location) => locationOwnedByDeclaration(record, span, location))
     .filter((location) => !isShadowedReferenceLocation(record, span, identifier, location, {
       binding,
@@ -2101,6 +2250,7 @@ function namespaceMemberReferenceLocations(record, span, namespaceName, { bindin
 }
 
 function importBindingRelationshipTarget(targetRecord, binding) {
+  if (importBindingIsTypeOnly(binding)) return null;
   const bindingKind = normalizeString(binding?.kind || 'named').trim() || 'named';
   if (bindingKind === 'namespace') return null;
 
@@ -2113,7 +2263,52 @@ function importBindingRelationshipTarget(targetRecord, binding) {
   } : null;
 }
 
+function reExportNamedBindings(record, importedName) {
+  const name = normalizeIdentifier(importedName);
+  if (!name) return [];
+  return (Array.isArray(record?.importRefs) ? record.importRefs : [])
+    .filter((ref) => ref.kind === 'export' && ref.localRel && !importRefIsTypeOnly(ref))
+    .flatMap((ref) => (Array.isArray(ref.bindings) ? ref.bindings : [])
+      .filter((binding) => !importBindingIsTypeOnly(binding))
+      .filter((binding) => normalizeIdentifier(binding.local) === name || normalizeIdentifier(binding.imported) === name)
+      .map((binding) => ({
+        ref,
+        importedName: normalizeIdentifier(binding.imported) || name,
+      })));
+}
+
+function importBindingRelationshipTargets(graph, targetRecord, binding, seen = new Set()) {
+  const direct = importBindingRelationshipTarget(targetRecord, binding);
+  if (direct) return [{ targetRecord, target: direct }];
+
+  const bindingKind = normalizeString(binding?.kind || 'named').trim() || 'named';
+  const importedName = bindingKind === 'default' ? 'default' : normalizeIdentifier(binding?.imported);
+  if (!graph || bindingKind !== 'named' || !targetRecord?.rel || !importedName) return [];
+  const seenKey = `${targetRecord.rel}\u0000${importedName}`;
+  if (seen.has(seenKey)) return [];
+  seen.add(seenKey);
+
+  const targets = [];
+  for (const reExport of reExportNamedBindings(targetRecord, importedName)) {
+    const reExportTarget = graph.modules.get(reExport.ref.localRel);
+    if (!reExportTarget) continue;
+    targets.push(...importBindingRelationshipTargets(
+      graph,
+      reExportTarget,
+      {
+        ...binding,
+        imported: reExport.importedName,
+        kind: 'named',
+        typeOnly: false,
+      },
+      seen,
+    ));
+  }
+  return targets;
+}
+
 function namespaceImportRelationshipTarget(targetRecord, binding, memberName) {
+  if (importBindingIsTypeOnly(binding)) return null;
   const importedName = normalizeIdentifier(memberName);
   const target = namedExportDeclarationTarget(targetRecord, importedName);
   const namespaceName = normalizeIdentifier(binding?.local);
@@ -2127,12 +2322,14 @@ function namespaceImportRelationshipTarget(targetRecord, binding, memberName) {
 }
 
 function bindingReferenceGroups({
+  graph,
   importerRecord,
   importerSpan,
   targetRecord,
   binding,
   ref,
 }) {
+  if (importRefIsTypeOnly(ref) || importBindingIsTypeOnly(binding)) return [];
   const bindingKind = normalizeString(binding?.kind || 'named').trim() || 'named';
   if (bindingKind === 'namespace') {
     return Array.from(namespaceMemberReferenceLocations(
@@ -2141,24 +2338,27 @@ function bindingReferenceGroups({
       binding.local,
       { binding, ref },
     ), ([memberName, referenceLocations]) => ({
+      targetRecord,
       target: namespaceImportRelationshipTarget(targetRecord, binding, memberName),
       referenceLocations,
     })).filter((group) => group.target && group.referenceLocations.length > 0);
   }
 
-  const target = importBindingRelationshipTarget(targetRecord, binding);
-  if (!target) return [];
+  const targets = importBindingRelationshipTargets(graph, targetRecord, binding);
+  if (targets.length === 0) return [];
   const referenceLocations = declarationReferenceLocations(
     importerRecord,
     importerSpan,
     binding.local,
     {
-      directCallableOnly: Boolean(target.directCallableOnly),
+      directCallableOnly: targets.some((target) => Boolean(target.target?.directCallableOnly)),
       binding,
       ref,
     },
   );
-  return referenceLocations.length > 0 ? [{ target, referenceLocations }] : [];
+  return referenceLocations.length > 0
+    ? targets.map((target) => ({ ...target, referenceLocations }))
+    : [];
 }
 
 function compactUseRelationship({
@@ -2258,19 +2458,21 @@ function buildDeclarationRelationships(graph) {
         if (!binding?.local) continue;
 
         for (const [importerName, importerSpan] of importerSpans) {
-          for (const { target, referenceLocations } of bindingReferenceGroups({
+          for (const { targetRecord: resolvedTargetRecord, target, referenceLocations } of bindingReferenceGroups({
+            graph,
             importerRecord,
             importerSpan,
             targetRecord,
             binding,
             ref,
           })) {
-            const targetKey = declarationImportMetricKey(targetRecord.rel, target.declarationName);
+            const relationshipTargetRecord = resolvedTargetRecord || targetRecord;
+            const targetKey = declarationImportMetricKey(relationshipTargetRecord.rel, target.declarationName);
             if (!targetKey) continue;
 
             const importerKey = declarationImportMetricKey(importerRecord.rel, importerName);
             const useBucket = ensure(importerRecord, importerName);
-            const importedByBucket = ensure(targetRecord, target.declarationName);
+            const importedByBucket = ensure(relationshipTargetRecord, target.declarationName);
             if (!importerKey || !useBucket || !importedByBucket) continue;
 
             const relationshipKey = [
@@ -2288,7 +2490,14 @@ function buildDeclarationRelationships(graph) {
               'importedFunctionUses',
               seenUses,
               relationshipKey,
-              compactUseRelationship({ importerRecord, targetRecord, target, binding, ref, referenceLocations }),
+              compactUseRelationship({
+                importerRecord,
+                targetRecord: relationshipTargetRecord,
+                target,
+                binding,
+                ref,
+                referenceLocations,
+              }),
             );
             addDeclarationRelationship(
               importedByBucket,
@@ -2347,20 +2556,24 @@ function buildDeclarationImportMetrics(graph) {
         if (!binding?.local) continue;
         const importGroups = new Map();
         for (const [, importerSpan] of declarationSpansByName(importerRecord)) {
-          for (const { target, referenceLocations } of bindingReferenceGroups({
+          for (const { targetRecord: resolvedTargetRecord, target, referenceLocations } of bindingReferenceGroups({
+            graph,
             importerRecord,
             importerSpan,
             targetRecord,
             binding,
             ref,
           })) {
-            const groupKey = declarationImportMetricKey(targetRecord.rel, target.declarationName);
+            const relationshipTargetRecord = resolvedTargetRecord || targetRecord;
+            const groupKey = declarationImportMetricKey(relationshipTargetRecord.rel, target.declarationName);
             if (!groupKey) continue;
-            if (!importGroups.has(groupKey)) importGroups.set(groupKey, { target, referenceCount: 0 });
+            if (!importGroups.has(groupKey)) {
+              importGroups.set(groupKey, { target, targetRecord: relationshipTargetRecord, referenceCount: 0 });
+            }
             importGroups.get(groupKey).referenceCount += referenceLocations.length;
           }
         }
-        for (const [key, { target, referenceCount }] of importGroups) {
+        for (const [key, { target, targetRecord: relationshipTargetRecord, referenceCount }] of importGroups) {
           if (!buckets.has(key)) {
             buckets.set(key, {
               identifierOccurrenceCount: 0,
@@ -2381,7 +2594,7 @@ function buildDeclarationImportMetrics(graph) {
           }
           const bucket = buckets.get(key);
           bucket.incomingReferenceCount += referenceCount;
-          if (importerRecord.rel !== targetRecord.rel) {
+          if (importerRecord.rel !== relationshipTargetRecord.rel) {
             bucket.importerFiles.add(importerRecord.rel);
             bucket.incomingImports.push({
               importerPath: importerRecord.rel,
@@ -2455,6 +2668,15 @@ function importSpecifierLooksLocal(specifier, aliases, routeAliases) {
   return routeAliases.some((alias) => raw === alias.from.slice(0, -1) || raw.startsWith(alias.from));
 }
 
+function importBindingIsTypeOnly(binding = {}) {
+  return Boolean(binding?.typeOnly);
+}
+
+function importRefIsTypeOnly(ref = {}) {
+  const bindings = Array.isArray(ref.bindings) ? ref.bindings : [];
+  return Boolean(ref.typeOnly) || (bindings.length > 0 && bindings.every(importBindingIsTypeOnly));
+}
+
 function externalLabel(specifier) {
   const raw = normalizeString(specifier).trim();
   if (!raw) return '';
@@ -2473,7 +2695,7 @@ function isIgnoredExternalLabel(label) {
 }
 
 function isJsxModule(rel) {
-  return /\.(?:jsx)$/i.test(rel);
+  return /\.jsx$/i.test(rel);
 }
 
 function moduleRecords(graph, { reachableOnly = false } = {}) {
@@ -2667,6 +2889,7 @@ function buildImportEdges(graph, { reachableOnly = false } = {}) {
   for (const record of jsxModules) {
     const source = classIds.get(record.rel);
     for (const ref of Array.isArray(record.importRefs) ? record.importRefs : []) {
+      if (importRefIsTypeOnly(ref)) continue;
       if (!ref?.localRel || !classIds.has(ref.localRel)) continue;
       const key = `${record.rel}\u0000${ref.localRel}`;
       if (!edgeMap.has(key)) {
@@ -2848,9 +3071,7 @@ function functionNodeForSpan(record, span, { nested = false, scopePath = '', ide
   const declarationType = normalizeString(span?.declarationType).trim()
     || (span?.kind === 'arrow' ? 'arrow-variable' : 'function-declaration');
   const detectedPublicApi = declarationPublicApiInfo(record, name);
-  const commonJsFunctionExpressionExport = declarationType === 'function-expression-name'
-    && detectedPublicApi.exportKinds.includes('commonjs-export');
-  const publicApi = nested || (declarationType === 'function-expression-name' && !commonJsFunctionExpressionExport)
+  const publicApi = nested || declarationType === 'function-expression-name'
     ? { exported: false, exportedNames: [], exportKinds: [] }
     : detectedPublicApi;
   return {
@@ -3066,14 +3287,16 @@ function buildImportedFunctionEdges(graph, { bySpanKey }) {
         for (const importerSpan of importerSpans) {
           const sourceDescriptor = bySpanKey.get(functionSpanKey(importerRecord, importerSpan));
           if (!sourceDescriptor) continue;
-          for (const { target, referenceLocations } of bindingReferenceGroups({
+          for (const { targetRecord: resolvedTargetRecord, target, referenceLocations } of bindingReferenceGroups({
+            graph,
             importerRecord,
             importerSpan,
             targetRecord,
             binding,
             ref,
           })) {
-            const targetDescriptor = bySpanKey.get(functionSpanKey(targetRecord, target.span));
+            const relationshipTargetRecord = resolvedTargetRecord || targetRecord;
+            const targetDescriptor = bySpanKey.get(functionSpanKey(relationshipTargetRecord, target.span));
             if (!targetDescriptor || referenceLocations.length === 0) continue;
             mergeFunctionDependencyEdge(edgeMap, createFunctionDependencyEdge({
               sourceDescriptor,
@@ -3803,48 +4026,454 @@ function reachableGraphView(graph) {
   };
 }
 
-export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeAliases = [] } = {}) {
-  const resolvedRoot = path.resolve(normalizeString(rootDir).trim() || '.');
-  const resolvedEntry = await resolveEntry(resolvedRoot, entry);
-  const aliases = await loadImportAliases(resolvedRoot, resolvedEntry.rel);
+function uniqueRecords(records, keyFor) {
+  const byKey = new Map();
+  for (const record of records) {
+    const key = keyFor(record);
+    if (!key || byKey.has(key)) continue;
+    byKey.set(key, record);
+  }
+  return Array.from(byKey.values());
+}
+
+function componentKey(modulePath, name) {
+  return `${modulePath}\u0000${name}`;
+}
+
+function buildComponents(graph) {
+  return moduleRecords(graph)
+    .flatMap((record) => (Array.isArray(record.components) ? record.components : [])
+      .map((component) => ({
+        ...component,
+        modulePath: record.rel,
+        reachable: Boolean(record.reachable),
+      })))
+    .sort((a, b) => compareLocale(a.modulePath, b.modulePath)
+      || compareLocale(a.name, b.name)
+      || a.startLine - b.startLine);
+}
+
+function importedBindingComponentTarget(record, graph, componentByModuleAndName, localName) {
+  for (const ref of Array.isArray(record.importRefs) ? record.importRefs : []) {
+    if (!ref.localRel) continue;
+    const binding = (Array.isArray(ref.bindings) ? ref.bindings : [])
+      .find((candidate) => candidate.local === localName);
+    if (!binding) continue;
+    const targetName = binding.imported === 'default' ? defaultExportDeclarationName(graph.modules.get(ref.localRel)) : binding.imported;
+    const key = componentKey(ref.localRel, targetName || localName);
+    if (componentByModuleAndName.has(key)) return componentByModuleAndName.get(key);
+  }
+  return null;
+}
+
+function buildComponentRenderEdges(graph, components) {
+  const componentByModuleAndName = new Map(components.map((component) => [
+    componentKey(component.modulePath, component.name),
+    component,
+  ]));
+  const edges = [];
+  for (const record of moduleRecords(graph)) {
+    for (const ref of Array.isArray(record.componentRefs) ? record.componentRefs : []) {
+      if (!ref.owner || ref.owner === ref.component) continue;
+      const localTarget = componentByModuleAndName.get(componentKey(record.rel, ref.component));
+      const importedTarget = localTarget || importedBindingComponentTarget(record, graph, componentByModuleAndName, ref.component);
+      edges.push({
+        sourceModulePath: record.rel,
+        sourceComponent: ref.owner,
+        targetModulePath: importedTarget?.modulePath || null,
+        targetComponent: importedTarget?.name || ref.component,
+        kind: ref.sourceKind || 'jsx-element',
+        line: ref.line,
+        resolved: Boolean(importedTarget || localTarget),
+      });
+    }
+  }
+  return uniqueRecords(edges, (edge) => [
+    edge.sourceModulePath,
+    edge.sourceComponent,
+    edge.targetModulePath || '',
+    edge.targetComponent,
+    edge.kind,
+    edge.line,
+  ].join('\u0000')).sort((a, b) => compareLocale(a.sourceModulePath, b.sourceModulePath)
+    || compareLocale(a.sourceComponent, b.sourceComponent)
+    || compareLocale(a.targetModulePath || '', b.targetModulePath || '')
+    || compareLocale(a.targetComponent, b.targetComponent)
+    || a.line - b.line);
+}
+
+function buildRoutes(graph) {
+  return moduleRecords(graph)
+    .flatMap((record) => (Array.isArray(record.routes) ? record.routes : [])
+      .map((route) => ({
+        ...route,
+        modulePath: record.rel,
+        reachable: Boolean(record.reachable),
+      })))
+    .sort((a, b) => compareLocale(a.path, b.path)
+      || compareLocale(a.modulePath, b.modulePath)
+      || compareLocale(a.component, b.component)
+      || a.line - b.line);
+}
+
+function buildBrowserApis(graph) {
+  return moduleRecords(graph)
+    .flatMap((record) => (Array.isArray(record.browserApis) ? record.browserApis : [])
+      .map((api) => ({
+        ...api,
+        modulePath: record.rel,
+        reachable: Boolean(record.reachable),
+      })))
+    .sort((a, b) => compareLocale(a.api, b.api)
+      || compareLocale(a.modulePath, b.modulePath)
+      || a.line - b.line);
+}
+
+function buildCommonJsSyntax(graph) {
+  return moduleRecords(graph)
+    .flatMap((record) => (Array.isArray(record.commonJsRefs) ? record.commonJsRefs : [])
+      .map((ref) => ({
+        ...ref,
+        modulePath: record.rel,
+        reachable: Boolean(record.reachable),
+      })))
+    .sort((a, b) => compareLocale(a.modulePath, b.modulePath)
+      || a.line - b.line
+      || compareLocale(a.kind, b.kind));
+}
+
+function assetRecordForRef(record, ref) {
+  return {
+    sourceModulePath: record.rel,
+    specifier: ref.specifier,
+    path: ref.assetRel || ref.localRel || null,
+    kind: ref.kind === 'worker' ? 'worker' : ref.assetKind || 'unknown',
+    loadKind: ref.kind,
+    resolved: ref.resolution === 'asset' || (ref.kind === 'worker' && ref.resolution === 'local'),
+  };
+}
+
+function buildAssets(graph) {
+  return uniqueRecords(moduleRecords(graph)
+    .flatMap((record) => (Array.isArray(record.importRefs) ? record.importRefs : [])
+      .filter((ref) => ref.resolution === 'asset' || ref.kind === 'worker')
+      .map((ref) => assetRecordForRef(record, ref))), (asset) => [
+      asset.sourceModulePath,
+      asset.specifier,
+      asset.path || '',
+      asset.loadKind,
+    ].join('\u0000'))
+    .sort((a, b) => compareLocale(a.sourceModulePath, b.sourceModulePath)
+      || compareLocale(a.path || '', b.path || '')
+      || compareLocale(a.specifier, b.specifier));
+}
+
+function buildLazyBoundaries(graph) {
+  return uniqueRecords(moduleRecords(graph)
+    .flatMap((record) => (Array.isArray(record.importRefs) ? record.importRefs : [])
+      .filter((ref) => ['lazy', 'dynamic', 'worker'].includes(ref.kind))
+      .map((ref) => ({
+        sourceModulePath: record.rel,
+        targetModulePath: ref.localRel || null,
+        specifier: ref.specifier,
+        kind: ref.kind === 'worker' ? 'worker' : ref.kind === 'lazy' ? 'react-lazy' : 'dynamic-import',
+        resolved: ref.resolution === 'local',
+      }))), (boundary) => [
+      boundary.sourceModulePath,
+      boundary.targetModulePath || '',
+      boundary.specifier,
+      boundary.kind,
+    ].join('\u0000'))
+    .sort((a, b) => compareLocale(a.sourceModulePath, b.sourceModulePath)
+      || compareLocale(a.targetModulePath || '', b.targetModulePath || '')
+      || compareLocale(a.specifier, b.specifier));
+}
+
+function buildRemoteImports(graph) {
+  return moduleRecords(graph)
+    .flatMap((record) => (Array.isArray(record.importRefs) ? record.importRefs : [])
+      .filter((ref) => ref.resolution === 'remote')
+      .map((ref) => ({
+        sourceModulePath: record.rel,
+        specifier: ref.specifier,
+        loadKind: ref.kind,
+      })))
+    .sort((a, b) => compareLocale(a.sourceModulePath, b.sourceModulePath)
+      || compareLocale(a.specifier, b.specifier));
+}
+
+function buildUnresolvedImports(graph) {
+  return moduleRecords(graph)
+    .flatMap((record) => (Array.isArray(record.importRefs) ? record.importRefs : [])
+      .filter((ref) => ref.resolution === 'unresolved')
+      .map((ref) => ({
+        sourceModulePath: record.rel,
+        specifier: ref.specifier,
+        loadKind: ref.kind,
+        unresolvedReason: ref.unresolvedReason || 'not_found',
+      })))
+    .sort((a, b) => compareLocale(a.sourceModulePath, b.sourceModulePath)
+      || compareLocale(a.specifier, b.specifier));
+}
+
+function buildBrowserIncompatibleImports(graph) {
+  return moduleRecords(graph)
+    .flatMap((record) => (Array.isArray(record.importRefs) ? record.importRefs : [])
+      .filter((ref) => ref.resolution === 'browser-incompatible')
+      .map((ref) => ({
+        sourceModulePath: record.rel,
+        specifier: ref.specifier,
+        nodeBuiltin: ref.nodeBuiltin || nodeBuiltinSpecifier(ref.specifier),
+        loadKind: ref.kind,
+      })))
+    .sort((a, b) => compareLocale(a.sourceModulePath, b.sourceModulePath)
+      || compareLocale(a.specifier, b.specifier));
+}
+
+function frontEndFindings({ unresolvedImports, browserIncompatibleImports, remoteImports, commonJsSyntax }) {
+  return [
+    ...browserIncompatibleImports.map((item) => ({
+      id: compactStableId('finding', ['browser-incompatible-import', item.sourceModulePath, item.specifier]),
+      ruleId: 'IRONG_FRONTEND_NODE_IMPORT',
+      severity: 'error',
+      message: `Browser-reachable module imports Node builtin "${item.specifier}".`,
+      modulePath: item.sourceModulePath,
+      evidence: item,
+    })),
+    ...unresolvedImports.map((item) => ({
+      id: compactStableId('finding', ['unresolved-import', item.sourceModulePath, item.specifier, item.loadKind]),
+      ruleId: 'IRONG_UNRESOLVED_IMPORT',
+      severity: 'error',
+      message: `Browser entry has unresolved import "${item.specifier}".`,
+      modulePath: item.sourceModulePath,
+      evidence: item,
+    })),
+    ...remoteImports.map((item) => ({
+      id: compactStableId('finding', ['remote-import', item.sourceModulePath, item.specifier, item.loadKind]),
+      ruleId: 'IRONG_REMOTE_IMPORT',
+      severity: 'warning',
+      message: `Browser entry uses remote import "${item.specifier}".`,
+      modulePath: item.sourceModulePath,
+      evidence: item,
+    })),
+    ...commonJsSyntax.map((item) => ({
+      id: compactStableId('finding', ['commonjs-syntax', item.modulePath, item.kind, item.line]),
+      ruleId: 'IRONG_UNSUPPORTED_COMMONJS',
+      severity: 'error',
+      message: `Browser module contains unsupported CommonJS ${item.kind}.`,
+      modulePath: item.modulePath,
+      evidence: item,
+    })),
+  ].sort((a, b) => compareLocale(a.severity, b.severity)
+    || compareLocale(a.ruleId, b.ruleId)
+    || compareLocale(a.modulePath, b.modulePath)
+    || compareLocale(a.id, b.id));
+}
+
+function filterGraphToReachable(graph) {
+  const reachableModules = new Map(moduleRecords(graph, { reachableOnly: true }).map((record) => [record.rel, record]));
+  const externals = new Set();
+  for (const record of reachableModules.values()) {
+    record.localDeps = record.localDeps.filter((dep) => reachableModules.has(dep));
+    for (const external of record.externalDeps) externals.add(external);
+  }
+  graph.modules = reachableModules;
+  graph.externals = externals;
+  graph.reachableModules = new Set(reachableModules.keys());
+}
+
+function entryModuleDiscoveryRoot(moduleRel) {
+  const rel = normalizeExclude(moduleRel);
+  if (!rel) return '';
+  const parts = rel.split('/').filter(Boolean);
+  if (parts.length > 1 && ['src', 'app', 'client', 'frontend', 'web', 'public'].includes(parts[0])) return parts[0];
+  const dir = path.posix.dirname(rel);
+  return dir === '.' ? '' : dir;
+}
+
+function includeUnreachableDiscoveryRoots({ sourceRoot, entryModules }) {
+  const normalizedSourceRoot = normalizeExclude(sourceRoot);
+  if (normalizedSourceRoot && normalizedSourceRoot !== '.') return [normalizedSourceRoot];
+  const roots = Array.from(new Set((Array.isArray(entryModules) ? entryModules : [])
+    .map((entryModule) => entryModuleDiscoveryRoot(entryModule.rel))
+    .filter((root) => root)));
+  return roots.length > 0 ? roots.sort(compareLocale) : [''];
+}
+
+async function moduleEntriesForHtmlEntry({ rootDir, htmlEntry, routeAliases }) {
+  const html = await fs.readFile(htmlEntry.filePath, 'utf8');
+  const parsed = parseHtmlEntry(html);
+  const entryDir = path.posix.dirname(htmlEntry.rel);
+  const resolvedEntries = [];
+  for (const src of parsed.moduleScriptSrcs) {
+    const resolved = await resolveImport({
+      rootDir,
+      specifier: src,
+      importerRel: htmlEntry.rel,
+      aliases: parsed.importAliases,
+      routeAliases,
+    }) || await resolveBrowserPathFromRoot(rootDir, path.posix.normalize(path.posix.join(entryDir, src)));
+    if (resolved?.kind === 'module') resolvedEntries.push(resolved);
+  }
+  if (resolvedEntries.length === 0) {
+    throw new Error(`HTML entry ${htmlEntry.rel} does not contain a resolvable <script type="module" src="...">.`);
+  }
+  return {
+    aliases: parsed.importAliases,
+    entries: uniqueRecords(resolvedEntries, (item) => item.rel).sort((a, b) => compareLocale(a.rel, b.rel)),
+  };
+}
+
+export async function analyzeProject({
+  rootDir,
+  entry,
+  moduleLimit = DEFAULT_MODULE_LIMIT,
+  routeAliases = [],
+  aliases: explicitAliases = [],
+  framework = DEFAULT_FRAMEWORK,
+  sourceRoot = '',
+  includeUnreachable = false,
+  exclude = [],
+} = {}) {
+  const effectiveModuleLimit = normalizeModuleLimit(moduleLimit);
+  const effectiveFramework = normalizeFramework(framework);
+  const requestedRoot = path.resolve(normalizeString(rootDir).trim() || '.');
+  const normalizedSourceRoot = normalizeRouteAliasTarget(sourceRoot);
+  const resolvedSourceRoot = normalizedSourceRoot
+    ? path.resolve(requestedRoot, normalizedSourceRoot)
+    : requestedRoot;
+  if (!isWithinPath(requestedRoot, resolvedSourceRoot)) {
+    throw new Error('--source-root must stay inside the project root.');
+  }
   const resolvedRouteAliases = [
     ...normalizeRouteAliases(routeAliases),
     ...DEFAULT_ROUTE_ALIASES,
   ];
-  const discoveredModules = await discoverAnalyzableModules(resolvedRoot, moduleLimit);
-  const discoveredByRel = new Map(discoveredModules.map((module) => [module.rel, module]));
-  if (!discoveredByRel.has(resolvedEntry.rel)) {
-    discoveredByRel.set(resolvedEntry.rel, resolvedEntry);
-    if (discoveredByRel.size > moduleLimit) {
-      throw new Error(`Module limit exceeded (${moduleLimit}).`);
+  let resolvedEntry = await resolveEntry(requestedRoot, entry);
+  let htmlEntry = null;
+  if (resolvedEntry.kind === 'html') {
+    try {
+      htmlEntry = await moduleEntriesForHtmlEntry({ rootDir: requestedRoot, htmlEntry: resolvedEntry, routeAliases: resolvedRouteAliases });
+    } catch (error) {
+      if (normalizeString(entry).trim()) throw error;
+      resolvedEntry = await resolveEntry(requestedRoot, entry, { allowHtml: false });
     }
   }
-  const discoveredRelSet = new Set(discoveredByRel.keys());
+  const entryModules = htmlEntry
+    ? htmlEntry.entries
+    : [resolvedEntry];
+  const aliases = mergeAliasMaps(
+    await loadImportAliases(requestedRoot, resolvedEntry.rel),
+    htmlEntry?.aliases || new Map(),
+    normalizeImportAliases(explicitAliases),
+  );
+  const normalizedExcludes = normalizeExcludes(exclude);
+  for (const entryModule of entryModules) {
+    if (!isAnalyzableModulePath(entryModule.rel)) {
+      throw new Error(`Entry ${entryModule.rel} is not a browser JavaScript module (.js, .jsx, .mjs).`);
+    }
+    if (pathMatchesExclude(entryModule.rel, normalizedExcludes)) {
+      throw new Error(`Entry ${entryModule.rel} is excluded from analysis.`);
+    }
+  }
+  const astContext = createJavaScriptAstAnalysisContext();
   const modules = new Map();
+  const queuedModules = new Map();
   const externals = new Set();
 
-  for (const current of Array.from(discoveredByRel.values()).sort((a, b) => compareLocale(a.rel, b.rel))) {
+  const enqueueModule = (module) => {
+    if (!module?.rel || modules.has(module.rel) || queuedModules.has(module.rel)) return;
+    if (pathMatchesExclude(module.rel, normalizedExcludes)) return;
+    if (modules.size + queuedModules.size >= effectiveModuleLimit) {
+      throw new Error(`Module limit exceeded (${effectiveModuleLimit}).`);
+    }
+    queuedModules.set(module.rel, module);
+  };
+
+  const analyzeModule = async (current, {
+    enqueueReachableImports = false,
+    allowedUnreachableModules = null,
+  } = {}) => {
+    if (modules.has(current.rel)) return;
+    if (modules.size >= effectiveModuleLimit) {
+      throw new Error(`Module limit exceeded (${effectiveModuleLimit}).`);
+    }
     const source = await fs.readFile(current.filePath, 'utf8');
-    const importRefs = extractImportRefs(source);
+    const ast = astContext.analyzeFile(current.filePath, source);
+    const importRefs = ast.importRefs;
     const localDeps = [];
     const externalDeps = [];
     const normalizedImportRefs = [];
 
     for (const ref of importRefs) {
+      const nodeBuiltin = nodeBuiltinSpecifier(ref.specifier);
+      if (nodeBuiltin) {
+        normalizedImportRefs.push({
+          ...ref,
+          localRel: null,
+          resolution: 'browser-incompatible',
+          unresolvedReason: 'node_builtin',
+          nodeBuiltin,
+        });
+        continue;
+      }
+
+      if (isRemoteSpecifier(ref.specifier)) {
+        normalizedImportRefs.push({
+          ...ref,
+          localRel: null,
+          resolution: 'remote',
+          unresolvedReason: null,
+        });
+        continue;
+      }
+
+      const remoteAliasTarget = remoteAliasTargetForSpecifier(ref.specifier, aliases);
+      if (remoteAliasTarget) {
+        normalizedImportRefs.push({
+          ...ref,
+          localRel: null,
+          remoteUrl: remoteAliasTarget,
+          resolution: 'remote',
+          unresolvedReason: null,
+        });
+        continue;
+      }
+
       const local = await resolveImport({
-        rootDir: resolvedRoot,
+        rootDir: requestedRoot,
         specifier: ref.specifier,
         importerRel: current.rel,
         aliases,
         routeAliases: resolvedRouteAliases,
       });
-      if (local && discoveredRelSet.has(local.rel)) {
+      const localModuleAllowed = local?.kind === 'module'
+        && !pathMatchesExclude(local.rel, normalizedExcludes)
+        && (enqueueReachableImports || !allowedUnreachableModules || modules.has(local.rel) || allowedUnreachableModules.has(local.rel));
+      if (localModuleAllowed) {
         localDeps.push(local.rel);
         normalizedImportRefs.push({
           ...ref,
           localRel: local.rel,
           resolution: 'local',
           unresolvedReason: null,
+        });
+        if (enqueueReachableImports) enqueueModule(local);
+      } else if (local?.kind === 'asset') {
+        normalizedImportRefs.push({
+          ...ref,
+          localRel: null,
+          assetRel: local.rel,
+          assetKind: local.assetKind || 'unknown',
+          resolution: 'asset',
+          unresolvedReason: null,
+        });
+      } else if (local?.kind === 'unsupported-module') {
+        normalizedImportRefs.push({
+          ...ref,
+          localRel: null,
+          resolution: 'unresolved',
+          unresolvedReason: `unsupported_module_type${local.unsupportedExtension ? `:${local.unsupportedExtension}` : ''}`,
         });
       } else if (importSpecifierLooksLocal(ref.specifier, aliases, resolvedRouteAliases)) {
         normalizedImportRefs.push({
@@ -3872,25 +4501,63 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
       rel: current.rel,
       source,
       stats: scriptStats(current.rel, source),
-      declarationSpans: extractDeclarationSpans(source),
+      declarationSpans: ast.declarationSpans,
+      typeOnlyRanges: ast.typeOnlyRanges,
+      components: ast.components,
+      componentRefs: ast.componentRefs,
+      routes: effectiveFramework === 'vanilla' ? [] : ast.routes,
+      browserApis: ast.browserApis,
+      commonJsRefs: ast.commonJsRefs,
       importRefs: normalizedImportRefs,
       localDeps: Array.from(new Set(localDeps)).sort(compareLocale),
       externalDeps: Array.from(new Set(externalDeps)).sort(compareLocale),
     });
+  };
+
+  for (const entryModule of entryModules) enqueueModule(entryModule);
+  while (queuedModules.size > 0) {
+    const [rel, current] = Array.from(queuedModules).sort(([left], [right]) => compareLocale(left, right))[0];
+    queuedModules.delete(rel);
+    await analyzeModule(current, { enqueueReachableImports: true });
   }
 
-  const reachableModules = buildReachableModuleSet(modules, resolvedEntry.rel);
+  if (includeUnreachable) {
+    const discoveryRoots = includeUnreachableDiscoveryRoots({
+      sourceRoot: normalizedSourceRoot,
+      entryModules,
+    });
+    const discoveredModules = await discoverAnalyzableModules(
+      requestedRoot,
+      effectiveModuleLimit,
+      normalizedExcludes,
+      discoveryRoots,
+    );
+    const allowedUnreachableModules = new Set(discoveredModules.map((module) => module.rel));
+    for (const current of discoveredModules) {
+      await analyzeModule(current, { allowedUnreachableModules });
+    }
+  }
+
+  const reachableModules = new Set();
+  for (const entryModule of entryModules) {
+    for (const rel of buildReachableModuleSet(modules, entryModule.rel)) reachableModules.add(rel);
+  }
   for (const record of modules.values()) {
     record.reachable = reachableModules.has(record.rel);
   }
 
   const graph = {
-    rootDir: resolvedRoot,
+    rootDir: requestedRoot,
+    projectRoot: requestedRoot,
+    sourceRoot: normalizedSourceRoot || '.',
     entryRel: resolvedEntry.rel,
+    entryKind: resolvedEntry.kind,
+    entryModuleRels: entryModules.map((module) => module.rel).sort(compareLocale),
     modules,
     reachableModules,
     externals,
   };
+  if (!includeUnreachable) filterGraphToReachable(graph);
 
   const jsScripts = moduleRecords(graph)
     .map((record) => ({ ...record.stats, reachable: Boolean(record.reachable) }))
@@ -3919,10 +4586,28 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
   );
   const treeText = buildTreeText(graph);
   const jsxTreeText = buildJsxTreeText(reachableJsxScripts);
+  const components = buildComponents(graph);
+  const componentEdges = buildComponentRenderEdges(graph, components);
+  const routes = buildRoutes(graph);
+  const browserApis = buildBrowserApis(graph);
+  const commonJsSyntax = buildCommonJsSyntax(graph);
+  const assets = buildAssets(graph);
+  const lazyBoundaries = buildLazyBoundaries(graph);
+  const remoteImports = buildRemoteImports(graph);
+  const unresolvedImports = buildUnresolvedImports(graph);
+  const browserIncompatibleImports = buildBrowserIncompatibleImports(graph);
+  const findings = frontEndFindings({
+    unresolvedImports,
+    browserIncompatibleImports,
+    remoteImports,
+    commonJsSyntax,
+  });
 
   return {
-    rootDir: resolvedRoot,
+    rootDir: requestedRoot,
     entryRel: resolvedEntry.rel,
+    entryKind: resolvedEntry.kind,
+    entryModules: graph.entryModuleRels,
     graph,
     treeText,
     jsxTreeText,
@@ -3930,8 +4615,35 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
     jsxScripts,
     mermaid,
     importEdges,
+    components,
+    componentEdges,
+    routes,
+    lazyBoundaries,
+    assets,
+    browserApis,
+    remoteImports,
+    unresolvedImports,
+    browserIncompatibleImports,
+    commonJsSyntax,
+    findings,
     sourceCode,
     functionDependencyMap,
+    metadata: {
+      analyzer: {
+        ...astContext.analyzer,
+      },
+      backend: {
+        ...astContext.analyzer,
+      },
+      framework: effectiveFramework,
+      includeUnreachable: Boolean(includeUnreachable),
+      excludes: normalizedExcludes,
+      aliases: Array.from(aliases, ([from, to]) => ({ from, to })).sort((a, b) => compareLocale(a.from, b.from)),
+      moduleLimit: {
+        limit: effectiveModuleLimit,
+        count: modules.size,
+      },
+    },
     summary: {
       moduleCount: modules.size,
       reachableModuleCount: reachableModules.size,
@@ -3941,7 +4653,17 @@ export async function analyzeProject({ rootDir, entry, moduleLimit = 500, routeA
       reachableJsxFileCount: reachableJsxScripts.length,
       jsScriptCount: jsScripts.length,
       reachableJsScriptCount: reachableJsScripts.length,
-      externalCount: externals.size,
+      externalCount: graph.externals.size,
+      componentCount: components.length,
+      componentEdgeCount: componentEdges.length,
+      routeCount: routes.length,
+      lazyBoundaryCount: lazyBoundaries.length,
+      assetCount: assets.length,
+      browserApiCount: browserApis.length,
+      remoteImportCount: remoteImports.length,
+      unresolvedImportCount: unresolvedImports.length,
+      browserIncompatibleImportCount: browserIncompatibleImports.length,
+      findingCount: findings.length,
     },
   };
 }

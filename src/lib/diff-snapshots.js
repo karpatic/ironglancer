@@ -5,6 +5,7 @@ import { compareLocale, normalizeString } from './utils.js';
 
 export const DIFF_SCHEMA_VERSION = '1.1.0';
 export const SUPPORTED_SNAPSHOT_SCHEMA_VERSION = '1.2.0';
+export const FINDING_IDENTITY_VERSION = '2';
 
 const STATIC_LIMITATIONS = [
   'IronGlancer diffs compare saved static-analysis snapshots; they do not execute code or claim runtime behavior.',
@@ -24,16 +25,72 @@ const SEVERITY_ORDER = new Map([
 ]);
 
 const RULE_ORDER = new Map([
-  ['IRONG_DIFF_EXPORT_REMOVED', 0],
-  ['IRONG_DIFF_EXPORT_NARROWED', 1],
-  ['IRONG_DIFF_REACHABILITY_REGRESSION', 2],
-  ['IRONG_DIFF_MODULE_CYCLE_ADDED', 3],
-  ['IRONG_DIFF_FUNCTION_CYCLE_ADDED', 4],
-  ['IRONG_DIFF_CROSS_FILE_EDGE_ADDED', 5],
-  ['IRONG_DIFF_FAN_INCREASE', 6],
+  ['IRONG_DIFF_BROWSER_INCOMPATIBLE_IMPORT_ADDED', 0],
+  ['IRONG_DIFF_UNRESOLVED_IMPORT_ADDED', 1],
+  ['IRONG_DIFF_ROUTE_REMOVED', 2],
+  ['IRONG_DIFF_LAZY_BOUNDARY_CHANGED', 3],
+  ['IRONG_DIFF_ENTRY_GROWTH', 4],
+  ['IRONG_DIFF_COMPONENT_CYCLE_ADDED', 5],
+  ['IRONG_DIFF_BROWSER_API_ADDED', 6],
+  ['IRONG_DIFF_REMOTE_IMPORT_ADDED', 7],
+  ['IRONG_DIFF_EXPORT_REMOVED', 20],
+  ['IRONG_DIFF_EXPORT_NARROWED', 21],
+  ['IRONG_DIFF_REACHABILITY_REGRESSION', 22],
+  ['IRONG_DIFF_MODULE_CYCLE_ADDED', 23],
+  ['IRONG_DIFF_FUNCTION_CYCLE_ADDED', 24],
+  ['IRONG_DIFF_CROSS_FILE_EDGE_ADDED', 25],
+  ['IRONG_DIFF_FAN_INCREASE', 26],
 ]);
 
 const RULE_DEFINITIONS = [
+  {
+    id: 'IRONG_DIFF_BROWSER_INCOMPATIBLE_IMPORT_ADDED',
+    name: 'Browser-incompatible Node builtin import added',
+    shortDescription: 'A reachable browser module added a Node builtin import.',
+    help: 'Review browser entry reachability and bundler polyfill assumptions. IronGlancer reports static import evidence only.',
+  },
+  {
+    id: 'IRONG_DIFF_UNRESOLVED_IMPORT_ADDED',
+    name: 'Unresolved browser import added',
+    shortDescription: 'A reachable browser module added an unresolved local import.',
+    help: 'Review aliases, import maps, root-relative routes, and file moves for this static import.',
+  },
+  {
+    id: 'IRONG_DIFF_ROUTE_REMOVED',
+    name: 'Route removed',
+    shortDescription: 'A route adapter record disappeared.',
+    help: 'Review route table changes. IronGlancer reports static adapter evidence and does not execute a router.',
+  },
+  {
+    id: 'IRONG_DIFF_LAZY_BOUNDARY_CHANGED',
+    name: 'Lazy boundary changed',
+    shortDescription: 'A lazy boundary was added or removed.',
+    help: 'Review dynamic import, React.lazy, and worker boundary changes as structural loading changes only.',
+  },
+  {
+    id: 'IRONG_DIFF_ENTRY_GROWTH',
+    name: 'Entry module growth',
+    shortDescription: 'Reachable browser entry size grew materially.',
+    help: 'Review reachable module count and line count changes from the configured browser entry. This is structural size evidence, not performance impact.',
+  },
+  {
+    id: 'IRONG_DIFF_COMPONENT_CYCLE_ADDED',
+    name: 'Component cycle added',
+    shortDescription: 'A new JSX render cycle appeared between component-shaped declarations.',
+    help: 'Component cycles are computed from saved JSX render edges and do not prove runtime render recursion.',
+  },
+  {
+    id: 'IRONG_DIFF_BROWSER_API_ADDED',
+    name: 'Browser API added',
+    shortDescription: 'A reachable module added a browser global/API reference.',
+    help: 'Review added browser API touchpoints as static source evidence.',
+  },
+  {
+    id: 'IRONG_DIFF_REMOTE_IMPORT_ADDED',
+    name: 'Remote import added',
+    shortDescription: 'A reachable browser module added a remote import.',
+    help: 'Review remote import policy and import-map changes. IronGlancer reports static import specifiers only.',
+  },
   {
     id: 'IRONG_DIFF_EXPORT_REMOVED',
     name: 'Exported function removed',
@@ -81,6 +138,13 @@ const RULE_DEFINITIONS = [
 const ENTITY_ORDER = new Map([
   ['module', 0],
   ['function', 1],
+  ['browser-incompatible-import', 2],
+  ['unresolved-import', 3],
+  ['remote-import', 4],
+  ['route', 5],
+  ['lazy-boundary', 6],
+  ['component-cycle', 7],
+  ['browser-api', 8],
 ]);
 
 export class SnapshotDiffError extends Error {
@@ -311,7 +375,12 @@ function normalizeModule(module = {}) {
     isJsx: Boolean(module.isJsx),
     localDependencies: uniqueSortedStrings(module.localDependencies),
     externalDependencies: uniqueSortedStrings(module.externalDependencies),
-    importRefs: Array.isArray(module.importRefs) ? module.importRefs : [],
+    importRefs: Array.isArray(module.importRefs) ? module.importRefs.map((ref) => ({
+      ...ref,
+      resolution: ['local', 'asset', 'external', 'remote', 'browser-incompatible', 'unresolved'].includes(ref?.resolution)
+        ? ref.resolution
+        : ref?.resolution,
+    })) : [],
   };
 }
 
@@ -391,6 +460,27 @@ function normalizeFunctionEdge(edge = {}) {
   };
 }
 
+function normalizeFrontEndRecord(record = {}) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return null;
+  const normalized = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (typeof value === 'string') normalized[key] = normalizeString(value).trim();
+    else if (typeof value === 'number' || typeof value === 'boolean' || value == null) normalized[key] = value;
+    else if (Array.isArray(value)) normalized[key] = value.map((item) => (
+      typeof item === 'string' ? normalizeString(item).trim() : item
+    ));
+    else if (typeof value === 'object') normalized[key] = normalizeFrontEndRecord(value);
+  }
+  return normalized;
+}
+
+function normalizeFrontEndRecords(value) {
+  return Array.isArray(value)
+    ? value.map(normalizeFrontEndRecord).filter(Boolean)
+      .sort((a, b) => compareLocale(stableJson(a), stableJson(b)))
+    : [];
+}
+
 function normalizeSnapshot(rawSnapshot, role) {
   if (!rawSnapshot || typeof rawSnapshot !== 'object' || Array.isArray(rawSnapshot)) {
     throw new SnapshotDiffError(`${role} snapshot must be a JSON object.`, 'malformed_snapshot');
@@ -464,11 +554,20 @@ function normalizeSnapshot(rawSnapshot, role) {
       generatedAt: normalizeString(meta.generatedAt).trim() || null,
       buildId: normalizeString(meta.buildId).trim() || null,
       gitCommit: normalizeString(meta.gitCommit).trim() || null,
+      analysis: meta.analysis && typeof meta.analysis === 'object' ? meta.analysis : null,
     },
     modules,
     functions,
     functionEdges,
     importEdges,
+    components: normalizeFrontEndRecords(rawSnapshot.components),
+    componentEdges: normalizeFrontEndRecords(rawSnapshot.componentEdges),
+    routes: normalizeFrontEndRecords(rawSnapshot.routes),
+    lazyBoundaries: normalizeFrontEndRecords(rawSnapshot.lazyBoundaries),
+    browserApis: normalizeFrontEndRecords(rawSnapshot.browserApis),
+    remoteImports: normalizeFrontEndRecords(rawSnapshot.remoteImports),
+    unresolvedImports: normalizeFrontEndRecords(rawSnapshot.unresolvedImports),
+    browserIncompatibleImports: normalizeFrontEndRecords(rawSnapshot.browserIncompatibleImports),
     limitations: uniqueSortedStrings(STATIC_LIMITATIONS),
   };
 }
@@ -481,6 +580,7 @@ function snapshotIdentity(snapshot, label) {
     generatedAt: snapshot.meta.generatedAt,
     buildId: snapshot.meta.buildId,
     gitCommit: snapshot.meta.gitCommit,
+    analysis: snapshot.meta.analysis || null,
   };
 }
 
@@ -911,9 +1011,16 @@ function relativeLocation(pathValue, startLine = null, endLine = null) {
   };
 }
 
-function createFinding({ ruleId, severity, confidence, message, evidence, location }) {
+function createFinding({ ruleId, semanticIdentity, severity, confidence, message, evidence, location }) {
+  const identity = {
+    version: FINDING_IDENTITY_VERSION,
+    ruleId,
+    ...semanticIdentity,
+  };
   return {
-    id: `finding_${stableHash({ ruleId, evidence, location })}`,
+    id: `finding_v${FINDING_IDENTITY_VERSION}_${stableHash(identity)}`,
+    identityVersion: FINDING_IDENTITY_VERSION,
+    identity,
     ruleId,
     severity,
     confidence,
@@ -938,6 +1045,12 @@ function exportFindings(functions) {
     if (!isPublicFunction(removed)) continue;
     findings.push(createFinding({
       ruleId: 'IRONG_DIFF_EXPORT_REMOVED',
+      semanticIdentity: {
+        entityType: 'function',
+        functionStableId: removed.stableId,
+        modulePath: removed.modulePath,
+        name: removed.name,
+      },
       severity: 'error',
       confidence: 'high',
       message: `Exported function ${removed.name} was removed from the static public surface.`,
@@ -965,6 +1078,12 @@ function exportFindings(functions) {
     }
     findings.push(createFinding({
       ruleId: 'IRONG_DIFF_EXPORT_NARROWED',
+      semanticIdentity: {
+        entityType: 'function',
+        functionStableId: change.base.stableId,
+        modulePath: change.base.modulePath,
+        name: change.base.name,
+      },
       severity: 'error',
       confidence: 'high',
       message: `Export surface for ${change.base.name} was narrowed in the static snapshot.`,
@@ -1000,6 +1119,10 @@ function reachabilityFindings(modules, functions) {
     if (change.base.reachable !== true || change.head.reachable !== false) continue;
     findings.push(createFinding({
       ruleId: 'IRONG_DIFF_REACHABILITY_REGRESSION',
+      semanticIdentity: {
+        entityType: 'module',
+        path: change.base.path,
+      },
       severity: 'warning',
       confidence: 'high',
       message: `Reachable module ${change.base.path} became unreachable in the static snapshot.`,
@@ -1016,6 +1139,12 @@ function reachabilityFindings(modules, functions) {
     if (change.base.reachable !== true || change.head.reachable !== false) continue;
     findings.push(createFinding({
       ruleId: 'IRONG_DIFF_REACHABILITY_REGRESSION',
+      semanticIdentity: {
+        entityType: 'function',
+        functionStableId: change.base.stableId,
+        modulePath: change.base.modulePath,
+        name: change.base.name,
+      },
       severity: 'warning',
       confidence: 'high',
       message: `Reachable function ${change.base.name} became unreachable in the static snapshot.`,
@@ -1156,6 +1285,10 @@ function cycleFindings(base, head, functions) {
     if (baseModuleCycleKeys.has(cycle.key)) continue;
     findings.push(createFinding({
       ruleId: 'IRONG_DIFF_MODULE_CYCLE_ADDED',
+      semanticIdentity: {
+        entityType: 'module-cycle',
+        members: cycle.members,
+      },
       severity: 'warning',
       confidence: 'high',
       message: `New module dependency cycle: ${cycle.members.join(' -> ')}.`,
@@ -1180,6 +1313,10 @@ function cycleFindings(base, head, functions) {
     const firstMember = cycle.members[0] || '';
     findings.push(createFinding({
       ruleId: 'IRONG_DIFF_FUNCTION_CYCLE_ADDED',
+      semanticIdentity: {
+        entityType: 'function-cycle',
+        members: cycle.members,
+      },
       severity: 'warning',
       confidence: 'high',
       message: `New function dependency cycle: ${cycle.members.join(' -> ')}.`,
@@ -1199,6 +1336,17 @@ function crossFileEdgeFindings(edges) {
       && edgeInfo.source.modulePath !== edgeInfo.target.modulePath)
     .map((edgeInfo) => createFinding({
       ruleId: 'IRONG_DIFF_CROSS_FILE_EDGE_ADDED',
+      semanticIdentity: {
+        entityType: 'function-edge',
+        sourceStableId: edgeInfo.source.stableId,
+        sourceModulePath: edgeInfo.source.modulePath,
+        sourceName: edgeInfo.source.name,
+        targetStableId: edgeInfo.target.stableId,
+        targetModulePath: edgeInfo.target.modulePath,
+        targetName: edgeInfo.target.name,
+        scope: edgeInfo.scope,
+        import: edgeInfo.import ? edgeImportIdentity(edgeInfo) : '',
+      },
       severity: 'note',
       confidence: 'medium',
       message: `New cross-file static function edge from ${edgeInfo.source.name} to ${edgeInfo.target.name}.`,
@@ -1250,6 +1398,13 @@ function fanIncreaseFindings(base, head, functions) {
       if (!isMaterialFanIncrease(baseCount, headCount)) continue;
       findings.push(createFinding({
         ruleId: 'IRONG_DIFF_FAN_INCREASE',
+        semanticIdentity: {
+          entityType: 'function',
+          functionStableId: match.head.stableId,
+          modulePath: match.head.modulePath,
+          name: match.head.name,
+          metric,
+        },
         severity: 'warning',
         confidence: 'medium',
         message: `${metric} for ${match.head.name} materially increased in the static function graph.`,
@@ -1275,6 +1430,216 @@ function fanIncreaseFindings(base, head, functions) {
   return findings;
 }
 
+function frontEndRecordKey(record, fields) {
+  return fields.map((field) => normalizeString(record?.[field]).trim()).join('\u0000');
+}
+
+function addedFrontEndRecords(baseRecords, headRecords, fields) {
+  const baseKeys = new Set(baseRecords.map((record) => frontEndRecordKey(record, fields)));
+  return headRecords.filter((record) => !baseKeys.has(frontEndRecordKey(record, fields)));
+}
+
+function removedFrontEndRecords(baseRecords, headRecords, fields) {
+  const headKeys = new Set(headRecords.map((record) => frontEndRecordKey(record, fields)));
+  return baseRecords.filter((record) => !headKeys.has(frontEndRecordKey(record, fields)));
+}
+
+function frontEndImportFindings(base, head) {
+  return [
+    ...addedFrontEndRecords(
+      base.browserIncompatibleImports,
+      head.browserIncompatibleImports,
+      ['sourceModulePath', 'specifier', 'loadKind'],
+    ).map((item) => createFinding({
+      ruleId: 'IRONG_DIFF_BROWSER_INCOMPATIBLE_IMPORT_ADDED',
+      semanticIdentity: {
+        entityType: 'browser-incompatible-import',
+        sourceModulePath: item.sourceModulePath,
+        specifier: item.specifier,
+        loadKind: item.loadKind,
+      },
+      severity: 'error',
+      confidence: 'high',
+      message: `Browser-incompatible Node builtin import "${item.specifier}" was added to reachable browser module ${item.sourceModulePath}.`,
+      evidence: { entityType: 'browser-incompatible-import', import: item },
+      location: relativeLocation(item.sourceModulePath),
+    })),
+    ...addedFrontEndRecords(
+      base.unresolvedImports,
+      head.unresolvedImports,
+      ['sourceModulePath', 'specifier', 'loadKind'],
+    ).map((item) => createFinding({
+      ruleId: 'IRONG_DIFF_UNRESOLVED_IMPORT_ADDED',
+      semanticIdentity: {
+        entityType: 'unresolved-import',
+        sourceModulePath: item.sourceModulePath,
+        specifier: item.specifier,
+        loadKind: item.loadKind,
+      },
+      severity: 'error',
+      confidence: 'high',
+      message: `Unresolved import "${item.specifier}" was added to reachable browser module ${item.sourceModulePath}.`,
+      evidence: { entityType: 'unresolved-import', import: item },
+      location: relativeLocation(item.sourceModulePath),
+    })),
+    ...addedFrontEndRecords(
+      base.remoteImports,
+      head.remoteImports,
+      ['sourceModulePath', 'specifier', 'loadKind'],
+    ).map((item) => createFinding({
+      ruleId: 'IRONG_DIFF_REMOTE_IMPORT_ADDED',
+      semanticIdentity: {
+        entityType: 'remote-import',
+        sourceModulePath: item.sourceModulePath,
+        specifier: item.specifier,
+        loadKind: item.loadKind,
+      },
+      severity: 'warning',
+      confidence: 'high',
+      message: `Remote import "${item.specifier}" was added to reachable browser module ${item.sourceModulePath}.`,
+      evidence: { entityType: 'remote-import', import: item },
+      location: relativeLocation(item.sourceModulePath),
+    })),
+  ];
+}
+
+function routeRemovalFindings(base, head) {
+  return removedFrontEndRecords(base.routes, head.routes, ['path', 'component', 'adapter'])
+    .map((route) => createFinding({
+      ruleId: 'IRONG_DIFF_ROUTE_REMOVED',
+      semanticIdentity: {
+        entityType: 'route',
+        path: route.path,
+        component: route.component,
+        adapter: route.adapter,
+      },
+      severity: 'warning',
+      confidence: 'medium',
+      message: `Route "${route.path || '(index)'}" was removed from saved ${route.adapter || 'route'} evidence.`,
+      evidence: { entityType: 'route', route },
+      location: relativeLocation(route.modulePath),
+    }));
+}
+
+function lazyBoundaryFindings(base, head) {
+  const added = addedFrontEndRecords(base.lazyBoundaries, head.lazyBoundaries, [
+    'sourceModulePath',
+    'targetModulePath',
+    'specifier',
+    'kind',
+  ]);
+  const removed = removedFrontEndRecords(base.lazyBoundaries, head.lazyBoundaries, [
+    'sourceModulePath',
+    'targetModulePath',
+    'specifier',
+    'kind',
+  ]);
+  return [
+    ...added.map((boundary) => ({ ...boundary, change: 'added' })),
+    ...removed.map((boundary) => ({ ...boundary, change: 'removed' })),
+  ].map((boundary) => createFinding({
+    ruleId: 'IRONG_DIFF_LAZY_BOUNDARY_CHANGED',
+    semanticIdentity: {
+      entityType: 'lazy-boundary',
+      sourceModulePath: boundary.sourceModulePath,
+      targetModulePath: boundary.targetModulePath,
+      specifier: boundary.specifier,
+      kind: boundary.kind,
+      change: boundary.change,
+    },
+    severity: 'warning',
+    confidence: 'medium',
+    message: `Lazy boundary ${boundary.change}: ${boundary.sourceModulePath} -> ${boundary.specifier}.`,
+    evidence: { entityType: 'lazy-boundary', boundary },
+    location: relativeLocation(boundary.sourceModulePath),
+  }));
+}
+
+function entryGrowthFindings(base, head) {
+  const baseReachable = base.modules.filter((module) => module.reachable === true);
+  const headReachable = head.modules.filter((module) => module.reachable === true);
+  const baseLines = baseReachable.reduce((total, module) => total + (module.lineCount || 0), 0);
+  const headLines = headReachable.reduce((total, module) => total + (module.lineCount || 0), 0);
+  const moduleDelta = headReachable.length - baseReachable.length;
+  const lineDelta = headLines - baseLines;
+  if (moduleDelta < 3 && lineDelta < 200) return [];
+  return [createFinding({
+    ruleId: 'IRONG_DIFF_ENTRY_GROWTH',
+    semanticIdentity: {
+      entityType: 'entry-growth',
+      entry: head.entry || '',
+      moduleDelta,
+      lineBucket: Math.floor(Math.max(0, lineDelta) / 100),
+    },
+    severity: 'warning',
+    confidence: 'medium',
+    message: `Reachable browser entry grew by ${moduleDelta} modules and ${lineDelta} source lines in the static snapshot.`,
+    evidence: {
+      entityType: 'entry-growth',
+      base: { reachableModules: baseReachable.length, reachableLines: baseLines },
+      head: { reachableModules: headReachable.length, reachableLines: headLines },
+      delta: { modules: moduleDelta, lines: lineDelta },
+    },
+    location: relativeLocation(head.entry),
+  })];
+}
+
+function componentCycles(snapshot) {
+  const nodes = new Set();
+  const depsByNode = new Map();
+  for (const edge of snapshot.componentEdges || []) {
+    const source = `${edge.sourceModulePath}:${edge.sourceComponent}`;
+    const target = edge.targetModulePath
+      ? `${edge.targetModulePath}:${edge.targetComponent}`
+      : '';
+    if (!source || !target) continue;
+    nodes.add(source);
+    nodes.add(target);
+    if (!depsByNode.has(source)) depsByNode.set(source, []);
+    depsByNode.get(source).push(target);
+  }
+  return stronglyConnectedComponents(nodes, (node) => depsByNode.get(node) || [])
+    .filter((component) => component.length > 1 || (depsByNode.get(component[0]) || []).includes(component[0]))
+    .map((members) => ({ key: members.join('\u0000'), members }))
+    .sort((a, b) => compareLocale(a.key, b.key));
+}
+
+function componentCycleFindings(base, head) {
+  const baseCycleKeys = new Set(componentCycles(base).map((cycle) => cycle.key));
+  return componentCycles(head)
+    .filter((cycle) => !baseCycleKeys.has(cycle.key))
+    .map((cycle) => createFinding({
+      ruleId: 'IRONG_DIFF_COMPONENT_CYCLE_ADDED',
+      semanticIdentity: {
+        entityType: 'component-cycle',
+        members: cycle.members,
+      },
+      severity: 'warning',
+      confidence: 'medium',
+      message: `New component render cycle: ${cycle.members.join(' -> ')}.`,
+      evidence: { entityType: 'component-cycle', members: cycle.members },
+      location: relativeLocation(cycle.members[0]?.split(':')[0] || null),
+    }));
+}
+
+function browserApiFindings(base, head) {
+  return addedFrontEndRecords(base.browserApis, head.browserApis, ['modulePath', 'api', 'name'])
+    .map((item) => createFinding({
+      ruleId: 'IRONG_DIFF_BROWSER_API_ADDED',
+      semanticIdentity: {
+        entityType: 'browser-api',
+        modulePath: item.modulePath,
+        api: item.api,
+        name: item.name,
+      },
+      severity: 'note',
+      confidence: 'medium',
+      message: `Browser API reference ${item.name || item.api} was added in ${item.modulePath}.`,
+      evidence: { entityType: 'browser-api', api: item },
+      location: relativeLocation(item.modulePath, item.line),
+    }));
+}
+
 function compareFindings(a, b) {
   return (SEVERITY_ORDER.get(a.severity) ?? 99) - (SEVERITY_ORDER.get(b.severity) ?? 99)
     || (RULE_ORDER.get(a.ruleId) ?? 99) - (RULE_ORDER.get(b.ruleId) ?? 99)
@@ -1286,6 +1651,12 @@ function compareFindings(a, b) {
 
 function buildFindings({ base, head, modules, functions, edges }) {
   return [
+    ...frontEndImportFindings(base, head),
+    ...routeRemovalFindings(base, head),
+    ...lazyBoundaryFindings(base, head),
+    ...entryGrowthFindings(base, head),
+    ...componentCycleFindings(base, head),
+    ...browserApiFindings(base, head),
     ...exportFindings(functions),
     ...reachabilityFindings(modules, functions),
     ...cycleFindings(base, head, functions),

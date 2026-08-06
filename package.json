@@ -1,7 +1,7 @@
 {
   "name": "ironglancer",
-  "version": "0.1.7",
-  "description": "Analyze a folder's JS/JSX module graph and emit a static IronGlancer site that only needs a file server.",
+  "version": "0.2.0",
+  "description": "Analyze browser-side JavaScript/JSX front-end architecture from HTML or module entries.",
   "type": "module",
   "author": "Carlos Karpati",
   "license": "MIT",
@@ -14,6 +14,10 @@
     "url": "https://github.com/karpatic/ironglancer/issues"
   },
   "keywords": [
+    "frontend",
+    "browser",
+    "react",
+    "architecture",
     "visualization",
     "dependency-graph",
     "mermaid",
@@ -36,12 +40,19 @@
   },
   "files": [
     "src/",
+    "dist/action/",
+    "action.yml",
     "README.md",
+    "CHANGELOG.md",
+    "MIGRATION.md",
     "LICENSE"
   ],
   "scripts": {
     "test": "node --test",
+    "build:action": "node ./scripts/build-action.mjs",
+    "check:action-bundle": "node ./scripts/build-action.mjs --check",
     "build:demo": "node ./scripts/build-demo.mjs",
+    "release:check": "node ./scripts/release-check.mjs",
     "prepublishOnly": "npm test",
     "publish:npm": "npm publish --access public",
     "publish:github": "./scripts/publish-github-package.sh",
@@ -54,9 +65,11 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@babel/parser": "^7.29.8",
     "mermaid": "^11.12.0"
   },
   "devDependencies": {
+    "@vercel/ncc": "^0.38.4",
     "bundlessdev": "1.0.10",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"

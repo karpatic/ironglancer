@@ -216,8 +216,8 @@ async function waitForExpression(client, expression, timeoutMs = 15_000) {
 
 async function writeDenseFixture(rootDir) {
   const components = [
-    'CreatorLogin',
-    'CreatorShell',
+    'DashboardLogin',
+    'DashboardShell',
     ...Array.from({ length: 150 }, (_, index) => `DenseRow${String(index + 1).padStart(3, '0')}`),
   ];
   const source = components.map((name) => [
@@ -251,7 +251,7 @@ test('real browser dense source labels open the clicked declaration at 20 percen
   t.after(() => fs.rm(profileDir, { recursive: true, force: true }));
 
   await writeDenseFixture(rootDir);
-  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir, sourceMode: 'declarations' });
   let site;
   try {
     site = await startStaticServer(outDir);
@@ -309,7 +309,7 @@ test('real browser dense source labels open the clicked declaration at 20 percen
   });
   await client.send('Page.navigate', { url });
   await waitForExpression(client, `
-    document.getElementById('mermaid')?.textContent.includes('CreatorLogin')
+    document.getElementById('mermaid')?.textContent.includes('DashboardLogin')
       && document.querySelectorAll('.source-member-trigger').length > 100
       && document.querySelectorAll('.source-member-hit-target').length > 100
       && fetch('./output.json').then((response) => response.ok)
@@ -317,15 +317,15 @@ test('real browser dense source labels open the clicked declaration at 20 percen
 
   const probe = await evaluate(client, `
     (() => {
-      const viewport = document.getElementById('diagram-viewport');
-      const zoomOut = document.getElementById('zoom-out-btn');
+      const viewport = document.getElementById('module-diagram-viewport');
+      const zoomOut = document.getElementById('module-diagram-zoom-out-btn');
       for (let index = 0; index < 20; index += 1) zoomOut.click();
       viewport.scrollTop = 0;
       viewport.scrollLeft = 0;
 
       const label = Array.from(document.querySelectorAll('.source-member-trigger'))
-        .find((element) => element.textContent.includes('CreatorLogin'));
-      if (!label) return { ok: false, reason: 'missing CreatorLogin label' };
+        .find((element) => element.textContent.includes('DashboardLogin'));
+      if (!label) return { ok: false, reason: 'missing DashboardLogin label' };
 
       label.scrollIntoView({ block: 'center', inline: 'center' });
       const rect = label.getBoundingClientRect();
@@ -343,7 +343,7 @@ test('real browser dense source labels open the clicked declaration at 20 percen
         y,
         labelId,
         hitTargets,
-        zoom: document.getElementById('zoom-status').textContent,
+        zoom: document.getElementById('module-diagram-zoom-status').textContent,
         rect: {
           left: rect.left,
           top: rect.top,
@@ -360,11 +360,11 @@ test('real browser dense source labels open the clicked declaration at 20 percen
   assert.ok(probe.rect.height > 0);
   assert.ok(
     probe.hitTargets.length >= 2,
-    `expected overlapping source hit targets at CreatorLogin center: ${JSON.stringify(probe)}`,
+    `expected overlapping source hit targets at DashboardLogin center: ${JSON.stringify(probe)}`,
   );
   assert.ok(
     probe.hitTargets.some((targetId) => targetId !== probe.labelId),
-    `expected a neighboring hit target at CreatorLogin center: ${JSON.stringify(probe)}`,
+    `expected a neighboring hit target at DashboardLogin center: ${JSON.stringify(probe)}`,
   );
 
   await client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: probe.x, y: probe.y });
@@ -390,6 +390,6 @@ test('real browser dense source labels open the clicked declaration at 20 percen
       && document.getElementById('source-dialog-title')?.textContent
   `);
   const sourcePath = await evaluate(client, "document.getElementById('source-dialog-path')?.textContent");
-  assert.equal(title, 'CreatorLogin');
+  assert.equal(title, 'DashboardLogin');
   assert.match(sourcePath, /^src\/app\.jsx:/);
 });

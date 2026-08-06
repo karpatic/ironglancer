@@ -1,0 +1,77 @@
+name: IronGlancer Front-End Architecture Diff
+description: Run IronGlancer browser-side JavaScript/JSX architecture diff reports in GitHub Actions.
+author: Carlos Karpati
+inputs:
+  folder:
+    description: Project folder containing the front-end browser entry.
+    required: false
+    default: .
+  base:
+    description: Base Git ref, output.json path, or generated-site directory.
+    required: true
+  head:
+    description: Head Git ref, output.json path, or generated-site directory.
+    required: true
+  entry:
+    description: Browser entry, either HTML with module scripts or .js/.jsx/.mjs.
+    required: false
+  framework:
+    description: Front-end adapter mode, one of auto, vanilla, or react.
+    required: false
+  source-root:
+    description: Project-relative front-end source root used to bound optional unreachable discovery.
+    required: false
+  aliases:
+    description: Newline- or comma-separated import aliases in specifier=path form.
+    required: false
+  alias:
+    description: Single import alias in specifier=path form.
+    required: false
+  route-aliases:
+    description: Deprecated compatibility input for root-relative URL aliases in route=path form. Prefer aliases.
+    required: false
+  route-alias:
+    description: Deprecated compatibility input for one root-relative URL alias in route=path form. Prefer alias.
+    required: false
+  module-limit:
+    description: Maximum analyzed module count. Defaults to 500.
+    required: false
+  include-unreachable:
+    description: Include JS/JSX/MJS files not reachable from the browser entry, bounded to the configured or inferred front-end root.
+    required: false
+  exclude:
+    description: Newline- or comma-separated project-relative paths or prefixes to exclude.
+    required: false
+  baseline:
+    description: Previous IronGlancer diff JSON report for exact baseline IDs.
+    required: false
+  suppressions:
+    description: Exact finding suppressions JSON file.
+    required: false
+  fail-on:
+    description: Gate severity threshold, one of error, warning, or note.
+    required: false
+  format:
+    description: Report format, json or html.
+    required: false
+    default: json
+  report-path:
+    description: Path for the JSON or HTML diff report.
+    required: false
+  sarif-path:
+    description: Optional SARIF report path. Upload is intentionally separate.
+    required: false
+outputs:
+  report-path:
+    description: Absolute path to the written diff report.
+  sarif-path:
+    description: Absolute path to the written SARIF report, when requested.
+  gate-triggered:
+    description: Whether fail-on triggered the review gate.
+  finding-count:
+    description: Total finding count in the diff report.
+  exit-code:
+    description: IronGlancer diff exit code.
+runs:
+  using: node20
+  main: dist/action/index.js

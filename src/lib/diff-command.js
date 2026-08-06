@@ -18,6 +18,7 @@ import {
   validateSuppressionsConfig,
 } from './diff-review.js';
 import { analyzeProject } from './analyze-project.js';
+import { DEFAULT_MODULE_LIMIT, normalizeModuleLimit } from './options.js';
 import { compareLocale, normalizeString } from './utils.js';
 
 const execFile = promisify(execFileCallback);
@@ -122,6 +123,15 @@ async function resolveGitCommit(projectRoot, input) {
   }
 }
 
+async function gitTopLevel(projectRoot) {
+  try {
+    const { stdout } = await execFile('git', ['-C', projectRoot, 'rev-parse', '--show-toplevel']);
+    return path.resolve(stdout.trim());
+  } catch {
+    return projectRoot;
+  }
+}
+
 function waitForChild(child, name, stderrChunks) {
   return new Promise((resolve, reject) => {
     child.once('error', reject);
@@ -187,14 +197,22 @@ function analysisModulesPayload(analysis = {}) {
       importRefs: Array.isArray(record.importRefs) ? record.importRefs.map((ref) => ({
         specifier: typeof ref.specifier === 'string' ? ref.specifier : '',
         kind: typeof ref.kind === 'string' ? ref.kind : '',
+        typeOnly: Boolean(ref.typeOnly),
         localRel: typeof ref.localRel === 'string' ? ref.localRel : null,
-        resolution: ['local', 'external', 'unresolved'].includes(ref.resolution) ? ref.resolution : null,
+        assetRel: typeof ref.assetRel === 'string' ? ref.assetRel : null,
+        assetKind: typeof ref.assetKind === 'string' ? ref.assetKind : null,
+        remoteUrl: typeof ref.remoteUrl === 'string' ? ref.remoteUrl : null,
+        nodeBuiltin: typeof ref.nodeBuiltin === 'string' ? ref.nodeBuiltin : null,
+        resolution: ['local', 'asset', 'external', 'remote', 'browser-incompatible', 'unresolved'].includes(ref.resolution)
+          ? ref.resolution
+          : null,
         unresolvedReason: typeof ref.unresolvedReason === 'string' ? ref.unresolvedReason : null,
         bindings: Array.isArray(ref.bindings) ? ref.bindings.map((binding) => ({
           imported: typeof binding.imported === 'string' ? binding.imported : '',
           local: typeof binding.local === 'string' ? binding.local : '',
           kind: typeof binding.kind === 'string' ? binding.kind : '',
           inferred: Boolean(binding.inferred),
+          typeOnly: Boolean(binding.typeOnly),
         })) : [],
       })) : [],
     }))
@@ -204,6 +222,8 @@ function analysisModulesPayload(analysis = {}) {
 function snapshotFromAnalysis(analysis, { gitCommit, generatedAt }) {
   const payload = {
     entry: analysis.entryRel,
+    entryKind: analysis.entryKind || 'module',
+    entryModules: Array.isArray(analysis.entryModules) ? analysis.entryModules : [analysis.entryRel].filter(Boolean),
     modules: analysisModulesPayload(analysis),
     treeText: analysis.treeText,
     jsxTreeText: analysis.jsxTreeText,
@@ -211,6 +231,16 @@ function snapshotFromAnalysis(analysis, { gitCommit, generatedAt }) {
     jsxScripts: analysis.jsxScripts,
     mermaid: analysis.mermaid,
     importEdges: analysis.importEdges,
+    components: Array.isArray(analysis.components) ? analysis.components : [],
+    componentEdges: Array.isArray(analysis.componentEdges) ? analysis.componentEdges : [],
+    routes: Array.isArray(analysis.routes) ? analysis.routes : [],
+    lazyBoundaries: Array.isArray(analysis.lazyBoundaries) ? analysis.lazyBoundaries : [],
+    assets: Array.isArray(analysis.assets) ? analysis.assets : [],
+    browserApis: Array.isArray(analysis.browserApis) ? analysis.browserApis : [],
+    remoteImports: Array.isArray(analysis.remoteImports) ? analysis.remoteImports : [],
+    unresolvedImports: Array.isArray(analysis.unresolvedImports) ? analysis.unresolvedImports : [],
+    browserIncompatibleImports: Array.isArray(analysis.browserIncompatibleImports) ? analysis.browserIncompatibleImports : [],
+    findings: Array.isArray(analysis.findings) ? analysis.findings : [],
     functionMap: {
       limitations: Array.isArray(analysis.functionDependencyMap?.limitations)
         ? analysis.functionDependencyMap.limitations
@@ -231,6 +261,16 @@ function snapshotFromAnalysis(analysis, { gitCommit, generatedAt }) {
       generatedAt,
       entry: analysis.entryRel,
       gitCommit,
+      analysis: {
+        analyzer: analysis.metadata?.analyzer || analysis.metadata?.backend || { name: 'javascript-ast' },
+        backend: analysis.metadata?.backend || analysis.metadata?.analyzer || { name: 'javascript-ast' },
+        framework: analysis.metadata?.framework || 'auto',
+        includeUnreachable: Boolean(analysis.metadata?.includeUnreachable),
+        moduleLimit: analysis.metadata?.moduleLimit || {
+          limit: DEFAULT_MODULE_LIMIT,
+          count: payload.modules.length,
+        },
+      },
       buildId: contentHash({
         schemaVersion: SNAPSHOT_SCHEMA_VERSION,
         gitCommit,
@@ -245,8 +285,15 @@ export async function loadSnapshotInput({
   input,
   entry,
   routeAliases = [],
+  aliases = [],
+  framework,
+  sourceRoot = '',
+  includeUnreachable = false,
+  exclude = [],
+  moduleLimit = DEFAULT_MODULE_LIMIT,
   generatedAt = new Date().toISOString(),
 } = {}) {
+  const effectiveModuleLimit = normalizeModuleLimit(moduleLimit);
   const snapshotPath = await snapshotPathForInput(input);
   if (snapshotPath) {
     return {
@@ -257,17 +304,26 @@ export async function loadSnapshotInput({
   }
 
   const projectRoot = path.resolve(normalizeString(folder).trim() || '.');
+  const repoRoot = await gitTopLevel(projectRoot);
+  const projectSubpath = path.relative(repoRoot, projectRoot);
   const commit = await resolveGitCommit(projectRoot, input);
   if (!commit) {
     throw new SnapshotDiffError(`Unable to resolve diff input "${input}" as a snapshot path or git ref.`, 'input_not_found');
   }
 
-  const materialized = await materializeGitCommit(projectRoot, commit);
+  const materialized = await materializeGitCommit(repoRoot, commit);
   try {
+    const materializedProjectRoot = path.resolve(materialized.checkoutDir, projectSubpath);
     const analysis = await analyzeProject({
-      rootDir: materialized.checkoutDir,
+      rootDir: materializedProjectRoot,
       entry,
       routeAliases,
+      aliases,
+      framework,
+      sourceRoot,
+      includeUnreachable,
+      exclude,
+      moduleLimit: effectiveModuleLimit,
     });
     return {
       label: input,
@@ -480,14 +536,21 @@ export async function createArchitectureDiff({
   head,
   entry,
   routeAliases = [],
+  aliases = [],
+  framework,
+  sourceRoot = '',
+  includeUnreachable = false,
+  exclude = [],
   format = 'json',
   outPath,
   sarifPath,
   baselinePath,
   suppressionsPath,
   failOn,
+  moduleLimit = DEFAULT_MODULE_LIMIT,
   generatedAt = new Date().toISOString(),
 } = {}) {
+  const effectiveModuleLimit = normalizeModuleLimit(moduleLimit);
   if (!base) throw new SnapshotDiffError('ironglancer diff requires --base <input>.', 'missing_base');
   if (!head) throw new SnapshotDiffError('ironglancer diff requires --head <input>.', 'missing_head');
   const resolvedFormat = normalizedFormat(format);
@@ -503,8 +566,32 @@ export async function createArchitectureDiff({
   if (suppressionsConfig) validateSuppressionsConfig(suppressionsConfig);
 
   const [baseInput, headInput] = await Promise.all([
-    loadSnapshotInput({ folder, input: base, entry, routeAliases, generatedAt }),
-    loadSnapshotInput({ folder, input: head, entry, routeAliases, generatedAt }),
+    loadSnapshotInput({
+      folder,
+      input: base,
+      entry,
+      routeAliases,
+      aliases,
+      framework,
+      sourceRoot,
+      includeUnreachable,
+      exclude,
+      moduleLimit: effectiveModuleLimit,
+      generatedAt,
+    }),
+    loadSnapshotInput({
+      folder,
+      input: head,
+      entry,
+      routeAliases,
+      aliases,
+      framework,
+      sourceRoot,
+      includeUnreachable,
+      exclude,
+      moduleLimit: effectiveModuleLimit,
+      generatedAt,
+    }),
   ]);
   await assertNoFilesystemOutputCollision(effectiveOutPath, sarifPath, {
     baselinePath,

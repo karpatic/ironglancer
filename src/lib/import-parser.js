@@ -94,91 +94,13 @@ function collectStringConstants(source, maskedSource = maskIgnorableSyntax(sourc
 }
 
 function resolveSpecifierExpression(expression, constants) {
-  let text = normalizeString(expression).trim();
+  const text = normalizeString(expression).trim();
   if (!text) return '';
-  const paneUrlMatch = text.match(/^paneUrl\s*\(\s*([\s\S]*?)\s*\)$/);
-  if (paneUrlMatch) text = paneUrlMatch[1].trim();
   const literalMatch = text.match(/^(['"])((?:\\.|(?!\1)[\s\S])*?)\1$/);
   if (literalMatch) return unescapeStringLiteralValue(literalMatch[2]);
   const identifierMatch = text.match(/^[A-Za-z_$][A-Za-z0-9_$]*$/);
   if (identifierMatch) return constants.get(text) || '';
   return '';
-}
-
-function isSupportedLocalSpecifier(specifier) {
-  const value = normalizeString(specifier).trim();
-  return value.startsWith('./') || value.startsWith('../') || value.startsWith('/');
-}
-
-function inferredNamedBinding(name, local = name) {
-  const importedName = normalizeJsIdentifier(name);
-  const localName = normalizeJsIdentifier(local);
-  if (!importedName || !localName) return null;
-  return {
-    imported: importedName,
-    local: localName,
-    kind: 'named',
-    inferred: true,
-  };
-}
-
-function collectModulePropertyBindings(text, maskedText, constants, specifierExpression) {
-  const refs = [];
-  const moduleCallPattern = new RegExp(`\\b(?:const|let|var)\\s+\\{([^}]*)\\}\\s*=\\s*\\b(?:use|load)[A-Za-z0-9_$]*Module(?:Once)?\\s*\\(\\s*(${specifierExpression})(?:\\s*,[^)]*)?\\s*\\)`, 'g');
-  const moduleRefs = new Map();
-  let match;
-  while ((match = moduleCallPattern.exec(text))) {
-    if (!startsInCode(maskedText, match.index)) continue;
-    const moduleField = match[1].match(/(?:^|,)\s*module(?:\s*:\s*([A-Za-z_$][A-Za-z0-9_$]*))?\s*(?:,|$)/);
-    if (!moduleField) continue;
-    const moduleLocal = moduleField[1] || 'module';
-    const specifier = resolveSpecifierExpression(match[2], constants);
-    if (!specifier) continue;
-    if (!moduleRefs.has(moduleLocal)) moduleRefs.set(moduleLocal, []);
-    moduleRefs.get(moduleLocal).push({ specifier, index: match.index });
-  }
-
-  const propertyPattern = /\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\??\.([A-Za-z_$][A-Za-z0-9_$]*)\s*;?/g;
-  while ((match = propertyPattern.exec(text))) {
-    if (!startsInCode(maskedText, match.index)) continue;
-    const candidates = (moduleRefs.get(match[2]) || [])
-      .filter((candidate) => candidate.index < match.index);
-    const candidate = candidates.at(-1);
-    if (!candidate) continue;
-    const binding = inferredNamedBinding(match[3], match[1]);
-    if (binding) refs.push({
-      specifier: candidate.specifier,
-      bindings: [binding],
-      kind: 'lazy',
-    });
-  }
-  return refs;
-}
-
-function collectJsxSpecifierRefs(text, maskedText, constants) {
-  const refs = [];
-  const openingElementPattern = /<[A-Za-z][A-Za-z0-9_$.:-]*(?:\s+[^<>]*?)\/?>/g;
-  const specifierAttrPattern = /\bspecifier\s*=\s*(?:\{\s*([^}]+?)\s*\}|(['"])((?:\\.|(?!\2)[\s\S])*?)\2)/;
-  const exportNameAttrPattern = /\bexportName\s*=\s*(['"])((?:\\.|(?!\1)[\s\S])*?)\1/;
-  let match;
-  while ((match = openingElementPattern.exec(maskedText))) {
-    if (!startsInCode(maskedText, match.index)) continue;
-    const tag = text.slice(match.index, openingElementPattern.lastIndex);
-    const specifierMatch = tag.match(specifierAttrPattern);
-    if (!specifierMatch) continue;
-    const specifier = specifierMatch[3]
-      ? unescapeStringLiteralValue(specifierMatch[3])
-      : resolveSpecifierExpression(specifierMatch[1], constants);
-    if (!specifier) continue;
-    const exportNameMatch = tag.match(exportNameAttrPattern);
-    if (!exportNameMatch) {
-      refs.push({ specifier, kind: 'lazy' });
-      continue;
-    }
-    const binding = inferredNamedBinding(unescapeStringLiteralValue(exportNameMatch[2]));
-    if (binding) refs.push({ specifier, bindings: [binding], kind: 'lazy' });
-  }
-  return refs;
 }
 
 function normalizeImportBinding(binding) {
@@ -223,16 +145,13 @@ export function extractImportRefs(source) {
   const masked = maskIgnorableSyntax(text);
   const constants = collectStringConstants(text, masked);
   const refs = [];
-  const specifierExpression = `(?:paneUrl\\s*\\(\\s*)?(?:['"](?:\\\\.|[^'"])*['"]|[A-Za-z_$][A-Za-z0-9_$]*)\\s*\\)?`;
+  const specifierExpression = `(?:['"](?:\\\\.|[^'"])*['"]|[A-Za-z_$][A-Za-z0-9_$]*)`;
   const staticImportPattern = /\bimport\s+(?!['"])([\s\S]*?)\s+from\s+['"]([^'"]+)['"]/g;
   const sideEffectImportPattern = /\bimport\s+['"]([^'"]+)['"]/g;
   const exportFromPattern = /\bexport\s+[\s\S]*?\s+from\s+['"]([^'"]+)['"]/g;
   const assignedDynamicImportPattern = new RegExp(`\\b(?:const|let|var)\\s+(\\{[^}]*\\}|[A-Za-z_$][A-Za-z0-9_$]*)\\s*=\\s*await\\s+(?:import|window\\.import)\\s*\\(\\s*(${specifierExpression})\\s*\\)`, 'g');
   const dynamicImportPattern = new RegExp(`\\b(?:import|window\\.import)\\s*\\(\\s*(${specifierExpression})\\s*\\)`, 'g');
-  const assignedRequirePattern = new RegExp(`\\b(?:const|let|var)\\s+(\\{[^}]*\\}|[A-Za-z_$][A-Za-z0-9_$]*)\\s*=\\s*require\\s*\\(\\s*(${specifierExpression})\\s*\\)`, 'g');
-  const requirePattern = new RegExp(`\\brequire\\s*\\(\\s*(${specifierExpression})\\s*\\)`, 'g');
-  const lazyModuleCallPattern = /\b(?:use|load)[A-Za-z0-9_$]*Module(?:Once)?\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*|['"](?:\\.|[^'"])*['"])/g;
-  const dynamicWrapperPattern = new RegExp(`(?<![\\p{ID_Continue}$])importCreatorBrowserModule\\s*\\(\\s*(${specifierExpression})\\s*,\\s*(${specifierExpression})\\s*\\)`, 'gu');
+  const lazyImportPattern = new RegExp(`\\b(?:const|let|var)\\s+([A-Za-z_$][A-Za-z0-9_$]*)\\s*=\\s*(?:React\\.)?lazy\\s*\\(\\s*(?:async\\s*)?\\(\\s*\\)\\s*=>\\s*(?:import|window\\.import)\\s*\\(\\s*(${specifierExpression})\\s*\\)\\s*\\)`, 'g');
 
   const mark = (specifier) => {
     const value = normalizeString(specifier).trim();
@@ -274,48 +193,21 @@ export function extractImportRefs(source) {
     const specifier = mark(resolveSpecifierExpression(match[1], constants));
     pushImportRef(refs, { specifier, kind: 'dynamic' });
   }
-  while ((match = assignedRequirePattern.exec(text))) {
+  while ((match = lazyImportPattern.exec(text))) {
     if (!startsInCode(masked, match.index)) continue;
     const specifier = mark(resolveSpecifierExpression(match[2], constants));
     pushImportRef(refs, {
       specifier,
-      bindings: parseDynamicImportBindings(match[1]),
-      kind: 'require',
+      bindings: [
+        {
+          imported: 'default',
+          local: match[1],
+          kind: 'default',
+          inferred: false,
+        },
+      ],
+      kind: 'lazy',
     });
-  }
-  while ((match = requirePattern.exec(text))) {
-    if (!startsInCode(masked, match.index)) continue;
-    const specifier = mark(resolveSpecifierExpression(match[1], constants));
-    pushImportRef(refs, { specifier, kind: 'require' });
-  }
-  while ((match = dynamicWrapperPattern.exec(text))) {
-    if (!startsInCode(masked, match.index)) continue;
-    const previousIndex = previousSignificantIndex(masked, match.index);
-    if (previousIndex !== -1 && (masked[previousIndex] === '.' || masked[previousIndex] === '#')) continue;
-    const specifiers = [
-      resolveSpecifierExpression(match[1], constants),
-      resolveSpecifierExpression(match[2], constants),
-    ];
-    if (!specifiers.every(isSupportedLocalSpecifier)) continue;
-    for (const specifier of specifiers) {
-      pushImportRef(refs, {
-        specifier: mark(specifier),
-        kind: 'dynamic-wrapper',
-      });
-    }
-  }
-  while ((match = lazyModuleCallPattern.exec(text))) {
-    if (!startsInCode(masked, match.index)) continue;
-    const specifier = mark(resolveSpecifierExpression(match[1], constants));
-    pushImportRef(refs, { specifier, kind: 'lazy' });
-  }
-  for (const ref of collectModulePropertyBindings(text, masked, constants, specifierExpression)) {
-    mark(ref.specifier);
-    pushImportRef(refs, ref);
-  }
-  for (const ref of collectJsxSpecifierRefs(text, masked, constants)) {
-    mark(ref.specifier);
-    pushImportRef(refs, ref);
   }
 
   const seen = new Set();

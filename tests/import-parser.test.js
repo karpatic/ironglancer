@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 import { countIdentifierReferences, extractDeclarationSpans, extractImportRefs } from '../src/lib/import-parser.js';
 
-test('extractImportRefs classifies dynamic, lazy, and require refs without duplicate refs', () => {
+test('extractImportRefs classifies ESM, dynamic, and lazy refs without CommonJS deps', () => {
   const source = [
     "import DefaultThing, { NamedThing as namedAlias } from './static.js';",
     "import './side-effect.js';",
@@ -11,16 +11,14 @@ test('extractImportRefs classifies dynamic, lazy, and require refs without dupli
     "const DYNAMIC_SPECIFIER = './dynamic.js';",
     "const WINDOW_SPECIFIER = './window.js';",
     "const LAZY_SPECIFIER = './lazy.js';",
-    "const REQUIRE_SPECIFIER = './required.js';",
     'const { DynamicThing: DynamicAlias } = await import(DYNAMIC_SPECIFIER);',
     'const WindowModule = await window.import(WINDOW_SPECIFIER);',
-    'loadCreatorModuleOnce(LAZY_SPECIFIER);',
-    '<LazyBoundary specifier={LAZY_SPECIFIER} exportName="LazyExport" />;',
+    'const LazyThing = React.lazy(() => import(LAZY_SPECIFIER));',
+    "const REQUIRE_SPECIFIER = './required.js';",
     'const { RequiredThing: RequiredAlias } = require(REQUIRE_SPECIFIER);',
     "const requiredNamespace = require('./namespace.cjs');",
     "require('./register.js');",
     "await import('./' + computedName);",
-    'loadCreatorModuleOnce(computedSpecifier);',
     "// import Hidden from './commented.js';",
     'const text = "require(\'./string.js\')";',
   ].join('\n');
@@ -50,54 +48,38 @@ test('extractImportRefs classifies dynamic, lazy, and require refs without dupli
       ],
       kind: 'dynamic',
     },
-    {
-      specifier: './required.js',
-      bindings: [
-        { imported: 'RequiredThing', local: 'RequiredAlias', kind: 'named', inferred: false },
-      ],
-      kind: 'require',
-    },
-    {
-      specifier: './namespace.cjs',
-      bindings: [
-        { imported: '*', local: 'requiredNamespace', kind: 'namespace', inferred: false },
-      ],
-      kind: 'require',
-    },
-    { specifier: './register.js', bindings: [], kind: 'require' },
+    { specifier: './lazy.js', bindings: [], kind: 'dynamic' },
     {
       specifier: './lazy.js',
       bindings: [
-        { imported: 'LazyExport', local: 'LazyExport', kind: 'named', inferred: true },
+        { imported: 'default', local: 'LazyThing', kind: 'default', inferred: false },
       ],
       kind: 'lazy',
     },
   ]);
 });
 
-test('extractImportRefs recognizes only resolvable Faculty browser import wrappers', () => {
+test('extractImportRefs ignores custom loader wrappers and JSX specifier props', () => {
   const source = [
     "const BROWSER_SPECIFIER = './browser-child.jsx';",
     "const NATIVE_SPECIFIER = './native-child.jsx';",
-    'await importCreatorBrowserModule(BROWSER_SPECIFIER, NATIVE_SPECIFIER);',
-    "importCreatorBrowserModule('./literal-browser.jsx', './literal-native.jsx');",
-    "importCreatorBrowserModule('./' + computedName, './computed-native.jsx');",
+    'await importProjectBrowserModule(BROWSER_SPECIFIER, NATIVE_SPECIFIER);',
+    "importProjectBrowserModule('./literal-browser.jsx', './literal-native.jsx');",
+    "importProjectBrowserModule('./' + computedName, './computed-native.jsx');",
     "importOtherBrowserModule('./false-positive.jsx', './false-positive-native.jsx');",
-    "loader.importCreatorBrowserModule('./member.jsx', './member-native.jsx');",
-    "loader . importCreatorBrowserModule('./spaced-member.jsx', './spaced-member-native.jsx');",
-    "loader?.importCreatorBrowserModule('./optional-member.jsx', './optional-member-native.jsx');",
-    "loader?. importCreatorBrowserModule('./spaced-optional-member.jsx', './spaced-optional-member-native.jsx');",
-    "loader./* member */importCreatorBrowserModule('./comment-member.jsx', './comment-member-native.jsx');",
-    "$importCreatorBrowserModule('./prefixed.jsx', './prefixed-native.jsx');",
-    "éimportCreatorBrowserModule('./unicode-prefixed.jsx', './unicode-prefixed-native.jsx');",
+    "loader.importProjectBrowserModule('./member.jsx', './member-native.jsx');",
+    "loader . importProjectBrowserModule('./spaced-member.jsx', './spaced-member-native.jsx');",
+    "loader?.importProjectBrowserModule('./optional-member.jsx', './optional-member-native.jsx');",
+    "loader?. importProjectBrowserModule('./spaced-optional-member.jsx', './spaced-optional-member-native.jsx');",
+    "loader./* member */importProjectBrowserModule('./comment-member.jsx', './comment-member-native.jsx');",
+    "$importProjectBrowserModule('./prefixed.jsx', './prefixed-native.jsx');",
+    "const { module } = loadWidgetModule(BROWSER_SPECIFIER);",
+    "const Widget = module?.Widget;",
+    '<LazyBoundary specifier={BROWSER_SPECIFIER} exportName="Widget" />;',
+    "await import(resolvePaneUrl('./pane-child.jsx'));",
   ].join('\n');
 
-  assert.deepEqual(extractImportRefs(source), [
-    { specifier: './browser-child.jsx', bindings: [], kind: 'dynamic-wrapper' },
-    { specifier: './native-child.jsx', bindings: [], kind: 'dynamic-wrapper' },
-    { specifier: './literal-browser.jsx', bindings: [], kind: 'dynamic-wrapper' },
-    { specifier: './literal-native.jsx', bindings: [], kind: 'dynamic-wrapper' },
-  ]);
+  assert.deepEqual(extractImportRefs(source), []);
 });
 
 test('countIdentifierReferences preserves template interpolation code and ignores template text', () => {

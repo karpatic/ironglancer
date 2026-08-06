@@ -71,7 +71,11 @@ test('function dependency nodes expose conservative reachability and export meta
     { exported: false, standalone: false },
     { exported: false, standalone: false },
   ]);
-  assert.equal(byName.get('Orphan').reachable, false);
+  assert.equal(byName.has('Orphan'), false);
+  const withUnreachable = await analyzeProject({ rootDir, entry: 'src/app.js', includeUnreachable: true });
+  const orphan = withUnreachable.functionDependencyMap.functions.find((node) => node.name === 'Orphan');
+  assert.ok(orphan);
+  assert.equal(orphan.reachable, false);
 
   const refs = new Map(result.graph.modules.get('src/app.js').importRefs.map((ref) => [ref.specifier, ref]));
   assert.deepEqual(
@@ -163,7 +167,7 @@ test('analyzeProject nests functions declared in bare lexical blocks under an an
   assert.match(insideBlock.scopePath, /anonymous-block/);
 });
 
-test('analyzeProject marks top-level CommonJS function-expression exports as exported without requiring standalone', async () => {
+test('analyzeProject records CommonJS syntax as unsupported browser evidence', async () => {
   const rootDir = await writeTempProject({
     'src/app.js': [
       'exports.pub = function internal() {',
@@ -179,9 +183,11 @@ test('analyzeProject marks top-level CommonJS function-expression exports as exp
   const internal = result.functionDependencyMap.functions.find((node) => node.name === 'internal');
 
   assert.ok(internal);
-  assert.equal(internal.exported, true);
-  assert.deepEqual(internal.exportedNames, ['pub']);
+  assert.equal(internal.exported, false);
+  assert.deepEqual(internal.exportedNames, []);
   assert.equal(internal.standalone, false);
+  assert.deepEqual(result.commonJsSyntax.map((item) => item.kind), ['commonjs-export']);
+  assert.deepEqual(result.findings.map((item) => item.ruleId), ['IRONG_UNSUPPORTED_COMMONJS']);
 });
 
 test('analyzeProject resolves same-module references to the lexically visible declaration', async () => {
@@ -384,7 +390,8 @@ test('analyzeProject resolves local modules, import-map aliases, and externals',
 
   assert.equal(result.entryRel, 'src/app.jsx');
   assert.equal(result.summary.moduleCount, 5);
-  assert.equal(result.summary.externalCount, 1);
+  assert.equal(result.summary.externalCount, 0);
+  assert.equal(result.summary.remoteImportCount, 1);
   assert.ok(result.treeText.includes('src/components/App.jsx'));
   assert.ok(result.treeText.includes('src/panes/Inspector.jsx'));
   assert.equal(result.summary.jsxFileCount, 3);
@@ -412,17 +419,22 @@ test('analyzeProject resolves local modules, import-map aliases, and externals',
   ].join('\n'));
   assert.ok(!result.jsxTreeText.includes('shared/theme.js'));
   assert.ok(!result.jsxTreeText.includes('[external]'));
+  assert.deepEqual(result.remoteImports, [{
+    sourceModulePath: 'src/app.jsx',
+    specifier: 'https://cdn.example.com/widget.js',
+    loadKind: 'dynamic',
+  }]);
 });
 
-const creatorLikeRoot = path.resolve('tests/fixtures/creator-like');
+const browserLikeRoot = path.resolve('tests/fixtures/browser-like');
 
-test('analyzeProject resolves creator-style public assets and review-origin aliases', async () => {
-  const result = await analyzeProject({ rootDir: creatorLikeRoot, entry: 'ceator/app.jsx' });
+test('analyzeProject resolves browser app public assets and review-origin aliases', async () => {
+  const result = await analyzeProject({ rootDir: browserLikeRoot, entry: 'app/app.jsx' });
 
-  assert.equal(result.entryRel, 'ceator/app.jsx');
+  assert.equal(result.entryRel, 'app/app.jsx');
   assert.equal(result.summary.moduleCount, 3);
   assert.deepEqual(result.jsScripts.map((item) => item.path), [
-    'ceator/app.jsx',
+    'app/app.jsx',
     'public/app.js',
     'public/controller.js',
   ]);
@@ -433,23 +445,194 @@ const routeAliasRoot = path.resolve('tests/fixtures/route-alias');
 test('analyzeProject maps URL-rooted imports through route aliases', async () => {
   const result = await analyzeProject({
     rootDir: routeAliasRoot,
-    entry: 'src/web/ceator/app.jsx',
-    routeAliases: [{ from: '/creator/', to: 'src/web/ceator/' }],
+    entry: 'src/web/portal/app.jsx',
+    routeAliases: [{ from: '/portal/', to: 'src/web/portal/' }],
   });
 
-  assert.equal(result.entryRel, 'src/web/ceator/app.jsx');
+  assert.equal(result.entryRel, 'src/web/portal/app.jsx');
   assert.equal(result.summary.moduleCount, 2);
   assert.equal(result.summary.externalCount, 0);
   assert.deepEqual(result.jsScripts.map((item) => item.path), [
-    'src/web/ceator/app.jsx',
-    'src/web/ceator/components/creator-linked-content-editor.jsx',
+    'src/web/portal/app.jsx',
+    'src/web/portal/components/linked-content-editor.jsx',
   ]);
-  assert.ok(!result.treeText.includes('[external] /creator/components/creator-linked-content-editor.jsx'));
+  assert.ok(!result.treeText.includes('[external] /portal/components/linked-content-editor.jsx'));
   assert.ok(!result.mermaid.includes('+LinkedContentEditor'));
-  assert.ok(result.mermaid.includes('CreatorLinkedContentEditor()'));
+  assert.ok(result.mermaid.includes('PortalLinkedContentEditor()'));
 });
 
-test('analyzeProject excludes transient project discovery directories only', async () => {
+test('analyzeProject treats HTML module scripts and import maps as browser entries', async () => {
+  const rootDir = await writeTempProject({
+    'index.html': [
+      '<script type="importmap">',
+      JSON.stringify({
+        imports: {
+          '@ui/': '/src/ui/',
+          'remote-lib': 'https://cdn.example.com/lib.js',
+        },
+      }),
+      '</script>',
+      '<script type="module" src="/src/main.jsx"></script>',
+      '<script type="module" src="./src/admin.js"></script>',
+    ].join('\n'),
+    'src/main.jsx': [
+      "import { Button } from '@ui/Button.jsx';",
+      "import './styles.css';",
+      "const remote = await import('remote-lib');",
+      'export function App() {',
+      "  localStorage.setItem('remote', String(Boolean(remote)));",
+      '  return <Button />;',
+      '}',
+    ].join('\n'),
+    'src/admin.js': [
+      "import { adminHelper } from './admin-helper.js';",
+      'export function Admin() {',
+      '  return adminHelper();',
+      '}',
+    ].join('\n'),
+    'src/admin-helper.js': 'export function adminHelper() { return "admin"; }\n',
+    'src/ui/Button.jsx': 'export function Button() { return <button />; }\n',
+    'src/styles.css': 'body { color: black; }\n',
+    'server/routes.js': 'export function apiRoute() { return "server"; }\n',
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'index.html' });
+
+  assert.equal(result.entryRel, 'index.html');
+  assert.equal(result.entryKind, 'html');
+  assert.deepEqual(result.entryModules, ['src/admin.js', 'src/main.jsx']);
+  assert.deepEqual(result.jsScripts.map((item) => item.path), [
+    'src/admin-helper.js',
+    'src/admin.js',
+    'src/main.jsx',
+    'src/ui/Button.jsx',
+  ]);
+  assert.deepEqual(result.assets.map((item) => [item.kind, item.path]), [
+    ['style', 'src/styles.css'],
+  ]);
+  assert.deepEqual(result.remoteImports.map((item) => item.specifier), ['remote-lib']);
+  assert.ok(result.componentEdges.some((edge) => edge.sourceComponent === 'App' && edge.targetComponent === 'Button'));
+  assert.ok(result.browserApis.some((item) => item.api === 'browser:localStorage'));
+  assert.ok(!result.jsScripts.some((item) => item.path.startsWith('server/')));
+});
+
+test('analyzeProject records browser asset, worker, Node builtin, and unsupported source edges', async () => {
+  const rootDir = await writeTempProject({
+    'src/main.js': [
+      "import fs from 'node:fs';",
+      "import path from 'path';",
+      "import './style.css';",
+      "import data from './data.json' with { type: 'json' };",
+      "import logo from './logo.svg';",
+      "import wasmUrl from './math.wasm';",
+      "import './readme.custom';",
+      "import './typed.ts';",
+      "const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });",
+      'export function boot() {',
+      '  return [fs, path, data, logo, wasmUrl, worker];',
+      '}',
+    ].join('\n'),
+    'src/worker.js': 'export function workerTask() { return true; }\n',
+    'src/style.css': 'body { color: black; }\n',
+    'src/data.json': '{"ok":true}\n',
+    'src/logo.svg': '<svg />\n',
+    'src/math.wasm': 'wasm\n',
+    'src/readme.custom': 'custom\n',
+    'src/typed.ts': 'export const typed = true;\n',
+  });
+
+  const result = await analyzeProject({ rootDir, entry: 'src/main.js' });
+  const mainModule = result.graph.modules.get('src/main.js');
+
+  assert.deepEqual(mainModule.localDeps, ['src/worker.js']);
+  assert.deepEqual(result.assets.map((item) => [item.kind, item.path]).sort(), [
+    ['image', 'src/logo.svg'],
+    ['json', 'src/data.json'],
+    ['style', 'src/style.css'],
+    ['unknown', 'src/readme.custom'],
+    ['wasm', 'src/math.wasm'],
+    ['worker', 'src/worker.js'],
+  ]);
+  assert.deepEqual(result.lazyBoundaries.map((item) => [item.kind, item.targetModulePath]), [
+    ['worker', 'src/worker.js'],
+  ]);
+  assert.deepEqual(result.browserIncompatibleImports.map((item) => [item.specifier, item.nodeBuiltin]), [
+    ['node:fs', 'fs'],
+    ['path', 'path'],
+  ]);
+  assert.ok(result.unresolvedImports.some((item) => (
+    item.specifier === './typed.ts' && item.unresolvedReason === 'unsupported_module_type:.ts'
+  )));
+  assert.deepEqual(new Set(result.findings.map((item) => item.ruleId)), new Set([
+    'IRONG_FRONTEND_NODE_IMPORT',
+    'IRONG_UNRESOLVED_IMPORT',
+  ]));
+});
+
+test('analyzeProject keeps full-stack backend files out unless browser reachable', async () => {
+  const rootDir = await writeTempProject({
+    'index.html': '<script type="module" src="/src/main.js"></script>\n',
+    'src/main.js': [
+      "import { clientApi } from './client-api.js';",
+      'export function boot() {',
+      '  return clientApi();',
+      '}',
+    ].join('\n'),
+    'src/client-api.js': [
+      'export function clientApi() {',
+      "  return fetch('/api');",
+      '}',
+    ].join('\n'),
+    'src/unused-widget.js': 'export function UnusedWidget() { return null; }\n',
+    'server/app.js': [
+      "import express from 'express';",
+      'export function serverApp() {',
+      '  return express();',
+      '}',
+    ].join('\n'),
+  });
+
+  const defaultResult = await analyzeProject({ rootDir, entry: 'index.html' });
+  const withUnreachable = await analyzeProject({ rootDir, entry: 'index.html', includeUnreachable: true });
+
+  assert.deepEqual(defaultResult.jsScripts.map((item) => item.path), [
+    'src/client-api.js',
+    'src/main.js',
+  ]);
+  assert.deepEqual(withUnreachable.jsScripts.map((item) => item.path), [
+    'src/client-api.js',
+    'src/main.js',
+    'src/unused-widget.js',
+  ]);
+  assert.ok(!withUnreachable.jsScripts.some((item) => item.path.startsWith('server/')));
+});
+
+test('analyzeProject uses sourceRoot only to bound unreachable discovery', async () => {
+  const rootDir = await writeTempProject({
+    'index.html': '<script type="module" src="/src/main.js"></script>\n',
+    'src/main.js': 'export function boot() { return true; }\n',
+    'src/unused.js': 'export function unused() { return true; }\n',
+    'client/unused.js': 'export function otherClient() { return true; }\n',
+    'server/app.js': 'export function serverApp() { return true; }\n',
+  });
+
+  const result = await analyzeProject({
+    rootDir,
+    entry: 'index.html',
+    sourceRoot: 'src',
+    includeUnreachable: true,
+  });
+
+  assert.equal(result.rootDir, rootDir);
+  assert.equal(result.entryRel, 'index.html');
+  assert.equal(result.graph.sourceRoot, 'src');
+  assert.deepEqual(result.jsScripts.map((item) => item.path), [
+    'src/main.js',
+    'src/unused.js',
+  ]);
+});
+
+test('analyzeProject bounds unreachable discovery to front-end roots while keeping reachable imports', async () => {
   const rootDir = await writeTempProject({
     'src/app.jsx': [
       "import { reachable } from './reachable.js';",
@@ -474,7 +657,7 @@ test('analyzeProject excludes transient project discovery directories only', asy
       "  return 'hidden but not transient';",
       '}',
     ].join('\n'),
-    '.worktrees/faculty/src/generated.js': [
+    '.worktrees/parallel-checkout/src/generated.js': [
       'export function embeddedWorktreeModule() {',
       "  return 'excluded';",
       '}',
@@ -491,18 +674,18 @@ test('analyzeProject excludes transient project discovery directories only', asy
     ].join('\n'),
   });
 
-  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx', includeUnreachable: true });
 
   assert.deepEqual(result.jsScripts.map((item) => item.path), [
     '.cache/ironglancer/app.js',
-    '.storybook/preview.js',
     'src/app.jsx',
     'src/ordinary-orphan.js',
     'src/reachable.js',
   ]);
-  assert.equal(result.summary.moduleCount, 5);
+  assert.equal(result.summary.moduleCount, 4);
   assert.equal(result.summary.reachableModuleCount, 3);
   assert.equal(result.summary.externalCount, 0);
+  assert.ok(!result.jsScripts.some((item) => item.path.startsWith('.storybook/')));
   assert.ok(!result.jsScripts.some((item) => item.path.startsWith('.worktrees/')));
   assert.ok(!result.jsScripts.some((item) => item.path.startsWith('.codex-worktrees/')));
 
@@ -530,46 +713,53 @@ test('analyzeProject ignores React imports in diagrams while keeping other exter
   assert.ok(result.mermaid.includes('class Widget'));
 });
 
-const lazyLoadedRoot = path.resolve('tests/fixtures/lazy-loaded-imports');
-
-test('analyzeProject resolves lazy-loaded module specifier constants', async () => {
-  const result = await analyzeProject({
-    rootDir: lazyLoadedRoot,
-    entry: 'src/app.jsx',
-    routeAliases: [{ from: '/creator/', to: 'src/creator/' }],
+test('analyzeProject resolves dynamic imports, React.lazy constants, and omits unreachable modules by default', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      "import React from 'react';",
+      "const LAZY_WIDGET = './Widget.jsx';",
+      "const PANEL = './Panel.jsx';",
+      "const LazyWidget = React.lazy(() => import(LAZY_WIDGET));",
+      "const { Panel } = await window.import(PANEL);",
+      'export function App() {',
+      '  return <><LazyWidget /><Panel /></>;',
+      '}',
+    ].join('\n'),
+    'src/Widget.jsx': 'export default function Widget() { return <p />; }\n',
+    'src/Panel.jsx': 'export function Panel() { return <section />; }\n',
+    'src/Unused.jsx': 'export function Unused() { return <aside />; }\n',
   });
 
+  const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
+
   assert.equal(result.entryRel, 'src/app.jsx');
-  assert.equal(result.summary.moduleCount, 5);
-  assert.equal(result.summary.reachableModuleCount, 4);
-  assert.equal(result.summary.unreachableModuleCount, 1);
   assert.deepEqual(result.jsScripts.map((item) => item.path), [
+    'src/Panel.jsx',
+    'src/Widget.jsx',
     'src/app.jsx',
-    'src/creator/components/creator-lazy-widget.jsx',
-    'src/creator/components/creator-panel.jsx',
-    'src/creator/components/creator-startup-cache.js',
-    'src/creator/components/unused-editor.jsx',
   ]);
-  assert.ok(result.treeText.includes('src/creator/components/creator-panel.jsx'));
-  assert.ok(result.treeText.includes('src/creator/components/creator-lazy-widget.jsx'));
-  assert.ok(!result.treeText.includes('src/creator/components/unused-editor.jsx'));
-  assert.ok(!result.jsxTreeText.includes('unused-editor.jsx'));
-  assert.ok(result.mermaid.includes('app --> creator_lazy_widget : lazy'));
-  assert.ok(result.mermaid.includes('app --> creator_panel : lazy'));
-  assert.ok(!result.mermaid.includes('unused_editor'));
-  assert.ok(!result.mermaid.includes(': imports'));
+  assert.deepEqual(
+    result.lazyBoundaries.map((item) => [item.kind, item.specifier, item.targetModulePath]),
+    [
+      ['dynamic-import', './Panel.jsx', 'src/Panel.jsx'],
+      ['dynamic-import', './Widget.jsx', 'src/Widget.jsx'],
+      ['react-lazy', './Widget.jsx', 'src/Widget.jsx'],
+    ],
+  );
+  assert.equal(result.componentEdges.filter((edge) => edge.resolved).length, 2);
+  assert.ok(!result.jsScripts.some((item) => item.path === 'src/Unused.jsx'));
 });
 
 test('analyzeProject records same-module function edges for spread operand calls', async () => {
   const rootDir = await writeTempProject({
     'src/app.jsx': [
-      'export function buildCreatorRubricsExplorerFiles(snapshot) {',
+      'export function buildReviewExplorerFiles(snapshot) {',
       '  return [snapshot];',
       '}',
       '',
-      'export function CreatorRubricsExplorer(snapshot) {',
+      'export function ReviewExplorer(snapshot) {',
       '  return [',
-      '    ...buildCreatorRubricsExplorerFiles(snapshot),',
+      '    ...buildReviewExplorerFiles(snapshot),',
       '  ];',
       '}',
     ].join('\n'),
@@ -577,8 +767,8 @@ test('analyzeProject records same-module function edges for spread operand calls
 
   const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
   const edge = result.functionDependencyMap.edges.find((candidate) => (
-    candidate.sourceFunction === 'CreatorRubricsExplorer'
-    && candidate.targetFunction === 'buildCreatorRubricsExplorerFiles'
+    candidate.sourceFunction === 'ReviewExplorer'
+    && candidate.targetFunction === 'buildReviewExplorerFiles'
   ));
 
   assert.ok(edge, 'expected spread operand call to create a same-module function edge');
@@ -590,31 +780,23 @@ test('analyzeProject records same-module function edges for spread operand calls
   assert.equal(edge.referenceCount, 1);
 });
 
-test('analyzeProject resolves exact Faculty browser import wrappers without broad call inference', async () => {
+test('analyzeProject resolves React.lazy import boundaries without broad call inference', async () => {
   const rootDir = await writeTempProject({
     'src/app.jsx': [
-      "const BROWSER_SPECIFIER = './browser-child.jsx';",
-      "const NATIVE_SPECIFIER = './native-child.jsx';",
+      "import { lazy } from 'react';",
+      "const CHILD_SPECIFIER = './browser-child.jsx';",
       '',
-      'export async function App() {',
-      '  await importCreatorBrowserModule(BROWSER_SPECIFIER, NATIVE_SPECIFIER);',
-      "  importCreatorBrowserModule('./' + computedName, './computed-native.jsx');",
-      "  importOtherBrowserModule('./false-positive.jsx', './false-positive-native.jsx');",
-      '  return null;',
+      'const BrowserChild = lazy(() => import(CHILD_SPECIFIER));',
+      "const ignored = lazy(() => import('./' + computedName));",
+      "function importOtherBrowserModule() { return null; }",
+      "importOtherBrowserModule('./false-positive.jsx');",
+      '',
+      'export function App() {',
+      '  return <BrowserChild />;',
       '}',
     ].join('\n'),
     'src/browser-child.jsx': [
       'export function BrowserChild() {',
-      '  return null;',
-      '}',
-    ].join('\n'),
-    'src/native-child.jsx': [
-      'export function NativeChild() {',
-      '  return null;',
-      '}',
-    ].join('\n'),
-    'src/computed-native.jsx': [
-      'export function ComputedNative() {',
       '  return null;',
       '}',
     ].join('\n'),
@@ -623,34 +805,23 @@ test('analyzeProject resolves exact Faculty browser import wrappers without broa
       '  return null;',
       '}',
     ].join('\n'),
-    'src/false-positive-native.jsx': [
-      'export function FalsePositiveNative() {',
-      '  return null;',
-      '}',
-    ].join('\n'),
   });
 
   const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
   const appModule = result.graph.modules.get('src/app.jsx');
 
-  assert.deepEqual(appModule.localDeps, [
-    'src/browser-child.jsx',
-    'src/native-child.jsx',
-  ]);
+  assert.deepEqual(appModule.localDeps, ['src/browser-child.jsx']);
   assert.equal(result.graph.modules.get('src/browser-child.jsx').reachable, true);
-  assert.equal(result.graph.modules.get('src/native-child.jsx').reachable, true);
-  assert.equal(result.graph.modules.get('src/computed-native.jsx').reachable, false);
-  assert.equal(result.graph.modules.get('src/false-positive.jsx').reachable, false);
-  assert.equal(result.graph.modules.get('src/false-positive-native.jsx').reachable, false);
+  assert.equal(result.graph.modules.has('src/false-positive.jsx'), false);
   assert.deepEqual(
     result.importEdges
       .filter((edge) => edge.sourcePath === 'src/app.jsx')
       .map(({ targetPath, loadKinds }) => ({ targetPath, loadKinds })),
     [
-      { targetPath: 'src/browser-child.jsx', loadKinds: ['dynamic-wrapper'] },
-      { targetPath: 'src/native-child.jsx', loadKinds: ['dynamic-wrapper'] },
+      { targetPath: 'src/browser-child.jsx', loadKinds: ['dynamic', 'lazy'] },
     ],
   );
+  assert.deepEqual(new Set(result.lazyBoundaries.map((item) => item.targetModulePath)), new Set(['src/browser-child.jsx']));
 });
 
 const importEdgeMetadataRoot = path.resolve('tests/fixtures/import-edge-metadata');
@@ -664,12 +835,10 @@ test('analyzeProject exposes JSX import edge metadata', async () => {
   assert.deepEqual(result.jsScripts.map((item) => item.path), [
     'src/app.jsx',
     'src/dynamic-child.jsx',
-    'src/faculty-body-child.jsx',
-    'src/faculty-editor-child.jsx',
     'src/static-child.jsx',
   ]);
-  assert.match(result.mermaid, /class app\["28 app\.jsx"\] \{/);
-  assert.match(result.mermaid, /\+App\(\) \[lines: 16 \| refs: 0 \| importers: 0\]/);
+  assert.match(result.mermaid, /class app\["20 app\.jsx"\] \{/);
+  assert.match(result.mermaid, /\+App\(\) \[lines: 12 \| refs: 0 \| importers: 0\]/);
   assert.match(result.mermaid, /class static_child\["11 static-child\.jsx"\] \{/);
   assert.match(result.mermaid, /\+StaticNamed\(\) \[lines: 3 \| refs: 1 \| importers: 1\]/);
   assert.ok(result.mermaid.includes('app --> static_child : import'));
@@ -690,40 +859,6 @@ test('analyzeProject exposes JSX import edge metadata', async () => {
           local: 'DynamicLocal',
           kind: 'named',
           inferred: false,
-          lineCount: 3,
-        },
-      ],
-    },
-    {
-      source: 'app',
-      target: 'faculty_body_child',
-      sourcePath: 'src/app.jsx',
-      targetPath: 'src/faculty-body-child.jsx',
-      targetLineCount: 3,
-      loadKinds: ['lazy'],
-      imports: [
-        {
-          imported: 'CreatorViewBody',
-          local: 'CreatorViewBody',
-          kind: 'named',
-          inferred: true,
-          lineCount: 3,
-        },
-      ],
-    },
-    {
-      source: 'app',
-      target: 'faculty_editor_child',
-      sourcePath: 'src/app.jsx',
-      targetPath: 'src/faculty-editor-child.jsx',
-      targetLineCount: 3,
-      loadKinds: ['lazy'],
-      imports: [
-        {
-          imported: 'CreatorQuizEntryEditor',
-          local: 'CreatorQuizEntryEditor',
-          kind: 'named',
-          inferred: true,
           lineCount: 3,
         },
       ],
@@ -859,7 +994,7 @@ test('analyzeProject counts function usages rather than import declarations as r
   assert.match(result.mermaid, /\+Format \[lines: 3 \| refs: 3 \| importers: 1\]/);
 });
 
-test('analyzeProject resolves local require forms and preserves require edge metadata', async () => {
+test('analyzeProject ignores require targets and reports unsupported CommonJS calls', async () => {
   const rootDir = await writeTempProject({
     'src/app.jsx': [
       "const { RequiredChild: RequiredAlias } = require('./child.jsx');",
@@ -889,26 +1024,17 @@ test('analyzeProject resolves local require forms and preserves require edge met
   });
 
   const result = await analyzeProject({ rootDir, entry: 'src/app.jsx' });
-  const requireEdge = result.importEdges.find((edge) => edge.targetPath === 'src/child.jsx');
 
-  assert.deepEqual(result.jsScripts.map((item) => item.path), [
-    'src/app.jsx',
-    'src/child.jsx',
-    'src/register.js',
-    'src/shared.js',
-  ]);
+  assert.deepEqual(result.jsScripts.map((item) => item.path), ['src/app.jsx']);
   assert.ok(!result.treeText.includes("computedName"));
-  assert.ok(requireEdge, 'expected a JSX import edge for the required child');
-  assert.deepEqual(requireEdge.loadKinds, ['require']);
-  assert.deepEqual(requireEdge.imports, [
-    {
-      imported: 'RequiredChild',
-      local: 'RequiredAlias',
-      kind: 'named',
-      inferred: false,
-      lineCount: 3,
-    },
+  assert.equal(result.importEdges.length, 0);
+  assert.deepEqual(result.commonJsSyntax.map((item) => item.kind), [
+    'require-call',
+    'require-call',
+    'require-call',
+    'require-call',
   ]);
+  assert.deepEqual(new Set(result.findings.map((item) => item.ruleId)), new Set(['IRONG_UNSUPPORTED_COMMONJS']));
 });
 
 test('analyzeProject maps named export aliases back to local declarations for import metrics', async () => {
@@ -990,4 +1116,76 @@ test('analyzeProject resolves default exports from mixed local export lists', as
   assert.equal(widgetDeclaration.importerFileCount, 1);
   assert.equal(widgetDeclaration.referenceCount, 1);
   assert.match(result.mermaid, /\+Widget \[lines: 1 \| refs: 1 \| importers: 1\]/);
+});
+
+test('analyzeProject rejects TS/TSX entries and resolves generic JS aliases only', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.tsx': [
+      'export function App() {',
+      '  return <main />;',
+      '}',
+    ].join('\n'),
+    'src/main.jsx': [
+      "import { formatDisplay } from '@lib/format.js';",
+      "import { Button } from '@ui';",
+      '',
+      'export function App() {',
+      "  return <Button label={formatDisplay('ok')} />;",
+      '}',
+    ].join('\n'),
+    'src/lib/format.js': [
+      'export function formatDisplay(value) {',
+      '  return value.trim();',
+      '}',
+    ].join('\n'),
+    'src/ui/index.jsx': [
+      'export function Button(props) {',
+      '  return <button>{props.label}</button>;',
+      '}',
+    ].join('\n'),
+  });
+
+  await assert.rejects(
+    () => analyzeProject({ rootDir, entry: 'src/app.tsx' }),
+    /browser JavaScript module/,
+  );
+
+  const first = await analyzeProject({
+    rootDir,
+    entry: 'src/main.jsx',
+    aliases: [
+      '@lib/=src/lib/',
+      '@ui=src/ui/index.jsx',
+    ],
+  });
+  const second = await analyzeProject({
+    rootDir,
+    entry: 'src/main.jsx',
+    aliases: [
+      '@lib/=src/lib/',
+      '@ui=src/ui/index.jsx',
+    ],
+  });
+  const appModule = first.graph.modules.get('src/main.jsx');
+  const edgeTargets = first.functionDependencyMap.edges
+    .filter((edge) => edge.sourceFunction === 'App')
+    .map((edge) => `${edge.targetModulePath}:${edge.targetFunction}`)
+    .sort();
+
+  assert.equal(first.metadata.analyzer.name, 'javascript-ast');
+  assert.equal(first.metadata.backend.name, 'javascript-ast');
+  assert.equal(first.summary.jsxFileCount, 2);
+  assert.deepEqual(appModule.localDeps, ['src/lib/format.js', 'src/ui/index.jsx']);
+  assert.deepEqual(edgeTargets, [
+    'src/lib/format.js:formatDisplay',
+    'src/ui/index.jsx:Button',
+  ]);
+  assert.deepEqual(
+    first.functionDependencyMap.functions.map((node) => [node.stableId, node.modulePath, node.name]),
+    second.functionDependencyMap.functions.map((node) => [node.stableId, node.modulePath, node.name]),
+  );
+  assert.deepEqual(
+    first.functionDependencyMap.edges.map((edge) => [edge.sourceFunction, edge.targetModulePath, edge.targetFunction]),
+    second.functionDependencyMap.edges.map((edge) => [edge.sourceFunction, edge.targetModulePath, edge.targetFunction]),
+  );
 });

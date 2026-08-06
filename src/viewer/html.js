@@ -897,7 +897,7 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
       <main class="viewer-grid">
         <section class="panel" aria-labelledby="visualization-title">
           <div class="panel-header">
-            <h2 id="visualization-title">Architecture Views</h2>
+            <h2 id="visualization-title">Overview</h2>
             <span id="network-status" class="status-line" aria-live="polite"></span>
           </div>
           <div class="panel-body visualization-panel-body">
@@ -905,7 +905,7 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
               <div id="primary-view-switch" class="segmented-control" role="group" aria-label="Primary visualization view"></div>
             </div>
 
-            <section id="function-graphs-view" class="visualization-view" aria-label="Function graphs">
+            <section id="function-graphs-view" class="visualization-view" aria-label="Functions advanced graph" hidden>
               <div class="network-toolbar">
                 <div class="toolbar-group network-primary-controls">
                   <div class="control-set">
@@ -937,13 +937,13 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
                 </div>
               </div>
               <div id="file-legend" class="legend" aria-label="File color legend"></div>
-              <div id="function-network-help" class="network-help">Drag to pan. Use the zoom buttons, pinch, or Ctrl/Cmd + wheel to zoom. Select a function in the graph to highlight who uses it and what it uses.</div>
+              <div id="function-network-help" class="network-help">Drag to pan. Use the zoom buttons, pinch, or Ctrl/Cmd + wheel to zoom. Select a function in the graph to highlight its saved structural relationships.</div>
               <div id="function-network-viewport" class="network-viewport">
                 <svg id="function-network-svg" class="network-svg" role="img" aria-label="Function graph"></svg>
               </div>
             </section>
 
-            <section id="jsx-map-view" class="visualization-view" aria-label="JSX file composition map" hidden>
+            <section id="jsx-map-view" class="visualization-view" aria-label="Components and module composition map">
               <div class="module-diagram-body">
                 <div class="network-toolbar">
                   <div class="toolbar-group" aria-label="JSX map view controls">
@@ -972,32 +972,67 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         <div class="lower-grid">
           <section class="panel" aria-labelledby="selected-title">
             <div class="panel-header">
-              <h2 id="selected-title">Function Details</h2>
+              <h2 id="selected-title">Functions (advanced)</h2>
             </div>
             <div id="selected-function" class="panel-body selected-function" aria-live="polite"></div>
           </section>
 
           <section class="panel" aria-labelledby="summary-title">
             <div class="panel-header">
-              <h2 id="summary-title">Project Snapshot</h2>
+              <h2 id="summary-title">Overview</h2>
             </div>
             <div id="stats" class="panel-body summary-grid"></div>
           </section>
         </div>
 
         <details class="panel">
-          <summary><h2>Files</h2></summary>
+          <summary><h2>Components</h2></summary>
+          <div class="panel-body text-panel-body">
+            <pre id="components-list"></pre>
+          </div>
+        </details>
+
+        <details class="panel">
+          <summary><h2>Modules</h2></summary>
           <div class="panel-body text-panel-body">
             <div class="text-toolbar">
-              <button id="copy-jsx-tree-btn" type="button" aria-describedby="copy-jsx-tree-status" disabled>Copy JSX tree</button>
+              <button id="copy-jsx-tree-btn" type="button" aria-describedby="copy-jsx-tree-status" disabled>Copy module tree</button>
               <span id="copy-jsx-tree-status" class="copy-status" role="status" aria-live="polite"></span>
             </div>
             <pre id="jsx-tree"></pre>
           </div>
         </details>
 
+        <details class="panel" open>
+          <summary><h2>Routes</h2></summary>
+          <div class="panel-body text-panel-body">
+            <pre id="routes-list"></pre>
+          </div>
+        </details>
+
         <details class="panel">
-          <summary><h2>Dependency Tree</h2></summary>
+          <summary><h2>Lazy Boundaries</h2></summary>
+          <div class="panel-body text-panel-body">
+            <pre id="lazy-boundaries-list"></pre>
+          </div>
+        </details>
+
+        <details class="panel">
+          <summary><h2>Assets</h2></summary>
+          <div class="panel-body text-panel-body">
+            <pre id="assets-list"></pre>
+          </div>
+        </details>
+
+        <details class="panel" open>
+          <summary><h2>Findings</h2></summary>
+          <div class="panel-body text-panel-body">
+            <pre id="findings-list"></pre>
+          </div>
+        </details>
+
+        <details class="panel">
+          <summary><h2>Source</h2></summary>
           <div class="panel-body text-panel-body">
             <div class="text-toolbar">
               <button id="copy-tree-btn" type="button" aria-describedby="copy-tree-status" disabled>Copy dependency tree</button>

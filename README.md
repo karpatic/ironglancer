@@ -1,161 +1,147 @@
 # IronGlancer
 
-IronGlancer analyzes a folder's JavaScript / JSX module graph and emits a static site that only needs a plain file server.
+IronGlancer is a front-end architecture analyzer for browser-side JavaScript/JSX apps. The "Iron" in the name is the front-end play: it glances at the browser-facing surface of an app, not the server behind it.
 
 What it does
-- walks JS/JSX imports from an entry file
-- resolves relative imports, root-relative imports, import-map aliases, and configurable URL route aliases
-- emits a dependency tree, Mermaid class diagram source, and a browser viewer
-- can stay running as a localhost-first read-only viewer and JSON API over the saved analysis
-- saves function placement/cohesion evidence for human and agent review without claiming runtime call-graph certainty
-- produces static output only: index.html, app.js, output.json, source-code.json, diagram.mmd, vendor/, .ironglancer-api/
+- starts from a browser entry: an HTML file with module scripts, or a `.js`, `.jsx`, or `.mjs` module
+- follows browser-reachable ESM imports/exports, dynamic `import()`, `React.lazy`, module workers, import maps, root-relative URLs, and configured import aliases
+- records modules, JSX component-shaped declarations, JSX render edges, lazy boundaries, browser API references, remote imports, assets, unresolved imports, and browser-incompatible Node builtin imports
+- emits a static viewer plus immutable JSON artifacts for local review, CI, and MCP tools
+- keeps function dependency evidence as an advanced static view, not as a runtime call graph
+
+What it does not do
+- no TypeScript or TSX analysis; `.ts`, `.tsx`, `.mts`, and `.cts` imports are unsupported source-module findings, not analyzed modules
+- no CommonJS dependency graph; `.cjs`, `require()`, and `module.exports` are unsupported browser evidence or ignored as dependencies
+- no backend, Express, server route, serverless, Node backend, or generic whole-project inventory model
+- no runtime dataflow, route execution, performance, or call-graph claims
 
 Install
-- npm install -g ironglancer
+- `npm install -g ironglancer`
 
 CLI
-- ironglancer <folder> [--entry src/app.jsx] [--out ./ironglancer-site] [--route-alias /app/=src/app/]
-- repeat `--route-alias route=path` to map URL-rooted import prefixes onto source folders
-- add `--serve` to generate once and serve the immutable viewer plus `/api/v1` JSON API
-- serve mode binds `127.0.0.1:4173` by default; override with `--host` and `--port`
+- `ironglancer <folder> [--entry index.html] [--out ./ironglancer-site] [--framework auto|vanilla|react]`
+- `--entry <path>` may be HTML or a `.js`/`.jsx`/`.mjs` browser module
+- default fallback entries are `src/main.jsx`, `src/main.js`, `src/index.jsx`, `src/index.js`, `src/app.jsx`, and `src/app.js`, with `index.html` checked first
+- repeat `--alias specifier=path` for import-map-like aliases; root-relative browser URLs are resolved from `/` by default
+- `--source-root <path>` bounds optional unreachable discovery to a project-relative front-end source root
+- `--include-unreachable` includes extra `.js`/`.jsx`/`.mjs` files from the configured/inferred front-end source root; default output is browser-reachable modules only
+- `--include-source` is the explicit full-source shortcut; `--source-mode none|declarations|full` offers finer source artifact control
+- `--module-limit <count>` bounds generation and both sides of git-ref diffs; the default is 500
+- `--serve` generates once, then serves the immutable viewer plus `/api/v1` on `127.0.0.1:4173` by default
+- `--route-alias` remains as a deprecated compatibility alias for older root-relative URL mappings; prefer `--alias`
 
 Examples
-- ironglancer ./my-app --entry src/app.jsx --out ./ironglancer-site
-- npx ironglancer ./my-app --entry src/main.js --out ./docs/ironglancer
-- ironglancer ./my-app --entry src/web/app.jsx --route-alias /creator/=src/web/creator/
-- ironglancer ./my-app/src/web/creator --entry app.jsx --route-alias /creator/=
-- ironglancer ./my-app --entry src/app.jsx --out ./ironglancer-site --serve
-- ironglancer ./my-app --serve --host 127.0.0.1 --port 0
+- `ironglancer ./my-app --entry index.html --out ./ironglancer-site`
+- `ironglancer ./my-app --entry src/main.jsx --alias @/=src/ --out ./docs/ironglancer`
+- `ironglancer ./my-app --entry src/app.jsx --include-unreachable --source-root src`
+- `ironglancer ./my-app --entry index.html --serve --host 127.0.0.1 --port 0`
+
+Source privacy
+- default `--source-mode none` writes no source snippets and no full module source
+- `declarations` writes declaration snippets to `source-code.json`
+- `full` writes declaration snippets and full module source to `.ironglancer-api/source-modules.json`
+- `output.json` includes privacy capability flags and counts; diff JSON, HTML, and SARIF remain source-free
+- generated output refuses destructive targets such as the filesystem root, project root, current working directory, home directory, and source ancestors; replacement also requires an IronGlancer ownership marker
 
 Architecture diffs
-- compare two architecture snapshots from git refs without changing the checkout:
-  `ironglancer diff ./my-app --base main --head HEAD --entry src/app.jsx --format html --sarif review.sarif`
-- run an opt-in review gate against an accepted prior diff and exact finding suppressions:
-  `ironglancer diff ./my-app --base main --head HEAD --entry src/app.jsx --format html --sarif review.sarif --baseline accepted-diff.json --suppressions ironglancer-suppressions.json --fail-on warning`
+- compare git refs without mutating the checkout:
+  `ironglancer diff ./my-app --base main --head HEAD --entry index.html --module-limit 500 --format html --sarif review.sarif`
 - compare saved snapshots:
   `ironglancer diff --base ./before/output.json --head ./after-site --format json`
-- inputs can be git refs resolvable in the project repo, an `output.json` file, or a generated-site directory containing `output.json`
-- precedence is explicit: an existing `output.json` file or directory containing `output.json` wins; otherwise the input is resolved as a Git ref, so a plain directory named `main` does not shadow the `main` branch
-- move and rename matching requires the analyzer's privacy-safe implementation fingerprint; older snapshots without that evidence remain conservative additions and removals
-- `--format json` writes machine-readable JSON to stdout unless `--out` is supplied; `--format html` writes one self-contained static report and defaults to `architecture-diff.html` when `--out` is omitted
-- `--sarif review.sarif` writes SARIF 2.1.0 findings alongside either JSON or HTML output
-- `--baseline accepted-diff.json` reads a previous IronGlancer diff JSON report and marks exact matching finding IDs as existing
-- `--suppressions ironglancer-suppressions.json` accepts only `{ "version": 1, "suppressions": [{ "findingId": "...", "reason": "..." }] }`; suppressions match exact finding IDs and unknown IDs are counted as unused
-- `--fail-on error|warning|note` is opt-in CI gating; without it, `ironglancer diff` exits 0 even with findings, and with it a triggered gate exits 2 after reports are written
-- gating considers only actionable findings: new findings that are not suppressed
-- diff reports include schema/build/commit labels, module/function/edge deltas, structural findings, severity counts, static-analysis limitations, and `privacy.sourceMode = "none"`
-- privacy guarantee: diff JSON, HTML, and SARIF intentionally exclude absolute `rootDir` values, baseline paths, suppression paths, and source excerpts
-- caveat: findings are static structural review prompts, not runtime behavior claims; function edges are static identifier-use evidence
-- current limitations: git-ref inputs are analyzed from archived committed contents, so uncommitted work is not included; function move/rename pairing is conservative and leaves ambiguous candidates as ordinary add/remove changes; fan findings use the documented threshold of at least 3 new edges and at least 2x the previous count
+- inputs can be git refs, an `output.json` file, or a generated-site directory containing `output.json`
+- `--baseline accepted-diff.json` marks exact matching finding IDs as existing
+- `--suppressions ironglancer-suppressions.json` accepts exact finding suppressions with nonempty human reasons
+- `--fail-on error|warning|note` is opt-in CI gating; reports are written before a triggered gate exits 2
+- Semantic finding IDs use explicit per-rule identities with `identityVersion`; IDs avoid churn from source line movement, messages, evidence counts, severity, and confidence
+- diff findings include front-end incompatibility, unresolved imports, remote imports, lazy-boundary changes, component cycles, module cycles, reachability changes, export changes, and conservative function evidence
+
+GitHub Action
+- bundled Action: `uses: karpatic/ironglancer@<ref>`
+- inputs: `folder`, `base`, `head`, `entry`, `framework`, `source-root`, `aliases`, `alias`, `include-unreachable`, `exclude`, `module-limit`, `baseline`, `suppressions`, `fail-on`, `format`, `report-path`, and `sarif-path`
+- deprecated compatibility inputs: `route-aliases`, `route-alias`
+- outputs: `report-path`, `sarif-path`, `gate-triggered`, `finding-count`, and `exit-code`
+
+```yaml
+- uses: karpatic/ironglancer@v0.2.0
+  with:
+    folder: .
+    base: ${{ github.event.pull_request.base.sha }}
+    head: ${{ github.sha }}
+    entry: index.html
+    aliases: |
+      @/=src/
+    module-limit: 500
+    report-path: architecture-diff.json
+    sarif-path: architecture-diff.sarif
+```
 
 Standalone viewer
-- generate the static viewer: `ironglancer ./my-app --entry src/app.jsx --out ./ironglancer-site`
-- serve it with any local file server, or use IronGlancer's server: `ironglancer ./my-app --entry src/app.jsx --out ./ironglancer-site --serve`
-- the viewer works without any agent; clicking a function/source member shows recognized interior calls, static callers, package/platform/unresolved binding evidence, child-helper counts, and a placement review
+- generate the static viewer: `ironglancer ./my-app --entry index.html --out ./ironglancer-site`
+- serve it with any local file server, or use IronGlancer's server: `ironglancer ./my-app --entry index.html --out ./ironglancer-site --serve`
+- the main view leads with modules/components/lazy boundaries/assets/findings; functions are available as an advanced static-evidence view
 
 Standalone agent
-- generate once: `ironglancer ./my-app --entry src/app.jsx --out ./ironglancer-site`
+- generate once: `ironglancer ./my-app --entry index.html --out ./ironglancer-site`
 - run the packaged MCP server over that immutable saved analysis: `ironglancer-mcp --analysis-dir ./ironglancer-site`
-- Hermes example: `hermes mcp add ironglancer --command ironglancer-mcp --args --analysis-dir /absolute/path/to/ironglancer-site`
-- the MCP server does not need a browser or running viewer for analysis tools
-- MCP tools: `ironglancer_run_summary`, `ironglancer_search_functions`, `ironglancer_get_function`, `ironglancer_function_neighborhood`, `ironglancer_investigate_function_placement`, `ironglancer_source_excerpt`, `ironglancer_viewer_state`, `ironglancer_viewer_command`
-
-Connected Hermes + viewer
-- start the localhost viewer/API/bridge: `ironglancer ./my-app --entry src/app.jsx --out ./ironglancer-site --serve --host 127.0.0.1 --port 4173`
-- add Hermes with bridge access: `hermes mcp add ironglancer --command ironglancer-mcp --args --analysis-dir /absolute/path/to/ironglancer-site --bridge-url http://127.0.0.1:4173/bridge/v1`
-- MCP analysis tools read saved data directly; `ironglancer_function_neighborhood` supports multi-hop `dependencies`, `users`, or `both` reasoning without a viewer
-- viewer tools only read structured viewer state or queue presentation commands such as `focusFunction`, `openFunction`, `highlightFunction`, `scrollToFunction`, `clearHighlight`, and `setGraphView`
-- `/bridge/v1` viewer state includes the primary view, graph layout, node visibility, scope, depth, and selected function/file when a viewer is connected
-- `/bridge/v1` is localhost-first and unauthenticated by design; do not bind the server to an untrusted network if you use bridge commands
+- MCP tools include module/component summary tools plus advanced function tools for static dependency evidence
+- MCP caveat: when source mode is `none` or `declarations`, source excerpt tools return explicit unavailable metadata for missing module source while structural tools continue to work
 
 Library usage
 ```js
 import { analyzeProject, compareSnapshots, generateStaticSite, startStaticAnalysisServer } from 'ironglancer';
 
-const analysis = await analyzeProject({ rootDir: './my-app', entry: 'src/app.jsx' });
-const site = await generateStaticSite({ rootDir: './my-app', entry: 'src/app.jsx', outDir: './ironglancer-site' });
-const routed = await analyzeProject({
+const analysis = await analyzeProject({
   rootDir: './my-app',
-  entry: 'src/web/app.jsx',
-  routeAliases: [{ from: '/creator/', to: 'src/web/creator/' }],
+  entry: 'index.html',
+  aliases: ['@/=src/'],
+});
+const site = await generateStaticSite({
+  rootDir: './my-app',
+  entry: 'src/main.jsx',
+  outDir: './ironglancer-site',
+  sourceMode: 'none',
+});
+const withUnreachable = await analyzeProject({
+  rootDir: './my-app',
+  entry: 'index.html',
+  sourceRoot: 'src',
+  includeUnreachable: true,
 });
 const service = await startStaticAnalysisServer({ outDir: site.outDir });
 const diff = compareSnapshots(beforeOutputJson, afterOutputJson, { baseLabel: 'main', headLabel: 'HEAD' });
-console.log(service.url, service.apiBaseUrl);
+console.log(analysis.summary, withUnreachable.summary, service.url, diff.findings.length);
 ```
 
 Read-only API
-- serve mode loads generated `output.json`, `source-code.json`, `.ironglancer-api/source-modules.json`, and `.ironglancer-api/function-map.json` once at startup and does not reparse the project per request
-- source endpoints only return bounded excerpts from modules saved in the analyzed run
-- the built-in server does not serve `.ironglancer-api/` as static files
-- symbol relation endpoints expose static import/export/reference relationships IronGlancer captures, not runtime call graphs or data lineage
-- function dependency endpoints expose static identifier usage inside declared function spans; direct call, optional-call, tagged-template, and JSX element syntax are labeled when visible, while generic references remain `reference`
-- function placement review distinguishes same-file, project-local, package, platform, and unresolved static evidence where IronGlancer can see lexical import-binding usage; it is a review aid, not runtime ownership proof or definitive dead-code detection
-- unknown API query parameters return HTTP 400 instead of being silently ignored
-- general list pagination uses `limit` and `offset`; explicit `limit` must be between 1 and 200, while `/modules/:id/functions` preserves its legacy all-functions result when both are omitted
-- legacy Base64URL `id` values remain accepted; module, function, symbol, import, and function-edge records also expose compact deterministic `stableId` join keys
-- compact function IDs use lexical scope rather than source lines; structurally indistinguishable duplicates or digest collisions receive unique ordinal suffixes whose assignment may change if those duplicates are reordered
-- summary lists accept opt-in `fields=...` sparse projections; module/function details accept bounded `include=...` expansion controls, with HTTP 400 for unknown selectors
-- `search` and `q` are case-insensitive substring filters on legacy list routes; exact filters include `name`, `userCount`, `dependencyCount`, and `referenceCount`
-- `/api/v1/search` adds exact function-aware lexical occurrence search over masked saved source without claiming binding identity or runtime execution; recognized JSX child text is labeled `jsx-text`, and occurrence scans fail with HTTP 413 above 5,000,000 saved-source characters or 10,000 matches
-- function triage supports `reachable`, `exported`, `standalone`, count filters, and deterministic sorting; import triage distinguishes local, external, unresolved, and dynamic static evidence
-- shortest paths and blast radius use bounded deterministic breadth-first traversal over immutable saved indexes (`maxDepth <= 50`, at most 10,000 visited nodes)
-- JSON errors are shaped as `{ "ok": false, "error": { "status": 404, "code": "not_found", "message": "..." } }`
+- serve mode loads generated `output.json`, `source-code.json`, `.ironglancer-api/source-modules.json`, and `.ironglancer-api/function-map.json` once at startup
+- source endpoints only return bounded excerpts from modules saved in the run
+- module/component/asset/import endpoints expose static browser architecture evidence
+- symbol/function endpoints expose advanced static import/export/reference relationships, not runtime calls or data lineage
+- import triage distinguishes `local`, `asset`, `remote`, `browser-incompatible`, `external`, and `unresolved`
+- unknown query parameters return HTTP 400; list pagination uses `limit` and `offset`
 
 Routes
-- `GET /api/v1` discovers routes and semantics
-- `GET /api/v1/schema` returns the schema catalog in the standard API envelope; `GET /api/v1/schema.json` returns raw `application/schema+json`
-- `GET /api/v1/run` returns API/schema version, package version, build timestamp, root/entry, git commit when available, build id, source hash, and summary
-- `GET /api/v1/modules?search=app&reachable=true&extension=.jsx&limit=25&offset=0`
-- `GET /api/v1/modules/:id`
-- `GET /api/v1/modules/:id/dependencies`
-- `GET /api/v1/modules/:id/dependents`
-- `GET /api/v1/modules/:id/functions?detail=summary&limit=25&offset=0`
-- `GET /api/v1/modules/:id/shortest-path?targetId=<module-id>&maxDepth=10`
-- `GET /api/v1/modules/:id/blast-radius?maxDepth=10&limit=200`
+- `GET /api/v1`
+- `GET /api/v1/run`
+- `GET /api/v1/modules?reachable=true&extension=.jsx`
+- `GET /api/v1/components?modulePath=src/main.jsx`
+- `GET /api/v1/component-edges`
+- `GET /api/v1/routes`
+- `GET /api/v1/lazy-boundaries`
+- `GET /api/v1/assets`
+- `GET /api/v1/imports?resolution=browser-incompatible`
 - `GET /api/v1/imports?resolution=unresolved&dynamic=true`
-- `GET /api/v1/modules/:id/source?startLine=1&endLine=40`
-- `GET /api/v1/source?path=src/app.jsx&startLine=1&endLine=40`
-- `GET /api/v1/symbols?search=helper&modulePath=src/app.jsx`
-- `GET /api/v1/symbols?name=helper&referenceCount=1`
-- `GET /api/v1/symbols/search?q=helper`
-- `GET /api/v1/symbols/:id`
-- `GET /api/v1/symbols/:id/references`
-- `GET /api/v1/symbols/:id/callers`
 - `GET /api/v1/functions?modulePath=src/app.jsx&component=true`
-- `GET /api/v1/functions?name=RootApp&dependencyCount=2&userCount=0`
-- `GET /api/v1/functions/search?q=RootApp`
-- `GET /api/v1/functions/:id`
-- `GET /api/v1/functions/:id/dependencies`
-- `GET /api/v1/functions/:id/users`
-- `GET /api/v1/functions/:id/placement`
-- `GET /api/v1/functions/:id/shortest-path?targetId=<function-id>&maxDepth=10`
-- `GET /api/v1/functions/:id/blast-radius?maxDepth=10&limit=200`
-- `GET /api/v1/search?q=RootApp&match=exact&types=function,occurrence`
-- `GET /api/v1/query?modulePath=src/app.jsx&symbol=RootApp`
-
-API examples
-```sh
-curl http://127.0.0.1:4173/api/v1/run
-curl 'http://127.0.0.1:4173/api/v1/modules?reachable=true&extension=.jsx'
-curl 'http://127.0.0.1:4173/api/v1/symbols/search?q=RootApp'
-curl 'http://127.0.0.1:4173/api/v1/functions/search?q=RootApp'
-curl 'http://127.0.0.1:4173/api/v1/functions?name=RootApp&dependencyCount=2'
-curl 'http://127.0.0.1:4173/api/v1/functions/<function-id>/placement'
-curl 'http://127.0.0.1:4173/api/v1/modules/<module-id>/functions?detail=summary&limit=25&offset=0'
-```
+- `GET /api/v1/search?q=App&match=exact&types=function,occurrence`
 
 Development
-- npm ci
-- npm test
-- npm run build:demo
+- `npm ci`
+- `npm test`
+- `npm run build:demo`
+- `npm run build:action`
+- `npm run check:action-bundle`
+- `npm run release:check`
 
-Publishing
-- npm run publish:npm
-- npm run publish:github
-- npm run publish:all
-
-GitHub Pages
-- the Pages workflow publishes a simple React app whose JSX runs directly in the browser with Bundless
-- the build runs IronGlancer against that exact app and embeds the generated viewer at `./analysis/`
-- intended public URL: https://karpatic.github.io/ironglancer/
+Release notes
+- 0.2.0 is release-ready in source form only after Carlos explicitly publishes both npmjs `ironglancer` and GitHub Packages `@karpatic/ironglancer`
+- do not call a version release complete unless both registries are updated and verified

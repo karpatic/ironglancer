@@ -12,13 +12,21 @@ const DEFAULT_PORT = 4173;
 
 function usage() {
   return [
-    'Usage: ironglancer <folder> [--entry src/app.jsx] [--out ./ironglancer-site] [--route-alias /app/=src/app/]',
-    '       ironglancer diff [folder] --base <input> --head <input> [--entry src/app.jsx] [--format json|html] [--out architecture-diff.html] [--sarif review.sarif] [--baseline accepted-diff.json] [--suppressions ironglancer-suppressions.json] [--fail-on error|warning|note]',
+    'Usage: ironglancer <folder> [--entry index.html] [--out ./ironglancer-site] [--framework auto|vanilla|react]',
+    '       ironglancer diff [folder] --base <input> --head <input> [--entry index.html] [--format json|html] [--out architecture-diff.html] [--sarif review.sarif] [--baseline accepted-diff.json] [--suppressions ironglancer-suppressions.json] [--fail-on error|warning|note]',
     '',
     'Options:',
-    '  --entry <path>              Entry module inside the project root.',
+    '  --entry <path>              Browser entry: HTML with module scripts or .js/.jsx/.mjs module.',
     '  --out <path>                Output directory for the generated viewer.',
-    '  --route-alias <route=path>  Map a URL-rooted import prefix onto a source folder. Repeatable.',
+    '  --framework <mode>          Front-end adapters: auto, vanilla, or react. Defaults to auto.',
+    '  --source-root <path>        Project-relative front-end source root for optional unreachable discovery.',
+    '  --alias <specifier=path>    Map an import specifier or prefix onto a project path. Repeatable.',
+    '  --route-alias <route=path>  Deprecated: map a root-relative browser URL prefix. Prefer --alias.',
+    '  --include-source            Persist declaration and module source in generated artifacts.',
+    '  --include-unreachable       Include extra JS/JSX/MJS files from the front-end source root.',
+    '  --exclude <path>            Exclude a project-relative path or prefix from discovery. Repeatable.',
+    '  --source-mode <mode>        Source artifacts: none, declarations, or full. Defaults to none.',
+    '  --module-limit <count>      Maximum analyzed module count. Defaults to 500.',
     '  --serve                     Generate once, then serve the immutable viewer and /api/v1 JSON API.',
     `  --host ${DEFAULT_HOST}          Host to bind in serve mode.`,
     `  --port ${DEFAULT_PORT}              Port to bind in serve mode. Use 0 to pick an available port.`,
@@ -36,9 +44,10 @@ function usage() {
     '  -h, --help                 Show this help.',
     '',
     'Examples:',
-    '  ironglancer ./my-app --entry src/app.jsx --out ./ironglancer-site',
-    '  ironglancer diff --base main --head HEAD --entry src/app.jsx --format html --out architecture-diff.html --sarif review.sarif',
-    '  ironglancer diff ./my-app --base main --head HEAD --entry src/app.jsx --format html --sarif review.sarif --baseline accepted-diff.json --suppressions ironglancer-suppressions.json --fail-on warning',
+    '  ironglancer ./my-app --entry index.html --out ./ironglancer-site',
+    '  ironglancer ./my-app --entry src/main.jsx --alias @/=src/ --include-source',
+    '  ironglancer diff --base main --head HEAD --entry index.html --format html --out architecture-diff.html --sarif review.sarif',
+    '  ironglancer diff ./my-app --base main --head HEAD --entry src/main.jsx --format html --sarif review.sarif --baseline accepted-diff.json --suppressions ironglancer-suppressions.json --fail-on warning',
     '  ironglancer diff ./my-app --base ./before/output.json --head ./after-site --format json',
     '',
   ].join('\n');
@@ -57,8 +66,10 @@ function parsePort(value) {
 function resultPayload(result, service) {
   return {
     ok: true,
-    rootDir: result.rootDir,
+    rootDir: null,
     entry: result.entryRel,
+    entryKind: result.entryKind || 'module',
+    entryModules: Array.isArray(result.entryModules) ? result.entryModules : [result.entryRel].filter(Boolean),
     outDir: result.outDir,
     summary: result.summary,
     ...(service ? {
@@ -111,7 +122,15 @@ export async function runCli(args = process.argv.slice(2), {
     options: {
       entry: { type: 'string' },
       out: { type: 'string' },
+      framework: { type: 'string' },
+      'source-root': { type: 'string' },
+      alias: { type: 'string', multiple: true },
       'route-alias': { type: 'string', multiple: true },
+      'include-source': { type: 'boolean' },
+      'include-unreachable': { type: 'boolean' },
+      exclude: { type: 'string', multiple: true },
+      'source-mode': { type: 'string' },
+      'module-limit': { type: 'string' },
       base: { type: 'string' },
       head: { type: 'string' },
       format: { type: 'string' },
@@ -138,13 +157,19 @@ export async function runCli(args = process.argv.slice(2), {
       base: values.base,
       head: values.head,
       entry: values.entry,
+      framework: values.framework,
+      sourceRoot: values['source-root'],
+      aliases: values.alias || [],
       routeAliases: values['route-alias'] || [],
+      includeUnreachable: Boolean(values['include-unreachable']),
+      exclude: values.exclude || [],
       format: values.format || 'json',
       outPath: values.out,
       sarifPath: values.sarif,
       baselinePath: values.baseline,
       suppressionsPath: values.suppressions,
       failOn: values['fail-on'],
+      moduleLimit: values['module-limit'],
     });
     if (result.stdoutText) await writeStream(stdout, result.stdoutText);
     return result.exitCode ?? 0;
@@ -155,7 +180,15 @@ export async function runCli(args = process.argv.slice(2), {
     rootDir,
     entry: values.entry,
     outDir: values.out,
+    framework: values.framework,
+    sourceRoot: values['source-root'],
+    aliases: values.alias || [],
     routeAliases: values['route-alias'] || [],
+    includeSource: Boolean(values['include-source']),
+    includeUnreachable: Boolean(values['include-unreachable']),
+    exclude: values.exclude || [],
+    sourceMode: values['source-mode'],
+    moduleLimit: values['module-limit'],
   });
 
   if (!values.serve) {

@@ -178,7 +178,59 @@ test('cli documents localhost serve mode flags', async () => {
   assert.match(stdout.text(), /--port 4173/);
   assert.match(stdout.text(), /ironglancer diff/);
   assert.match(stdout.text(), /--base <input>/);
+  assert.match(stdout.text(), /--source-mode <mode>/);
+  assert.match(stdout.text(), /--module-limit <count>/);
   assert.match(stdout.text(), /output\.json file or directory containing output\.json wins; otherwise inputs resolve as Git refs/i);
+});
+
+test('cli passes source mode and module limit through generation and diff commands', async () => {
+  const generationStdout = memoryStream();
+  const generationArgs = [];
+  const generationExit = await runCli([
+    './project',
+    '--entry',
+    'src/app.tsx',
+    '--source-mode',
+    'none',
+    '--module-limit',
+    '42',
+  ], {
+    stdout: generationStdout,
+    generateStaticSite: async (args) => {
+      generationArgs.push(args);
+      return {
+        rootDir: '/tmp/project',
+        entryRel: 'src/app.tsx',
+        outDir: '/tmp/project/site',
+        summary: {},
+      };
+    },
+  });
+
+  assert.equal(generationExit, 0);
+  assert.equal(generationArgs[0].sourceMode, 'none');
+  assert.equal(generationArgs[0].moduleLimit, '42');
+
+  const diffArgs = [];
+  const diffExit = await runCli([
+    'diff',
+    './project',
+    '--base',
+    'main',
+    '--head',
+    'HEAD',
+    '--module-limit',
+    '43',
+  ], {
+    stdout: memoryStream(),
+    createArchitectureDiff: async (args) => {
+      diffArgs.push(args);
+      return { stdoutText: '', exitCode: 0 };
+    },
+  });
+
+  assert.equal(diffExit, 0);
+  assert.equal(diffArgs[0].moduleLimit, '43');
 });
 
 test('cli diff compares saved snapshot file and directory inputs as JSON stdout', async () => {
@@ -258,6 +310,8 @@ test('cli diff compares git refs without mutating branch, HEAD, or worktree', as
     'HEAD',
     '--entry',
     'src/app.js',
+    '--module-limit',
+    '10',
     '--format',
     'json',
   ], { cwd: path.resolve('.') });
@@ -266,6 +320,10 @@ test('cli diff compares git refs without mutating branch, HEAD, or worktree', as
   assert.deepEqual(output.modules.added.map((item) => item.path), ['src/feature.js']);
   assert.equal(output.base.gitCommit, baseCommit);
   assert.equal(output.head.gitCommit, headBefore);
+  assert.equal(output.base.analysis.moduleLimit.limit, 10);
+  assert.equal(output.head.analysis.moduleLimit.limit, 10);
+  assert.equal(output.base.analysis.moduleLimit.count, 1);
+  assert.equal(output.head.analysis.moduleLimit.count, 2);
   assert.equal(await git(projectDir, ['rev-parse', '--abbrev-ref', 'HEAD']), branchBefore);
   assert.equal(await git(projectDir, ['rev-parse', 'HEAD']), headBefore);
   assert.equal(await git(projectDir, ['status', '--short']), statusBefore);
@@ -335,6 +393,12 @@ test('cli diff analyzes a nested project folder at each git ref', async () => {
   await git(repoDir, ['add', '.']);
   await git(repoDir, ['commit', '-m', 'base']);
   const baseCommit = await git(repoDir, ['rev-parse', 'HEAD']);
+  await writeText(path.join(projectDir, 'src/app.js'), [
+    "import { feature } from './feature.js';",
+    'export function App() {',
+    '  return feature();',
+    '}',
+  ].join('\n'));
   await writeText(path.join(projectDir, 'src/feature.js'), 'export function feature() { return true; }\n');
   await git(repoDir, ['add', '.']);
   await git(repoDir, ['commit', '-m', 'head']);
@@ -943,7 +1007,7 @@ test('cli diff reports missing entry at a git ref without leaving temp residue',
     ], { cwd: path.resolve('.') }),
     (error) => {
       assert.equal(error.code, 1);
-      assert.match(error.stderr, /Unable to resolve entry/);
+      assert.match(error.stderr, /Unable to resolve browser entry/);
       return true;
     },
   );
@@ -1001,7 +1065,15 @@ test('cli serve mode generates once and starts the localhost API', async () => {
         rootDir: fixtureRoot,
         entry: 'src/app.jsx',
         outDir: '/tmp/ironglancer-cli-serve',
+        framework: undefined,
+        sourceRoot: undefined,
+        aliases: [],
         routeAliases: [],
+        includeSource: false,
+        includeUnreachable: false,
+        exclude: [],
+        sourceMode: undefined,
+        moduleLimit: undefined,
       },
     },
     {
@@ -1076,19 +1148,19 @@ test('cli accepts route aliases for URL-rooted source imports', async () => {
     'src/cli.mjs',
     routeAliasRoot,
     '--entry',
-    'src/web/ceator/app.jsx',
+    'src/web/portal/app.jsx',
     '--out',
     outDir,
     '--route-alias',
-    '/creator/=src/web/ceator/',
+    '/portal/=src/web/portal/',
   ], {
     cwd: path.resolve('.'),
   });
 
   const output = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
-  assert.equal(output.entry, 'src/web/ceator/app.jsx');
+  assert.equal(output.entry, 'src/web/portal/app.jsx');
   assert.equal(output.summary.moduleCount, 2);
   assert.equal(output.summary.externalCount, 0);
-  assert.ok(!output.treeText.includes('[external] /creator/components/creator-linked-content-editor.jsx'));
+  assert.ok(!output.treeText.includes('[external] /portal/components/linked-content-editor.jsx'));
   assert.ok(!output.mermaid.includes('+LinkedContentEditor'));
 });

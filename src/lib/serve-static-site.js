@@ -103,6 +103,7 @@ const IMPORT_LIST_QUERY_PARAMS = [
   'sourcePath', 'targetPath', 'specifier', 'resolution', 'loadKind', 'dynamic', 'sourceReachable',
   'sort', 'order', 'fields', ...PAGINATION_QUERY_PARAMS,
 ];
+const FRONTEND_ENTITY_QUERY_PARAMS = ['search', 'q', 'modulePath', ...PAGINATION_QUERY_PARAMS];
 const SHORTEST_PATH_QUERY_PARAMS = ['targetId', 'maxDepth'];
 const BLAST_RADIUS_QUERY_PARAMS = ['maxDepth', 'limit'];
 const MODULE_SUMMARY_FIELDS = [
@@ -124,12 +125,12 @@ const SYMBOL_SUMMARY_FIELDS = [
 const IMPORT_SUMMARY_FIELDS = [
   'stableId', 'sourceId', 'sourceStableId', 'sourcePath', 'sourceReachable',
   'targetId', 'targetStableId', 'targetPath', 'specifier', 'loadKind', 'dynamic',
-  'resolution', 'unresolvedReason', 'bindings',
+  'resolution', 'unresolvedReason', 'assetPath', 'assetKind', 'remoteUrl', 'nodeBuiltin', 'typeOnly', 'bindings',
 ];
 const FUNCTION_DEPENDENCY_LIMITATIONS = [
   'Static function dependencies are based on identifier references inside saved declaration spans; IronGlancer does not execute code or prove runtime control flow.',
   'Usage syntax is labeled as call, optional-call, tagged-template, jsx-element, or reference from nearby source syntax; reference entries are not claimed to be definite runtime calls.',
-  'Imported targets are limited to statically resolved local imports, dynamic imports, require calls, exact supported Faculty browser import wrappers, and supported lazy-module patterns with resolvable bindings.',
+  'Imported targets are limited to browser ESM imports, dynamic imports, React.lazy boundaries, and module worker entries with statically resolvable bindings.',
   'Same-module targets are limited to named function declarations and named arrow-function variable declarations discovered in the same file; dynamic property dispatch, aliasing through arbitrary values, and unresolved re-exports are outside this map.',
   'Placement review is deterministic static affinity evidence; it is a review aid, not a runtime ownership proof or definitive dead-code detector.',
 ];
@@ -415,10 +416,20 @@ function normalizedModulePayloads(outputPayload = {}) {
         specifier: normalizeString(ref?.specifier).trim(),
         kind: normalizeString(ref?.kind).trim() || 'unknown',
         loadKind: normalizeString(ref?.kind).trim() || 'unknown',
+        typeOnly: Boolean(ref?.typeOnly),
         localRel: normalizeString(ref?.localRel).trim() || null,
-        resolution: ['local', 'external', 'unresolved'].includes(ref?.resolution) ? ref.resolution : null,
+        assetRel: normalizeString(ref?.assetRel).trim() || null,
+        assetKind: normalizeString(ref?.assetKind).trim() || null,
+        remoteUrl: normalizeString(ref?.remoteUrl).trim() || null,
+        nodeBuiltin: normalizeString(ref?.nodeBuiltin).trim() || null,
+        resolution: ['local', 'asset', 'external', 'remote', 'browser-incompatible', 'unresolved'].includes(ref?.resolution)
+          ? ref.resolution
+          : null,
         unresolvedReason: normalizeString(ref?.unresolvedReason).trim() || null,
-        bindings: Array.isArray(ref?.bindings) ? ref.bindings : [],
+        bindings: Array.isArray(ref?.bindings) ? ref.bindings.map((binding) => ({
+          ...binding,
+          typeOnly: Boolean(binding?.typeOnly),
+        })) : [],
       })).filter((ref) => ref.specifier) : [],
     }))
     .filter((module) => module.path)
@@ -871,6 +882,11 @@ function createFunctionSummary(index, node) {
 }
 
 function createAnalysisIndex(outputPayload, sourcePayload, moduleSourcePayload, functionMapPayload = {}) {
+  const outputMeta = outputPayload?.meta && typeof outputPayload.meta === 'object' ? outputPayload.meta : {};
+  const privacy = outputMeta.privacy && typeof outputMeta.privacy === 'object'
+    ? outputMeta.privacy
+    : {};
+  const sourceMode = normalizeString(privacy.sourceMode || outputMeta.sourceMode || 'full').trim() || 'full';
   const declarationSourceIsUsable = sourcePayloadMatchesOutput(outputPayload, sourcePayload)
     && Array.isArray(sourcePayload?.declarations);
   const modernModuleSourceIsUsable = sourcePayloadMatchesOutput(outputPayload, moduleSourcePayload)
@@ -932,11 +948,16 @@ function createAnalysisIndex(outputPayload, sourcePayload, moduleSourcePayload, 
         targetId: target?.id || null,
         targetStableId: target?.stableId || null,
         targetPath: target?.path || null,
+        assetPath: ref.assetRel || null,
+        assetKind: ref.assetKind || null,
         specifier: ref.specifier,
         loadKind: ref.loadKind,
-        dynamic: ['dynamic', 'dynamic-wrapper', 'lazy'].includes(ref.loadKind),
+        typeOnly: Boolean(ref.typeOnly),
+        dynamic: ['dynamic', 'lazy', 'worker'].includes(ref.loadKind),
         resolution: ref.resolution || (target ? 'local' : 'unknown'),
         unresolvedReason: ref.unresolvedReason,
+        remoteUrl: ref.remoteUrl || null,
+        nodeBuiltin: ref.nodeBuiltin || null,
         bindings: ref.bindings,
       };
       const key = [
@@ -1017,6 +1038,8 @@ function createAnalysisIndex(outputPayload, sourcePayload, moduleSourcePayload, 
   const index = {
     output: outputPayload,
     source: sourcePayload,
+    sourceMode,
+    privacy,
     sourceIsUsable: declarationSourceIsUsable || modernModuleSourceIsUsable || legacyModuleSourceIsUsable,
     declarationSourceIsUsable,
     moduleSourceIsUsable: modernModuleSourceIsUsable || legacyModuleSourceIsUsable,
@@ -1394,14 +1417,20 @@ function routeEntries() {
     { method: 'GET', path: '/api/v1/schema', description: 'Return an enveloped JSON Schema catalog for API clients.' },
     { method: 'GET', path: '/api/v1/schema.json', description: 'Return the raw application/schema+json catalog.' },
     { method: 'GET', path: '/api/v1/run', description: 'Return immutable run, package, schema, source, and summary metadata.' },
-    { method: 'GET', path: '/api/v1/modules', description: 'List analyzed modules with search, extension, reachability, limit, and offset filters.' },
-    { method: 'GET', path: '/api/v1/modules/:id', description: 'Return one analyzed module with dependencies, dependents, imports, and symbols.' },
-    { method: 'GET', path: '/api/v1/modules/:id/dependencies', description: 'Return local and external dependencies for one analyzed module.' },
-    { method: 'GET', path: '/api/v1/modules/:id/dependents', description: 'Return modules that import one analyzed module.' },
-    { method: 'GET', path: '/api/v1/modules/:id/functions', description: 'Return functions declared in one module with detail, exact/count filters, limit, and offset controls.' },
+    { method: 'GET', path: '/api/v1/modules', description: 'List saved browser modules with search, extension, reachability, limit, and offset filters.' },
+    { method: 'GET', path: '/api/v1/modules/:id', description: 'Return one saved browser module with dependencies, dependents, imports, and symbols.' },
+    { method: 'GET', path: '/api/v1/modules/:id/dependencies', description: 'Return local and external dependencies for one saved browser module.' },
+    { method: 'GET', path: '/api/v1/modules/:id/dependents', description: 'Return modules that import one saved browser module.' },
     { method: 'GET', path: '/api/v1/modules/:id/shortest-path', description: 'Return a bounded shortest local dependency path to a target module.' },
     { method: 'GET', path: '/api/v1/modules/:id/blast-radius', description: 'Return bounded direct and transitive importers affected by one module.' },
-    { method: 'GET', path: '/api/v1/imports', description: 'Filter saved local, external, unresolved, static, and dynamic import evidence.' },
+    { method: 'GET', path: '/api/v1/components', description: 'List saved component and hook declarations from reachable browser modules.' },
+    { method: 'GET', path: '/api/v1/component-edges', description: 'List saved JSX render edges between component-shaped declarations.' },
+    { method: 'GET', path: '/api/v1/routes', description: 'List framework-adapter route records such as React Router route declarations.' },
+    { method: 'GET', path: '/api/v1/lazy-boundaries', description: 'List dynamic import, React.lazy, and module worker lazy boundaries.' },
+    { method: 'GET', path: '/api/v1/assets', description: 'List CSS, image, font, JSON, WASM, worker, and unknown asset imports.' },
+    { method: 'GET', path: '/api/v1/browser-apis', description: 'List browser global/API references seen in reachable modules.' },
+    { method: 'GET', path: '/api/v1/findings', description: 'List structural front-end findings from the saved snapshot.' },
+    { method: 'GET', path: '/api/v1/imports', description: 'Filter saved local, asset, remote, browser-incompatible, external, unresolved, static, and dynamic import evidence.' },
     { method: 'GET', path: '/api/v1/modules/:id/source', description: 'Return a bounded source excerpt from saved analyzed module source.' },
     { method: 'GET', path: '/api/v1/source', description: 'Return a bounded source excerpt by exact analyzed module path.' },
     { method: 'GET', path: '/api/v1/symbols', description: 'List saved source symbols with search, exact name, modulePath, kind, sourceOrigin, referenceCount, limit, and offset filters.' },
@@ -1409,14 +1438,15 @@ function routeEntries() {
     { method: 'GET', path: '/api/v1/symbols/:id', description: 'Return one saved source symbol and its declaration source snippet.' },
     { method: 'GET', path: '/api/v1/symbols/:id/references', description: 'Return captured static reference/importer relationships for one symbol.' },
     { method: 'GET', path: '/api/v1/symbols/:id/callers', description: 'Alias for static importer relationships; this is not a runtime call graph.' },
-    { method: 'GET', path: '/api/v1/functions', description: 'List saved function declarations with search, exact name, modulePath, kind, component, dependencyCount, userCount, limit, and offset filters.' },
-    { method: 'GET', path: '/api/v1/functions/search', description: 'Search saved function declarations using q or search.' },
-    { method: 'GET', path: '/api/v1/functions/:id', description: 'Return one function with outgoing static dependencies and reverse users.' },
-    { method: 'GET', path: '/api/v1/functions/:id/dependencies', description: 'Return outgoing static function dependencies for one function.' },
-    { method: 'GET', path: '/api/v1/functions/:id/users', description: 'Return reverse static users for one function.' },
+    { method: 'GET', path: '/api/v1/modules/:id/functions', description: 'Return advanced static function records declared in one module with detail, exact/count filters, limit, and offset controls.' },
+    { method: 'GET', path: '/api/v1/functions', description: 'List advanced static function declarations with search, exact name, modulePath, kind, component, dependencyCount, userCount, limit, and offset filters.' },
+    { method: 'GET', path: '/api/v1/functions/search', description: 'Search advanced static function declarations using q or search.' },
+    { method: 'GET', path: '/api/v1/functions/:id', description: 'Return one advanced static function with dependencies and reverse users.' },
+    { method: 'GET', path: '/api/v1/functions/:id/dependencies', description: 'Return outgoing static dependency evidence for one function.' },
+    { method: 'GET', path: '/api/v1/functions/:id/users', description: 'Return reverse static user evidence for one function.' },
     { method: 'GET', path: '/api/v1/functions/:id/placement', description: 'Return deterministic static placement/cohesion evidence for one function.' },
     { method: 'GET', path: '/api/v1/functions/:id/shortest-path', description: 'Return a bounded shortest static dependency path to a target function.' },
-    { method: 'GET', path: '/api/v1/functions/:id/blast-radius', description: 'Return bounded direct and transitive static users affected by one function.' },
+    { method: 'GET', path: '/api/v1/functions/:id/blast-radius', description: 'Return bounded direct and transitive static user evidence affected by one function.' },
     { method: 'GET', path: '/api/v1/search', description: 'Unified module, function, symbol, and exact lexical-occurrence search.' },
     { method: 'GET', path: '/api/v1/query', description: 'Aggregate exact modulePath and symbol search results without adding inferred semantics.' },
   ];
@@ -1428,8 +1458,8 @@ function apiSchema(index) {
   return {
     $schema: 'https://json-schema.org/draft/2020-12/schema',
     $id: '/api/v1/schema.json',
-    title: 'IronGlancer static analysis API',
-    description: 'Schemas for API v1 resource summaries. Legacy id fields remain supported; stableId fields are compact semantic joins.',
+    title: 'IronGlancer front-end architecture API',
+    description: 'Schemas for API v1 browser-module architecture summaries. Legacy id fields remain supported; stableId fields are compact semantic joins.',
     type: 'object',
     $defs: {
       moduleSummary: {
@@ -1480,7 +1510,7 @@ function apiSchema(index) {
           specifier: { type: 'string' },
           loadKind: { type: 'string' },
           dynamic: { type: 'boolean' },
-          resolution: { enum: ['local', 'external', 'unresolved', 'unknown'] },
+          resolution: { enum: ['local', 'asset', 'external', 'remote', 'browser-incompatible', 'unresolved', 'unknown'] },
           unresolvedReason: stringOrNull,
         },
         additionalProperties: true,
@@ -1583,6 +1613,24 @@ function apiSchema(index) {
         query: IMPORT_LIST_QUERY_PARAMS,
         itemSchema: '#/$defs/importSummary',
       },
+      '/api/v1/components': {
+        query: FRONTEND_ENTITY_QUERY_PARAMS,
+      },
+      '/api/v1/routes': {
+        query: FRONTEND_ENTITY_QUERY_PARAMS,
+      },
+      '/api/v1/lazy-boundaries': {
+        query: FRONTEND_ENTITY_QUERY_PARAMS,
+      },
+      '/api/v1/assets': {
+        query: FRONTEND_ENTITY_QUERY_PARAMS,
+      },
+      '/api/v1/browser-apis': {
+        query: FRONTEND_ENTITY_QUERY_PARAMS,
+      },
+      '/api/v1/findings': {
+        query: FRONTEND_ENTITY_QUERY_PARAMS,
+      },
       '/api/v1/search': {
         query: UNIFIED_SEARCH_QUERY_PARAMS,
         match: ['exact', 'substring'],
@@ -1632,22 +1680,28 @@ function discovery(index) {
     examples: [
       '/api/v1/run',
       '/api/v1/modules?reachable=true&extension=.jsx&limit=25',
+      '/api/v1/components?modulePath=src/App.jsx',
+      '/api/v1/routes?modulePath=src/App.jsx',
+      '/api/v1/lazy-boundaries',
+      '/api/v1/assets?modulePath=src/main.jsx',
+      '/api/v1/findings',
+      '/api/v1/imports?resolution=browser-incompatible',
+      '/api/v1/imports?resolution=unresolved&dynamic=true',
       '/api/v1/modules/<module-id>/functions?detail=summary&limit=25&offset=0',
       '/api/v1/modules/<module-id>/source?startLine=1&endLine=40',
       '/api/v1/symbols?name=App&referenceCount=1',
       '/api/v1/symbols/search?q=App',
-      '/api/v1/functions?name=CreatorShell&dependencyCount=2',
-      '/api/v1/functions/search?q=CreatorShell',
+      '/api/v1/functions?name=DashboardShell&dependencyCount=2',
+      '/api/v1/functions/search?q=DashboardShell',
       '/api/v1/functions?exported=false&standalone=true&userCount=0&sort=lineCount&order=desc',
-      '/api/v1/imports?resolution=unresolved&dynamic=true',
-      '/api/v1/search?q=CreatorShell&match=exact&types=function,occurrence',
+      '/api/v1/search?q=DashboardShell&match=exact&types=function,occurrence',
       '/api/v1/modules/<module-id>/shortest-path?targetId=<module-id>&maxDepth=10',
       '/api/v1/functions/<function-id>/blast-radius?maxDepth=10&limit=200',
       '/api/v1/functions/<function-id>/placement',
       '/api/v1/query?modulePath=src/app.jsx&symbol=RootApp',
     ],
     semantics: {
-      analysis: 'Responses are served from generated output.json, source-code.json, .ironglancer-api/source-modules.json, and .ironglancer-api/function-map.json loaded once at server start.',
+      analysis: 'Responses are served from generated output.json, source-code.json, .ironglancer-api/source-modules.json, and .ironglancer-api/function-map.json loaded once at server start. Browser entry reachability is authoritative.',
       relations: 'Symbol relation endpoints expose static import/export/reference relationships captured by IronGlancer, not runtime call graphs or data lineage.',
       functionDependencies: index.functionLimitations,
       queryParameters: {
@@ -1679,13 +1733,15 @@ function runMetadata(index, outDir) {
     gitCommit: meta.gitCommit || null,
     buildId: meta.buildId || null,
     sourceCodeHash: meta.sourceCodeHash || null,
-    outDir,
+    outDir: path.basename(outDir),
     summary: index.output.summary || {},
     source: {
+      sourceMode: index.sourceMode,
       sourceCodeAvailable: index.sourceIsUsable,
       declarationSourceAvailable: index.declarationSourceIsUsable,
       moduleSourceAvailable: index.moduleSourceIsUsable,
       functionMapAvailable: index.functionMapIsUsable,
+      capabilities: index.privacy?.capabilities || {},
       moduleSourceCount: index.sourceModuleByPath.size,
       symbolSourceCount: index.symbols.length,
       functionCount: index.functions.length,
@@ -1950,7 +2006,15 @@ function moduleDetail(index, module, url) {
 function sourceExcerpt(index, module, url) {
   const sourceModule = index.sourceModuleByPath.get(module.path);
   if (!sourceModule) {
-    throw apiError(404, 'source_not_available', `Saved source is not available for ${module.path}.`);
+    throw apiError(
+      404,
+      'source_not_available',
+      `Saved module source is not available for ${module.path} with sourceMode=${index.sourceMode}.`,
+      {
+        sourceMode: index.sourceMode,
+        moduleSourceAvailable: index.moduleSourceIsUsable,
+      },
+    );
   }
   const lines = sourceLines(sourceModule.code);
   const startLine = parseIntegerParam(url.searchParams, 'startLine', 1, {
@@ -2507,8 +2571,9 @@ function importList(index, url) {
   const sourcePath = sourcePathParam ? getModuleByPath(index, sourcePathParam).path : '';
   const targetPath = targetPathParam ? getModuleByPath(index, targetPathParam).path : '';
   const resolution = lowerSearch(url.searchParams.get('resolution'));
-  if (resolution && !['local', 'external', 'unresolved', 'unknown'].includes(resolution)) {
-    throw apiError(400, 'invalid_query', 'resolution must be local, external, unresolved, or unknown.');
+  const allowedResolutions = ['local', 'asset', 'external', 'remote', 'browser-incompatible', 'unresolved', 'unknown'];
+  if (resolution && !allowedResolutions.includes(resolution)) {
+    throw apiError(400, 'invalid_query', `resolution must be one of: ${allowedResolutions.join(', ')}.`);
   }
   const loadKind = lowerSearch(url.searchParams.get('loadKind'));
   const dynamic = parseBoolean(url.searchParams.get('dynamic'), 'dynamic');
@@ -2532,8 +2597,8 @@ function importList(index, url) {
   return {
     ...paginated(projected, url),
     semantics: {
-      resolution: 'local identifies an indexed target, external identifies a non-local specifier, unresolved identifies a local-looking specifier that did not resolve, and unknown is retained for legacy artifacts without classification.',
-      dynamic: 'dynamic includes saved dynamic import, supported dynamic wrapper, and lazy-module evidence; it does not imply runtime execution.',
+      resolution: 'local identifies an indexed browser module, asset identifies a browser asset, remote identifies a URL import, browser-incompatible identifies a Node builtin import, external identifies a bare package specifier, unresolved identifies a local-looking specifier that did not resolve, and unknown is retained for legacy artifacts without classification.',
+      dynamic: 'dynamic includes saved dynamic import, React.lazy, and module worker evidence; it does not imply runtime execution.',
     },
   };
 }
@@ -2570,6 +2635,17 @@ function exactOccurrences(index, query, modulePath) {
   const identifierPart = /[A-Za-z0-9_$]/;
   const sourceModules = Array.from(index.sourceModuleByPath.values())
     .filter((item) => !modulePath || item.path === modulePath);
+  if (sourceModules.length === 0) {
+    throw apiError(
+      404,
+      'source_not_available',
+      `Occurrence search requires saved module source, but sourceMode=${index.sourceMode}.`,
+      {
+        sourceMode: index.sourceMode,
+        moduleSourceAvailable: index.moduleSourceIsUsable,
+      },
+    );
+  }
   const scanCharacters = sourceModules.reduce((total, item) => total + item.code.length, 0);
   if (scanCharacters > MAX_OCCURRENCE_SCAN_CHARACTERS) {
     throw apiError(413, 'occurrence_search_too_large', 'Occurrence search exceeds the saved-source scan limit.', {
@@ -2709,6 +2785,22 @@ function queryPayload(index, url) {
   return payload;
 }
 
+function rawOutputArray(index, field) {
+  return Array.isArray(index.output?.[field]) ? index.output[field] : [];
+}
+
+function frontEndEntityList(index, url, field) {
+  const search = lowerSearch(url.searchParams.get('search') || url.searchParams.get('q'));
+  const modulePath = normalizeString(url.searchParams.get('modulePath')).trim();
+  const filtered = rawOutputArray(index, field)
+    .filter((item) => !modulePath || item.modulePath === modulePath || item.sourceModulePath === modulePath)
+    .filter((item) => !search || JSON.stringify(item).toLowerCase().includes(search))
+    .sort((a, b) => compareLocale(a.modulePath || a.sourceModulePath || a.path || '', b.modulePath || b.sourceModulePath || b.path || '')
+      || compareLocale(a.name || a.component || a.specifier || a.ruleId || '', b.name || b.component || b.specifier || b.ruleId || '')
+      || (a.line || 0) - (b.line || 0));
+  return paginated(filtered, url);
+}
+
 function handleApiRequest({ request, response, index, outDir }) {
   if (request.method !== 'GET') {
     throw apiError(405, 'method_not_allowed', 'The analysis API is read-only and supports GET requests only.');
@@ -2740,6 +2832,34 @@ function handleApiRequest({ request, response, index, outDir }) {
   if (resource === 'imports' && parts.length === 3) {
     rejectUnknownQueryParams(url, IMPORT_LIST_QUERY_PARAMS);
     return sendApiData(response, importList(index, url));
+  }
+  if (resource === 'components' && parts.length === 3) {
+    rejectUnknownQueryParams(url, FRONTEND_ENTITY_QUERY_PARAMS);
+    return sendApiData(response, frontEndEntityList(index, url, 'components'));
+  }
+  if (resource === 'component-edges' && parts.length === 3) {
+    rejectUnknownQueryParams(url, FRONTEND_ENTITY_QUERY_PARAMS);
+    return sendApiData(response, frontEndEntityList(index, url, 'componentEdges'));
+  }
+  if (resource === 'routes' && parts.length === 3) {
+    rejectUnknownQueryParams(url, FRONTEND_ENTITY_QUERY_PARAMS);
+    return sendApiData(response, frontEndEntityList(index, url, 'routes'));
+  }
+  if (resource === 'lazy-boundaries' && parts.length === 3) {
+    rejectUnknownQueryParams(url, FRONTEND_ENTITY_QUERY_PARAMS);
+    return sendApiData(response, frontEndEntityList(index, url, 'lazyBoundaries'));
+  }
+  if (resource === 'assets' && parts.length === 3) {
+    rejectUnknownQueryParams(url, FRONTEND_ENTITY_QUERY_PARAMS);
+    return sendApiData(response, frontEndEntityList(index, url, 'assets'));
+  }
+  if (resource === 'browser-apis' && parts.length === 3) {
+    rejectUnknownQueryParams(url, FRONTEND_ENTITY_QUERY_PARAMS);
+    return sendApiData(response, frontEndEntityList(index, url, 'browserApis'));
+  }
+  if (resource === 'findings' && parts.length === 3) {
+    rejectUnknownQueryParams(url, FRONTEND_ENTITY_QUERY_PARAMS);
+    return sendApiData(response, frontEndEntityList(index, url, 'findings'));
   }
   if (resource === 'modules') {
     if (parts.length === 3) {
@@ -2939,12 +3059,24 @@ function hostForUrl(host) {
   return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
 }
 
+function isLoopbackHost(host) {
+  const normalized = normalizeString(host).trim().toLowerCase();
+  return normalized === 'localhost'
+    || normalized === '127.0.0.1'
+    || normalized.startsWith('127.')
+    || normalized === '::1'
+    || normalized === '[::1]';
+}
+
 export async function startStaticAnalysisServer({
   outDir,
   host = DEFAULT_HOST,
   port = DEFAULT_PORT,
 } = {}) {
   const resolvedHost = normalizeString(host).trim() || DEFAULT_HOST;
+  if (!isLoopbackHost(resolvedHost)) {
+    throw new Error('IronGlancer serve mode is loopback-only; use 127.0.0.1 or localhost.');
+  }
   const parsedPort = Number(port);
   if (!Number.isInteger(parsedPort) || parsedPort < 0 || parsedPort > 65535) {
     throw new Error('port must be an integer between 0 and 65535.');

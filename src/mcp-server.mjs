@@ -1,9 +1,6 @@
 #!/usr/bin/env node
-import { realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
-import { createInterface } from 'node:readline';
-import { pathToFileURL } from 'node:url';
 
 import { loadStaticAnalysisRun } from './lib/serve-static-site.js';
 
@@ -64,6 +61,92 @@ function compareText(a, b) {
 function compactCount(value) {
   const count = Number(value);
   return Number.isInteger(count) && count >= 0 ? count : 0;
+}
+
+function outputArray(index, field) {
+  const value = index.output?.[field];
+  return Array.isArray(value) ? value : [];
+}
+
+function compactModule(index, module) {
+  const imports = index.imports.filter((item) => item.sourcePath === module.path);
+  return {
+    id: module.id,
+    stableId: module.stableId,
+    path: module.path,
+    extension: module.extension,
+    reachable: module.reachable,
+    isJsx: module.isJsx,
+    lineCount: module.lineCount,
+    dependencyCount: module.localDependencies.length,
+    dependentCount: module.dependents.length,
+    externalDependencyCount: module.externalDependencies.length,
+    importCount: imports.length,
+    componentCount: outputArray(index, 'components').filter((item) => item.modulePath === module.path).length,
+    lazyBoundaryCount: outputArray(index, 'lazyBoundaries').filter((item) => item.sourceModulePath === module.path).length,
+    assetCount: outputArray(index, 'assets').filter((item) => item.sourceModulePath === module.path).length,
+    functionCount: (index.functionsByModulePath.get(module.path) || []).length,
+    sourceAvailable: index.sourceModuleByPath.has(module.path),
+  };
+}
+
+function resolveModule(index, args = {}) {
+  const id = String(args.id || args.moduleId || '').trim();
+  const stableId = String(args.stableId || args.moduleStableId || '').trim();
+  const modulePath = String(args.path || args.modulePath || '').trim();
+  if (id) {
+    const module = index.moduleById.get(id) || index.moduleByStableId.get(id);
+    if (module) return module;
+  }
+  if (stableId) {
+    const module = index.moduleByStableId.get(stableId) || index.moduleById.get(stableId);
+    if (module) return module;
+  }
+  if (modulePath) {
+    const module = index.moduleByPath.get(modulePath);
+    if (module) return module;
+  }
+  throw new Error('Provide module path, id, or stableId.');
+}
+
+function listModules({ index }, args = {}) {
+  const q = lower(args.q || args.search || '');
+  const reachable = args.reachable == null ? null : Boolean(args.reachable);
+  const limit = Math.max(1, Math.min(100, Number(args.limit) || 25));
+  const items = index.modules
+    .filter((module) => !q || lower(module.path).includes(q))
+    .filter((module) => reachable == null || Boolean(module.reachable) === reachable)
+    .slice(0, limit)
+    .map((module) => compactModule(index, module));
+  return { q, reachable, items, totalReturned: items.length };
+}
+
+function getModule({ index }, args = {}) {
+  const module = resolveModule(index, args);
+  const imports = index.imports
+    .filter((item) => item.sourcePath === module.path)
+    .sort((a, b) => compareText(a.specifier, b.specifier) || compareText(a.loadKind, b.loadKind));
+  return {
+    module: compactModule(index, module),
+    dependencies: module.localDependencies.map((modulePath) => compactModule(index, index.moduleByPath.get(modulePath))),
+    dependents: module.dependents.map((modulePath) => compactModule(index, index.moduleByPath.get(modulePath))),
+    imports,
+    components: outputArray(index, 'components').filter((item) => item.modulePath === module.path),
+    lazyBoundaries: outputArray(index, 'lazyBoundaries').filter((item) => item.sourceModulePath === module.path),
+    assets: outputArray(index, 'assets').filter((item) => item.sourceModulePath === module.path),
+    findings: outputArray(index, 'findings').filter((item) => item.modulePath === module.path),
+  };
+}
+
+function listOutputRecords({ index }, args = {}, field, modulePathField = 'modulePath') {
+  const q = lower(args.q || args.search || '');
+  const modulePath = String(args.modulePath || args.path || '').trim();
+  const limit = Math.max(1, Math.min(100, Number(args.limit) || 25));
+  const items = outputArray(index, field)
+    .filter((item) => !modulePath || item[modulePathField] === modulePath)
+    .filter((item) => !q || JSON.stringify(item).toLowerCase().includes(q))
+    .slice(0, limit);
+  return { q, modulePath: modulePath || null, items, totalReturned: items.length };
 }
 
 function parseBoundedInteger(value, defaultValue, { min, max, name }) {
@@ -166,11 +249,20 @@ function resolveFunction(index, args = {}) {
 
 function sourceExcerpt(index, node, contextLines = 4) {
   const sourceModule = index.sourceModuleByPath.get(node.modulePath);
-  if (!sourceModule) return null;
+  if (!sourceModule) {
+    return {
+      available: false,
+      sourceMode: index.sourceMode || 'unknown',
+      reason: `Saved module source is not available with sourceMode=${index.sourceMode || 'unknown'}.`,
+      modulePath: node.modulePath,
+    };
+  }
   const lines = sourceModule.code.split(/\r\n|\r|\n/);
   const startLine = Math.max(1, (node.startLine || 1) - contextLines);
   const endLine = Math.min(lines.length, (node.endLine || node.startLine || 1) + contextLines);
   return {
+    available: true,
+    sourceMode: index.sourceMode || 'unknown',
     modulePath: node.modulePath,
     startLine,
     endLine,
@@ -199,12 +291,24 @@ function runSummary({ outDir, index }) {
     summary: index.output.summary || {},
     counts: {
       modules: index.modules.length,
+      components: outputArray(index, 'components').length,
+      componentEdges: outputArray(index, 'componentEdges').length,
+      lazyBoundaries: outputArray(index, 'lazyBoundaries').length,
+      assets: outputArray(index, 'assets').length,
+      findings: outputArray(index, 'findings').length,
       functions: index.functions.length,
       functionEdges: index.functionEdges.length,
       symbols: index.symbols.length,
     },
     staticAnalysis: {
       functionDependencies: index.functionLimitations,
+    },
+    source: {
+      sourceMode: index.sourceMode || 'unknown',
+      declarationSourceAvailable: Boolean(index.declarationSourceIsUsable),
+      moduleSourceAvailable: Boolean(index.moduleSourceIsUsable),
+      functionMapAvailable: Boolean(index.functionMapIsUsable),
+      capabilities: index.privacy?.capabilities || {},
     },
   };
 }
@@ -401,7 +505,9 @@ function getSource({ index }, args = {}) {
   const modulePath = String(args.modulePath || args.path || '').trim();
   if (!modulePath) throw new Error('Provide modulePath.');
   const sourceModule = index.sourceModuleByPath.get(modulePath);
-  if (!sourceModule) throw new Error(`Saved source is not available for ${modulePath}.`);
+  if (!sourceModule) {
+    throw new Error(`Saved module source is not available for ${modulePath} with sourceMode=${index.sourceMode || 'unknown'}.`);
+  }
   const lines = sourceModule.code.split(/\r\n|\r|\n/);
   const startLine = Math.max(1, Number(args.startLine) || 1);
   const endLine = Math.min(lines.length, Math.max(startLine, Number(args.endLine) || startLine + 40));
@@ -417,7 +523,12 @@ function getSource({ index }, args = {}) {
 }
 
 function bridgeUrlFor(options, args = {}) {
-  return String(args.bridgeUrl || options.bridgeUrl || DEFAULT_BRIDGE_URL).replace(/\/?$/, '/');
+  const bridgeUrl = String(args.bridgeUrl || options.bridgeUrl || DEFAULT_BRIDGE_URL).replace(/\/?$/, '/');
+  const url = new URL(bridgeUrl);
+  const host = url.hostname.toLowerCase();
+  const loopback = host === 'localhost' || host === '127.0.0.1' || host.startsWith('127.') || host === '::1';
+  if (!loopback) throw new Error('IronGlancer viewer bridge URLs must be loopback-only.');
+  return bridgeUrl;
 }
 
 async function fetchBridgeJson(url, init) {
@@ -464,8 +575,83 @@ const tools = [
     inputSchema: { type: 'object', additionalProperties: false, properties: {} },
   },
   {
+    name: 'ironglancer_list_modules',
+    description: 'List saved browser-reachable/front-end modules with compact architecture counts.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        q: { type: 'string' },
+        search: { type: 'string' },
+        reachable: { type: 'boolean' },
+        limit: { type: 'integer', minimum: 1, maximum: 100 },
+      },
+    },
+  },
+  {
+    name: 'ironglancer_get_module',
+    description: 'Return one saved module with imports, dependencies, components, lazy boundaries, assets, and findings.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        id: { type: 'string' },
+        stableId: { type: 'string' },
+        moduleId: { type: 'string' },
+        moduleStableId: { type: 'string' },
+        path: { type: 'string' },
+        modulePath: { type: 'string' },
+      },
+    },
+  },
+  {
+    name: 'ironglancer_list_components',
+    description: 'List JSX/React component records discovered in saved browser modules.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        q: { type: 'string' },
+        search: { type: 'string' },
+        modulePath: { type: 'string' },
+        path: { type: 'string' },
+        limit: { type: 'integer', minimum: 1, maximum: 100 },
+      },
+    },
+  },
+  {
+    name: 'ironglancer_list_assets',
+    description: 'List browser asset and worker edges referenced by saved modules.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        q: { type: 'string' },
+        search: { type: 'string' },
+        modulePath: { type: 'string' },
+        path: { type: 'string' },
+        limit: { type: 'integer', minimum: 1, maximum: 100 },
+      },
+    },
+  },
+  {
+    name: 'ironglancer_list_findings',
+    description: 'List front-end architecture findings from the saved analysis.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        q: { type: 'string' },
+        search: { type: 'string' },
+        modulePath: { type: 'string' },
+        path: { type: 'string' },
+        limit: { type: 'integer', minimum: 1, maximum: 100 },
+      },
+    },
+  },
+  {
     name: 'ironglancer_search_functions',
-    description: 'Search saved function declarations and include compact placement assessment fields.',
+    description: 'Search saved advanced static function declarations and compact placement evidence.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -479,7 +665,7 @@ const tools = [
   },
   {
     name: 'ironglancer_get_function',
-    description: 'Return one saved function with placement evidence, static dependencies/users, and a source excerpt.',
+    description: 'Return one saved advanced static function with placement evidence, dependencies/users, and a source excerpt.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -496,7 +682,7 @@ const tools = [
   },
   {
     name: 'ironglancer_function_neighborhood',
-    description: 'Return a deterministic multi-hop static function neighborhood from the saved snapshot without requiring a viewer.',
+    description: 'Return a deterministic advanced static function neighborhood from the saved snapshot without requiring a viewer.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -515,7 +701,7 @@ const tools = [
   },
   {
     name: 'ironglancer_investigate_function_placement',
-    description: 'Return focused function-placement/cohesion evidence for a saved function.',
+    description: 'Return focused advanced function-placement/cohesion evidence for a saved function.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -608,6 +794,11 @@ function createServer(options) {
 
     const run = await getRun();
     if (name === 'ironglancer_run_summary') return runSummary(run);
+    if (name === 'ironglancer_list_modules') return listModules(run, args);
+    if (name === 'ironglancer_get_module') return getModule(run, args);
+    if (name === 'ironglancer_list_components') return listOutputRecords(run, args, 'components');
+    if (name === 'ironglancer_list_assets') return listOutputRecords(run, args, 'assets', 'sourceModulePath');
+    if (name === 'ironglancer_list_findings') return listOutputRecords(run, args, 'findings');
     if (name === 'ironglancer_search_functions') return searchFunctions(run, args);
     if (name === 'ironglancer_get_function') return getFunction(run, args);
     if (name === 'ironglancer_function_neighborhood') return functionNeighborhood(run, args);
@@ -670,15 +861,12 @@ function writeMessage(message) {
 
 async function runStdioServer(options) {
   const server = createServer(options);
+  const keepAlive = setInterval(() => {}, 1000);
+  let buffer = '';
+  let queue = Promise.resolve();
 
-  const lines = createInterface({
-    input: process.stdin,
-    crlfDelay: Infinity,
-    terminal: false,
-  });
-
-  for await (const line of lines) {
-    if (!line.trim()) continue;
+  const handleLine = async (line) => {
+    if (!line.trim()) return;
     try {
       const response = await server.handle(JSON.parse(line));
       if (response) writeMessage(response);
@@ -689,6 +877,32 @@ async function runStdioServer(options) {
         error: { code: -32700, message: error?.message || String(error) },
       });
     }
+  };
+
+  process.stdin.setEncoding('utf8');
+  process.stdin.resume();
+  process.stdin.on('data', (chunk) => {
+    buffer += chunk;
+    let lineEnd = buffer.indexOf('\n');
+    while (lineEnd !== -1) {
+      const line = buffer.slice(0, lineEnd).replace(/\r$/, '');
+      buffer = buffer.slice(lineEnd + 1);
+      queue = queue.then(() => handleLine(line));
+      lineEnd = buffer.indexOf('\n');
+    }
+  });
+
+  try {
+    await new Promise((resolve) => {
+      process.stdin.once('end', resolve);
+    });
+    if (buffer.trim()) {
+      const trailingLine = buffer.replace(/\r$/, '');
+      queue = queue.then(() => handleLine(trailingLine));
+    }
+    await queue;
+  } finally {
+    clearInterval(keepAlive);
   }
 }
 
@@ -696,12 +910,8 @@ const options = parseArgs();
 if (options.help) {
   process.stdout.write(usage());
 } else {
-  const isMain = process.argv[1]
-    && pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url;
-  if (isMain) {
-    runStdioServer(options).catch((error) => {
-      process.stderr.write(`${error?.stack || error}\n`);
-      process.exitCode = 1;
-    });
-  }
+  runStdioServer(options).catch((error) => {
+    process.stderr.write(`${error?.stack || error}\n`);
+    process.exitCode = 1;
+  });
 }

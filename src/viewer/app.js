@@ -28,8 +28,8 @@ const relationFilters = [
 ];
 const primaryViewStorageKey = 'ironglancer:primary-visualization-view';
 const primaryViewModes = [
-  { id: 'function-graphs', label: 'Function graphs', accessibilityLabel: 'Function graphs' },
-  { id: 'jsx-map', label: 'JSX map', accessibilityLabel: 'JSX file composition map' },
+  { id: 'jsx-map', label: 'Components', accessibilityLabel: 'Component/module map' },
+  { id: 'function-graphs', label: 'Functions (advanced)', accessibilityLabel: 'Advanced function graph' },
 ];
 const networkLayoutModeStorageKey = 'ironglancer:function-network-layout';
 const networkLayoutModes = [
@@ -73,6 +73,11 @@ const statsEl = document.getElementById('stats');
 const jsxTreeEl = document.getElementById('jsx-tree');
 const treeEl = document.getElementById('tree');
 const mermaidEl = document.getElementById('mermaid');
+const componentsListEl = document.getElementById('components-list');
+const routesListEl = document.getElementById('routes-list');
+const lazyBoundariesListEl = document.getElementById('lazy-boundaries-list');
+const assetsListEl = document.getElementById('assets-list');
+const findingsListEl = document.getElementById('findings-list');
 const copyJsxTreeBtn = document.getElementById('copy-jsx-tree-btn');
 const copyTreeBtn = document.getElementById('copy-tree-btn');
 const copyMermaidSourceBtn = document.getElementById('copy-mermaid-source-btn');
@@ -164,7 +169,7 @@ let highlightedSourceRecord = null;
 let selectedFunctionId = '';
 let selectedFilePath = '';
 let activeRelationFilter = 'all';
-let activePrimaryView = 'function-graphs';
+let activePrimaryView = 'jsx-map';
 let activeNetworkLayoutMode = 'network';
 let activeNetworkNodeVisibility = { files: false, functions: true };
 let activeNetworkScope = 'full';
@@ -365,6 +370,14 @@ function sourcePayloadMatchesOutput(payload = {}, source = {}) {
   const outputMeta = payload && typeof payload.meta === 'object' ? payload.meta : {};
   const sourceMeta = source && typeof source.meta === 'object' ? source.meta : {};
   return ['buildId', 'sourceCodeHash'].every((key) => outputMeta[key] && outputMeta[key] === sourceMeta[key]);
+}
+
+function sourceMode() {
+  return String(outputPayload?.meta?.privacy?.sourceMode || 'full').trim() || 'full';
+}
+
+function unavailableSourceComment(kind) {
+  return '// ' + kind + ' source was not saved for this run (sourceMode=' + sourceMode() + ').';
 }
 
 function sourceKey(moduleId, name) {
@@ -1263,10 +1276,10 @@ function renderNetworkLayoutSwitch() {
 function updateVisualizationStatus() {
   if (activePrimaryView === 'jsx-map') {
     networkStatusEl.textContent = !outputPayload?.mermaid
-      ? 'JSX map: no file composition diagram was saved.'
+      ? 'Components: no component diagram was saved.'
       : moduleDiagramSvgEl
-      ? 'JSX map: file composition, member rows, and import edges.'
-      : 'JSX map: loading file composition.';
+      ? 'Components: module composition, member rows, and import edges.'
+      : 'Components: loading module composition.';
     return;
   }
   networkHelpEl.textContent = networkHelpText();
@@ -3300,7 +3313,7 @@ function renderSourceDialogDeclaration(declaration) {
   const node = functionNodeForDeclaration(declaration);
   sourceDialogTitleEl.textContent = declaration.name || declaration.declarationName || 'Source';
   sourceDialogPathEl.textContent = sourceDialogPathForDeclaration(declaration);
-  sourceDialogCodeEl.textContent = declaration.code || '// Source snippet was not saved for this member.';
+  sourceDialogCodeEl.textContent = declaration.code || unavailableSourceComment('Declaration');
 
   if (node) {
     renderDialogInsight(node);
@@ -3642,10 +3655,14 @@ function renderStats() {
     total + externalRelationshipsForNode(node).filter((item) => item.relationshipKind === 'browser-library').length
   ), 0);
   statsEl.append(
-    renderStat('files', outputPayload?.summary?.moduleCount || outputPayload?.modules?.length || 0),
+    renderStat('modules', outputPayload?.summary?.moduleCount || outputPayload?.modules?.length || 0),
+    renderStat('components', safeArray(outputPayload?.components).length),
+    renderStat('routes', safeArray(outputPayload?.routes).length),
+    renderStat('lazy boundaries', safeArray(outputPayload?.lazyBoundaries).length),
+    renderStat('assets', safeArray(outputPayload?.assets).length),
+    renderStat('findings', safeArray(outputPayload?.findings).length),
     renderStat('functions', functions.length),
-    renderStat('function links', edges.length),
-    renderStat('browser/library', browserLibraryCount),
+    renderStat('browser APIs', safeArray(outputPayload?.browserApis).length || browserLibraryCount),
   );
 }
 
@@ -4432,7 +4449,7 @@ function renderSourceDialogFunction(functionId) {
   sourceDialogPathEl.textContent = node.modulePath + ':' + lineRange(node);
   renderDialogInsight(node);
   renderNeighborhood(node);
-  sourceDialogCodeEl.textContent = declaration.code || '// Source snippet was not saved for this function.';
+  sourceDialogCodeEl.textContent = declaration.code || unavailableSourceComment('Function');
   renderSourceConnectionDisclosure(node);
   updateDialogNavigationControls();
 }
@@ -5081,7 +5098,7 @@ function bindControls() {
   moduleDiagramFitBtn.addEventListener('click', fitModuleDiagramToViewport);
   moduleDiagramResetViewBtn.addEventListener('click', resetModuleDiagramView);
   copyJsxTreeBtn.addEventListener('click', () => {
-    copyRawText(outputPayload?.jsxTreeText || '', 'JSX tree', copyJsxTreeStatusEl);
+    copyRawText(outputPayload?.jsxTreeText || '', 'module tree', copyJsxTreeStatusEl);
   });
   copyTreeBtn.addEventListener('click', () => {
     copyRawText(outputPayload?.treeText || '', 'dependency tree', copyTreeStatusEl);
@@ -5150,7 +5167,8 @@ async function main() {
   activeNetworkScope = loadNetworkScope();
   activeNetworkDepth = loadNetworkDepth();
   rawRenderText();
-  subtitleEl.textContent = (outputPayload.entry || 'unknown entry') + '  |  ' + (outputPayload.rootDir || 'unknown root');
+  subtitleEl.textContent = (outputPayload.entry || 'unknown entry') + ' | browser modules: '
+    + safeArray(outputPayload.entryModules).join(', ');
   buildMetaEl.textContent = formatBuildMeta(outputPayload.meta);
   renderStats();
   applyPrimaryViewMode();
@@ -5167,12 +5185,24 @@ async function main() {
 }
 
 function rawRenderText() {
-  jsxTreeEl.textContent = outputPayload?.jsxTreeText || 'No JSX files found.';
+  jsxTreeEl.textContent = outputPayload?.jsxTreeText || 'No component modules found.';
   treeEl.textContent = outputPayload?.treeText || '';
   mermaidEl.textContent = outputPayload?.mermaid || '';
+  if (componentsListEl) componentsListEl.textContent = frontEndListText(outputPayload?.components, 'No components found.');
+  if (routesListEl) routesListEl.textContent = frontEndListText(outputPayload?.routes, 'No routes found.');
+  if (lazyBoundariesListEl) {
+    lazyBoundariesListEl.textContent = frontEndListText(outputPayload?.lazyBoundaries, 'No lazy boundaries found.');
+  }
+  if (assetsListEl) assetsListEl.textContent = frontEndListText(outputPayload?.assets, 'No assets found.');
+  if (findingsListEl) findingsListEl.textContent = frontEndListText(outputPayload?.findings, 'No findings.');
   copyJsxTreeBtn.disabled = false;
   copyTreeBtn.disabled = false;
   copyMermaidSourceBtn.disabled = false;
+}
+
+function frontEndListText(items, emptyText) {
+  const values = safeArray(items);
+  return values.length > 0 ? JSON.stringify(values, null, 2) : emptyText;
 }
 
 bindNetworkInteraction();

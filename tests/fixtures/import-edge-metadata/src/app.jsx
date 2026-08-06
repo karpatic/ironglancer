@@ -2,27 +2,19 @@ import StaticDefault, { StaticNamed as StaticAlias, StaticSame } from './static-
 
 const { DynamicExport: DynamicLocal } = await window.import('./dynamic-child.jsx');
 
-const FACULTY_BODY_SPECIFIER = './faculty-body-child.jsx';
-const FACULTY_EDITOR_SPECIFIER = './faculty-editor-child.jsx';
-
-
-function useCreatorModule(specifier) {
-  return { module: {}, specifier };
+function renderDynamicValue(value) {
+  return value;
 }
 
 export function App() {
-  const { module, loading, error } = useCreatorModule(FACULTY_BODY_SPECIFIER, true, 0);
-  if (loading || error) return null;
-  const CreatorViewBody = module?.CreatorViewBody;
+  const DynamicView = renderDynamicValue(DynamicLocal);
 
   return (
     <>
       {StaticDefault}
       {StaticAlias}
       {StaticSame}
-      {DynamicLocal}
-      {CreatorViewBody}
-      <CreatorLazyEditor specifier={FACULTY_EDITOR_SPECIFIER} exportName="CreatorQuizEntryEditor" />
+      {DynamicView}
     </>
   );
 }

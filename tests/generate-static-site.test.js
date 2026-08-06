@@ -373,9 +373,40 @@ async function writeTempProject(files) {
   return rootDir;
 }
 
-async function generateTestSite({ rootDir = fixtureRoot, entry = 'src/app.jsx', prefix = 'ironglancer-static-' } = {}) {
+async function pathExists(filePath) {
+  try {
+    await fs.stat(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readTreeText(rootDir) {
+  const chunks = [];
+  const visit = async (dirPath) => {
+    const entries = await fs.readdir(dirPath, { withFileTypes: true });
+    for (const entry of entries) {
+      const filePath = path.join(dirPath, entry.name);
+      if (entry.isDirectory()) {
+        await visit(filePath);
+      } else if (entry.isFile()) {
+        chunks.push(await fs.readFile(filePath, 'utf8'));
+      }
+    }
+  };
+  await visit(rootDir);
+  return chunks.join('\n');
+}
+
+async function generateTestSite({
+  rootDir = fixtureRoot,
+  entry = 'src/app.jsx',
+  prefix = 'ironglancer-static-',
+  sourceMode = 'full',
+} = {}) {
   const outDir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
-  const result = await generateStaticSite({ rootDir, entry, outDir });
+  const result = await generateStaticSite({ rootDir, entry, outDir, sourceMode });
   const readJson = async (fileName) => JSON.parse(await fs.readFile(path.join(outDir, fileName), 'utf8'));
   const [html, appJs, payload, sourcePayload, moduleSourcePayload, functionMapPayload] = await Promise.all([
     fs.readFile(path.join(outDir, 'index.html'), 'utf8'),
@@ -492,7 +523,7 @@ test('generateStaticSite writes a static viewer bundle', async () => {
     new URL(appScriptMatch[1], 'https://static.example/analysis/index.html').href,
     `https://static.example/analysis/app.js?v=${expectedAppHash}`,
   );
-  assert.match(html, />Architecture Views</);
+  assert.match(html, />Overview</);
   assert.match(html, /id="primary-view-switch"/);
   assert.match(html, /id="function-graphs-view"/);
   assert.match(html, /id="jsx-map-view"/);
@@ -501,8 +532,14 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.match(html, /id="network-scope-switch"/);
   assert.match(html, /id="network-depth-switch"/);
   assert.match(html, /id="selected-function"/);
-  assert.match(html, />Function Details</);
-  assert.match(html, />Project Snapshot</);
+  assert.match(html, />Functions \(advanced\)</);
+  assert.match(html, />Components</);
+  assert.match(html, />Modules</);
+  assert.match(html, />Routes</);
+  assert.match(html, />Lazy Boundaries</);
+  assert.match(html, />Assets</);
+  assert.match(html, />Findings</);
+  assert.match(html, />Source</);
   assert.match(html, /id="download-svg-btn"/);
   assert.match(html, /id="source-dialog-neighborhood"/);
   assert.match(html, /id="source-dialog-relationships"/);
@@ -533,7 +570,7 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.match(output.meta.buildId, /^[a-f0-9]{64}$/);
   assert.match(output.meta.sourceCodeHash, /^[a-f0-9]{64}$/);
   assert.equal(output.meta.apiVersion, 'v1');
-  assert.equal(output.meta.schemaVersion, '1.2.0');
+  assert.equal(output.meta.schemaVersion, '0.2.0');
   assert.equal(output.meta.rootDir, fixtureRoot);
   assert.equal(output.meta.entry, 'src/app.jsx');
   const { stdout: expectedGitCommit } = await execFile('git', ['-C', fixtureRoot, 'rev-parse', 'HEAD']);
@@ -587,6 +624,160 @@ test('generateStaticSite keeps full module source in API-only data', async () =>
   assert.match(appModule.code, /export default function RootApp/);
 });
 
+test('generateStaticSite defaults to no source artifacts', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      'export function App() {',
+      "  const sourceModeLiteral = 'DECLARATION_ONLY_LITERAL';",
+      '  return <main>{sourceModeLiteral}</main>;',
+      '}',
+    ].join('\n'),
+  });
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-source-default-'));
+
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
+  const output = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
+
+  assert.equal(output.meta.privacy.sourceMode, 'none');
+  assert.equal(output.meta.privacy.capabilities.sourceDialogs, false);
+  assert.equal(await pathExists(path.join(outDir, 'source-code.json')), false);
+  assert.equal(await pathExists(path.join(outDir, '.ironglancer-api', 'source-modules.json')), false);
+  assert.equal(await pathExists(path.join(outDir, '.ironglancer-api', 'function-map.json')), true);
+});
+
+test('generateStaticSite sourceMode none emits no source artifacts and leaks no source literals', async () => {
+  const uniqueLiteral = 'UNIQUE_SOURCE_LITERAL_0_2_NONE_MODE';
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      'export function App() {',
+      `  const privateLiteral = '${uniqueLiteral}';`,
+      '  return <main>{privateLiteral}</main>;',
+      '}',
+    ].join('\n'),
+  });
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-source-none-'));
+
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir, sourceMode: 'none' });
+  const output = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
+  const allOutputText = await readTreeText(outDir);
+
+  assert.equal(output.meta.privacy.sourceMode, 'none');
+  assert.equal(output.meta.privacy.capabilities.sourceDialogs, false);
+  assert.equal(await pathExists(path.join(outDir, 'source-code.json')), false);
+  assert.equal(await pathExists(path.join(outDir, '.ironglancer-api', 'source-modules.json')), false);
+  assert.equal(await pathExists(path.join(outDir, '.ironglancer-api', 'function-map.json')), true);
+  assert.equal(allOutputText.includes(uniqueLiteral), false);
+});
+
+test('generateStaticSite sourceMode full preserves full source artifacts', async () => {
+  const uniqueLiteral = 'UNIQUE_SOURCE_LITERAL_0_2_FULL_MODE';
+  const rootDir = await writeTempProject({
+    'src/app.jsx': [
+      'export function App() {',
+      `  return <main>${uniqueLiteral}</main>;`,
+      '}',
+    ].join('\n'),
+  });
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-source-full-'));
+
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir, sourceMode: 'full' });
+  const moduleSourcePayload = JSON.parse(await fs.readFile(
+    path.join(outDir, '.ironglancer-api', 'source-modules.json'),
+    'utf8',
+  ));
+
+  assert.equal(moduleSourcePayload.meta.privacy.sourceMode, 'full');
+  assert.ok(moduleSourcePayload.modules.some((module) => module.code.includes(uniqueLiteral)));
+});
+
+test('generateStaticSite rejects invalid source modes before replacing output', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.jsx': 'export function App() { return <main />; }\n',
+  });
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-source-invalid-'));
+  const markerPath = path.join(outDir, 'marker.txt');
+  await fs.writeFile(markerPath, 'keep me\n', 'utf8');
+
+  await assert.rejects(
+    generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir, sourceMode: 'invalid' }),
+    /--source-mode must be one of none, declarations, or full/,
+  );
+  assert.equal(await fs.readFile(markerPath, 'utf8'), 'keep me\n');
+});
+
+test('generateStaticSite records effective module limit metadata and validates before replacing output', async () => {
+  const rootDir = await writeTempProject({
+    'src/app.js': [
+      "import { feature } from './feature.js';",
+      'export function App() { return feature(); }',
+    ].join('\n'),
+    'src/feature.js': 'export function feature() { return 1; }\n',
+  });
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-module-limit-'));
+
+  await generateStaticSite({ rootDir, entry: 'src/app.js', outDir, moduleLimit: 2 });
+  const output = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
+  assert.deepEqual(output.meta.analysis.moduleLimit, { limit: 2, count: 2 });
+
+  const markerPath = path.join(outDir, 'marker.txt');
+  await fs.writeFile(markerPath, 'keep me\n', 'utf8');
+  await assert.rejects(
+    generateStaticSite({ rootDir, entry: 'src/app.js', outDir, moduleLimit: 0 }),
+    /--module-limit must be an integer/,
+  );
+  assert.equal(await fs.readFile(markerPath, 'utf8'), 'keep me\n');
+});
+
+test('generateStaticSite refuses destructive output targets and unmarked replacements', async () => {
+  const parentDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-destructive-parent-'));
+  const rootDir = path.join(parentDir, 'project');
+  await fs.mkdir(path.join(rootDir, 'src'), { recursive: true });
+  await fs.writeFile(
+    path.join(rootDir, 'src/app.jsx'),
+    'export function App() { return <main />; }\n',
+    'utf8',
+  );
+
+  const cases = [
+    { outDir: path.parse(process.cwd()).root, message: /filesystem root/ },
+    { outDir: os.homedir(), message: /home directory/ },
+    { outDir: process.cwd(), message: /current working directory/ },
+    { outDir: rootDir, message: /project\/source root/ },
+    { outDir: parentDir, message: /source ancestor/ },
+  ];
+
+  for (const item of cases) {
+    await assert.rejects(
+      generateStaticSite({
+        rootDir,
+        entry: 'src/app.jsx',
+        outDir: item.outDir,
+      }),
+      item.message,
+    );
+  }
+
+  const unmarkedOutDir = path.join(parentDir, 'existing-site');
+  await fs.mkdir(unmarkedOutDir);
+  await fs.writeFile(path.join(unmarkedOutDir, 'keep.txt'), 'do not replace\n', 'utf8');
+  await assert.rejects(
+    generateStaticSite({
+      rootDir,
+      entry: 'src/app.jsx',
+      outDir: unmarkedOutDir,
+    }),
+    /valid IronGlancer ownership marker/,
+  );
+  assert.equal(await fs.readFile(path.join(unmarkedOutDir, 'keep.txt'), 'utf8'), 'do not replace\n');
+
+  const safeOutDir = path.join(parentDir, 'safe-site');
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir: safeOutDir });
+  assert.equal(await pathExists(path.join(safeOutDir, '.ironglancer-output.json')), true);
+  const siblingArtifacts = (await fs.readdir(parentDir))
+    .filter((name) => name.startsWith('.safe-site.tmp-') || name.startsWith('.safe-site.previous-'));
+  assert.deepEqual(siblingArtifacts, []);
+});
+
 test('generateStaticSite refuses credential-looking source snippets without rejecting validation copy', async () => {
   const safeRootDir = await writeTempProject({
     'src/app.jsx': [
@@ -599,10 +790,12 @@ test('generateStaticSite refuses credential-looking source snippets without reje
       '}',
     ].join('\n'),
   });
+  const safeOutParent = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-validation-out-'));
   await assert.doesNotReject(generateStaticSite({
     rootDir: safeRootDir,
     entry: 'src/app.jsx',
-    outDir: path.join(safeRootDir, 'site'),
+    outDir: path.join(safeOutParent, 'site'),
+    sourceMode: 'declarations',
   }));
 
   const cases = [
@@ -641,7 +834,12 @@ test('generateStaticSite refuses credential-looking source snippets without reje
     });
 
     await assert.rejects(
-      generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir: path.join(rootDir, 'site') }),
+      generateStaticSite({
+        rootDir,
+        entry: 'src/app.jsx',
+        outDir: path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-credential-out-')), 'site'),
+        sourceMode: 'declarations',
+      }),
       /credential-looking literal/,
       credentialCase.name,
     );
@@ -659,7 +857,7 @@ test('generated viewer opens visible member source snippets from scoped source p
   assert.ok(files.includes('source-code.json'));
 
   const appSource = await fs.readFile(path.join(rootDir, 'src/app.jsx'), 'utf8');
-  const appLines = appSource.split(/\r\n|\r|\n/).slice(12, 28).join('\n');
+  const appLines = appSource.split(/\r\n|\r|\n/).slice(8, 20).join('\n');
   const jsxMapDeclarations = sourcePayload.declarations.filter((item) => item.sourceOrigin !== 'saved-function');
   assert.deepEqual(jsxMapDeclarations.map(({ moduleId, modulePath, name, startLine, endLine }) => ({
     moduleId,
@@ -672,27 +870,13 @@ test('generated viewer opens visible member source snippets from scoped source p
       moduleId: 'app',
       modulePath: 'src/app.jsx',
       name: 'App',
-      startLine: 13,
-      endLine: 28,
+      startLine: 9,
+      endLine: 20,
     },
     {
       moduleId: 'dynamic_child',
       modulePath: 'src/dynamic-child.jsx',
       name: 'DynamicExport',
-      startLine: 1,
-      endLine: 3,
-    },
-    {
-      moduleId: 'faculty_body_child',
-      modulePath: 'src/faculty-body-child.jsx',
-      name: 'CreatorViewBody',
-      startLine: 1,
-      endLine: 3,
-    },
-    {
-      moduleId: 'faculty_editor_child',
-      modulePath: 'src/faculty-editor-child.jsx',
-      name: 'CreatorQuizEntryEditor',
       startLine: 1,
       endLine: 3,
     },
@@ -719,12 +903,12 @@ test('generated viewer opens visible member source snippets from scoped source p
     },
   ]);
   assert.equal(sourcePayload.declarations.find((item) => item.name === 'App').code, appLines);
-  const savedFunctionDeclaration = sourcePayload.declarations.find((item) => item.name === 'useCreatorModule');
+  const savedFunctionDeclaration = sourcePayload.declarations.find((item) => item.name === 'renderDynamicValue');
   assert.ok(savedFunctionDeclaration, 'expected function graph-only source declaration');
   assert.equal(savedFunctionDeclaration.sourceOrigin, 'saved-function');
   assert.equal(savedFunctionDeclaration.modulePath, 'src/app.jsx');
-  assert.equal(savedFunctionDeclaration.startLine, 9);
-  assert.equal(savedFunctionDeclaration.endLine, 11);
+  assert.equal(savedFunctionDeclaration.startLine, 5);
+  assert.equal(savedFunctionDeclaration.endLine, 7);
 
   assert.equal(sourcePayload.meta.buildId, payload.meta.buildId);
   assert.equal(sourcePayload.meta.sourceCodeHash, payload.meta.sourceCodeHash);
@@ -734,7 +918,7 @@ test('generated viewer opens visible member source snippets from scoped source p
     sourcePayload,
     classOptions: {
       classId: 'app',
-      memberText: '+App() [lines: 16 | refs: 0 | importers: 0]',
+      memberText: '+App() [lines: 12 | refs: 0 | importers: 0]',
     },
   });
 
@@ -758,7 +942,7 @@ test('generated viewer opens visible member source snippets from scoped source p
   const dialog = document.getElementById('source-dialog');
   assert.equal(dialog.open, true);
   assert.equal(document.getElementById('source-dialog-title').textContent, 'App');
-  assert.equal(document.getElementById('source-dialog-path').textContent, 'src/app.jsx:13-28');
+  assert.equal(document.getElementById('source-dialog-path').textContent, 'src/app.jsx:9-20');
   const codeEl = document.getElementById('source-dialog-code');
   assert.equal(codeEl.textContent, appLines);
   assert.equal(codeEl.innerHTML, '');
@@ -1209,7 +1393,7 @@ test('generated viewer resolves source members from Mermaid class id variants', 
     classOptions: {
       classId: 'app',
       classGroupId: 'classId-app',
-      memberText: '+App() [lines: 16 | refs: 0 | importers: 0]',
+      memberText: '+App() [lines: 12 | refs: 0 | importers: 0]',
     },
   });
 
@@ -1230,7 +1414,7 @@ test('generated viewer adds non-scaling source member hit targets without duplic
     sourcePayload,
     classOptions: {
       classId: 'app',
-      memberText: '+App() [lines: 16 | refs: 0 | importers: 0]',
+      memberText: '+App() [lines: 12 | refs: 0 | importers: 0]',
       memberBox: { x: 96, y: 144, width: 124, height: 18 },
     },
   });
@@ -1268,11 +1452,11 @@ test('generated viewer adds non-scaling source member hit targets without duplic
 test('generated viewer resolves overlapping source hit targets to the visible or nearest source label', async () => {
   const rootDir = await writeTempProject({
     'src/app.jsx': [
-      'export function CreatorShell() {',
+      'export function DashboardShell() {',
       "  return <div>Shell</div>;",
       '}',
       '',
-      'export function CreatorLogin() {',
+      'export function DashboardLogin() {',
       "  return <form>Login</form>;",
       '}',
     ].join('\n'),
@@ -1288,8 +1472,8 @@ test('generated viewer resolves overlapping source hit targets to the visible or
     classOptions: {
       classId: 'app',
       memberTexts: [
-        '+CreatorShell() [lines: 3 | refs: 0 | importers: 0]',
-        '+CreatorLogin() [lines: 3 | refs: 0 | importers: 0]',
+        '+DashboardShell() [lines: 3 | refs: 0 | importers: 0]',
+        '+DashboardLogin() [lines: 3 | refs: 0 | importers: 0]',
       ],
     },
   });
@@ -1311,42 +1495,42 @@ test('generated viewer resolves overlapping source hit targets to the visible or
     height: 4.8,
   });
 
-  const [creatorShellHitTarget, creatorLoginHitTarget] = rendered.classGroup
+  const [dashboardShellHitTarget, dashboardLoginHitTarget] = rendered.classGroup
     .querySelectorAll('path.source-member-hit-target');
-  assert.ok(creatorShellHitTarget, 'expected CreatorShell hit target');
-  assert.ok(creatorLoginHitTarget, 'expected CreatorLogin hit target');
+  assert.ok(dashboardShellHitTarget, 'expected DashboardShell hit target');
+  assert.ok(dashboardLoginHitTarget, 'expected DashboardLogin hit target');
 
   const dialog = document.getElementById('source-dialog');
   document.elementsFromPointResult = [
-    creatorShellHitTarget,
-    creatorLoginHitTarget,
+    dashboardShellHitTarget,
+    dashboardLoginHitTarget,
     rendered.members[1],
   ];
-  creatorShellHitTarget.dispatchEvent({
+  dashboardShellHitTarget.dispatchEvent({
     type: 'click',
-    target: creatorShellHitTarget,
+    target: dashboardShellHitTarget,
     clientX: 134.25,
     clientY: 120.4,
     stopPropagation() {},
   });
   assert.equal(dialog.open, true);
-  assert.equal(document.getElementById('source-dialog-title').textContent, 'CreatorLogin');
+  assert.equal(document.getElementById('source-dialog-title').textContent, 'DashboardLogin');
   assert.equal(document.getElementById('source-dialog-path').textContent, 'src/app.jsx:5-7');
 
   document.getElementById('source-dialog-close').click();
   document.elementsFromPointResult = [
-    creatorShellHitTarget,
-    creatorLoginHitTarget,
+    dashboardShellHitTarget,
+    dashboardLoginHitTarget,
   ];
-  creatorShellHitTarget.dispatchEvent({
+  dashboardShellHitTarget.dispatchEvent({
     type: 'click',
-    target: creatorShellHitTarget,
+    target: dashboardShellHitTarget,
     clientX: 112,
     clientY: 120.4,
     stopPropagation() {},
   });
   assert.equal(dialog.open, true);
-  assert.equal(document.getElementById('source-dialog-title').textContent, 'CreatorLogin');
+  assert.equal(document.getElementById('source-dialog-title').textContent, 'DashboardLogin');
   assert.equal(document.getElementById('source-dialog-path').textContent, 'src/app.jsx:5-7');
 });
 
@@ -1365,7 +1549,7 @@ test('generated viewer disables source popups for mismatched or unavailable sour
       ...sourceOptions,
       classOptions: {
         classId: 'app',
-        memberText: '+App() [lines: 16 | refs: 0 | importers: 0]',
+        memberText: '+App() [lines: 12 | refs: 0 | importers: 0]',
       },
     });
   }
@@ -1404,7 +1588,7 @@ test('generated viewer disables source popups for mismatched or unavailable sour
 test('generated viewer copy controls copy raw output values and report success', async () => {
   const { html, appJs, payload } = await generateTestSite({ prefix: 'ironglancer-static-copy-' });
 
-  assert.match(html, />Copy JSX tree</);
+  assert.match(html, />Copy module tree</);
   assert.match(html, />Copy Mermaid source</);
   assert.match(html, /id="copy-jsx-tree-status"[^>]*role="status"[^>]*aria-live="polite"/);
   assert.match(html, /id="copy-mermaid-source-status"[^>]*role="status"[^>]*aria-live="polite"/);
@@ -1422,8 +1606,8 @@ test('generated viewer copy controls copy raw output values and report success',
   await flushAsyncWork();
   assert.equal(copiedTexts.at(-1), payload.jsxTreeText);
   assert.match(copiedTexts.at(-1), /app\.jsx \(9 lines\)/);
-  assert.doesNotMatch(copiedTexts.at(-1), /Copy JSX tree|JSX hierarchy|Copied/);
-  assert.equal(document.getElementById('copy-jsx-tree-status').textContent, 'Copied JSX tree.');
+  assert.doesNotMatch(copiedTexts.at(-1), /Copy module tree|JSX hierarchy|Copied/);
+  assert.equal(document.getElementById('copy-jsx-tree-status').textContent, 'Copied module tree.');
 
   document.getElementById('copy-mermaid-source-btn').click();
   await flushAsyncWork();
@@ -1461,7 +1645,7 @@ test('generated viewer copy controls fall back and report copy failure', async (
   failureHarness.document.getElementById('copy-jsx-tree-btn').click();
   await flushAsyncWork();
   const statusEl = failureHarness.document.getElementById('copy-jsx-tree-status');
-  assert.equal(statusEl.textContent, 'Could not copy JSX tree.');
+  assert.equal(statusEl.textContent, 'Could not copy module tree.');
   assert.match(statusEl.className, /is-error/);
 });
 

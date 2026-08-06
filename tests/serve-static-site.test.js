@@ -54,7 +54,7 @@ async function requestUrl(url, { method = 'GET', body = '' } = {}) {
 
 test('static analysis server exposes viewer files and a versioned cached API', async () => {
   const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-server-'));
-  await generateStaticSite({ rootDir: fixtureRoot, entry: 'src/app.jsx', outDir });
+  await generateStaticSite({ rootDir: fixtureRoot, entry: 'src/app.jsx', outDir, sourceMode: 'full' });
   activeHandler = await createStaticAnalysisRequestHandler({ outDir });
 
   try {
@@ -204,7 +204,10 @@ test('static analysis server exposes viewer files and a versioned cached API', a
       'src/lib/util.js',
       'src/panes/Inspector.jsx',
     ]);
-    assert.deepEqual(appDetail.body.data.dependencies.external, ['cdn.example.com']);
+    assert.deepEqual(appDetail.body.data.dependencies.external, []);
+    const remoteImports = await fetchJson(new URL('/api/v1/imports?resolution=remote', serviceUrl));
+    assert.equal(remoteImports.response.status, 200);
+    assert.deepEqual(remoteImports.body.data.items.map((item) => item.specifier), ['https://cdn.example.com/widget.js']);
 
     const dependencyOnlyModule = await fetchJson(new URL(
       `/api/v1/modules/${appModule.stableId}?include=dependencies`,
@@ -267,6 +270,35 @@ test('static analysis server exposes viewer files and a versioned cached API', a
   }
 });
 
+test('static analysis server reports source privacy limits explicitly', async () => {
+  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-server-source-mode-'));
+  await generateStaticSite({ rootDir: fixtureRoot, entry: 'src/app.jsx', outDir });
+  activeHandler = await createStaticAnalysisRequestHandler({ outDir });
+
+  try {
+    const run = await fetchJson('/api/v1/run');
+    assert.equal(run.response.status, 200);
+    assert.equal(run.body.data.source.sourceMode, 'none');
+    assert.equal(run.body.data.source.declarationSourceAvailable, false);
+    assert.equal(run.body.data.source.moduleSourceAvailable, false);
+    assert.equal(run.body.data.source.functionMapAvailable, true);
+
+    const modules = await fetchJson('/api/v1/modules');
+    const appModule = modules.body.data.items.find((item) => item.path === 'src/app.jsx');
+    const source = await fetchJson(`/api/v1/modules/${appModule.stableId}/source`);
+    assert.equal(source.response.status, 404);
+    assert.equal(source.body.error.code, 'source_not_available');
+    assert.equal(source.body.error.details.sourceMode, 'none');
+
+    const occurrenceSearch = await fetchJson('/api/v1/search?q=RootApp&match=exact&types=occurrence');
+    assert.equal(occurrenceSearch.response.status, 404);
+    assert.equal(occurrenceSearch.body.error.code, 'source_not_available');
+    assert.equal(occurrenceSearch.body.error.details.moduleSourceAvailable, false);
+  } finally {
+    activeHandler = null;
+  }
+});
+
 test('source excerpts preserve the API v1 80-line default and maximum', async () => {
   const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-source-limit-src-'));
   const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-source-limit-out-'));
@@ -276,7 +308,7 @@ test('source excerpts preserve the API v1 80-line default and maximum', async ()
     ['export function App() { return 1; }', ...Array.from({ length: 119 }, (_, index) => `// line ${index + 2}`)].join('\n'),
     'utf8',
   );
-  await generateStaticSite({ rootDir, entry: 'src/app.js', outDir });
+  await generateStaticSite({ rootDir, entry: 'src/app.js', outDir, sourceMode: 'full', includeUnreachable: true });
   activeHandler = await createStaticAnalysisRequestHandler({ outDir });
 
   try {
@@ -314,7 +346,7 @@ test('module functions API supports compact summary pagination and query bounds'
   ].join('\n'), 'utf8');
 
   const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-module-functions-api-'));
-  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir, sourceMode: 'full' });
   activeHandler = await createStaticAnalysisRequestHandler({ outDir });
 
   try {
@@ -401,7 +433,7 @@ test('function and module lists expose triage filters and deterministic sorting'
   await fs.writeFile(path.join(rootDir, 'src/dep.js'), 'export const a = 1; export const b = 2;\n', 'utf8');
   await fs.writeFile(path.join(rootDir, 'src/orphan.js'), 'export function Orphan() { return 3; }\n', 'utf8');
   const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-triage-api-'));
-  await generateStaticSite({ rootDir, entry: 'src/app.js', outDir });
+  await generateStaticSite({ rootDir, entry: 'src/app.js', outDir, sourceMode: 'full', includeUnreachable: true });
   activeHandler = await createStaticAnalysisRequestHandler({ outDir });
 
   try {
@@ -527,7 +559,7 @@ test('module and function graph APIs return bounded shortest paths and blast rad
   ].join('\n'), 'utf8');
   await fs.writeFile(path.join(rootDir, 'src/leaf.js'), 'export function Leaf() { return 1; }\n', 'utf8');
   const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-graph-api-'));
-  await generateStaticSite({ rootDir, entry: 'src/app.js', outDir });
+  await generateStaticSite({ rootDir, entry: 'src/app.js', outDir, sourceMode: 'full' });
   activeHandler = await createStaticAnalysisRequestHandler({ outDir });
 
   try {
@@ -599,7 +631,7 @@ test('stable IDs survive unrelated line insertions while legacy declaration IDs 
     '}',
   ].filter(Boolean).join('\n'), 'utf8');
   const readIds = async (outDir) => {
-    await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
+    await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir, sourceMode: 'full' });
     activeHandler = await createStaticAnalysisRequestHandler({ outDir });
     const module = (await fetchJson(new URL('http://127.0.0.1/api/v1/modules'))).body.data.items[0];
     const functions = (await fetchJson(new URL('http://127.0.0.1/api/v1/functions?name=App'))).body.data.items;
@@ -640,7 +672,7 @@ test('import stable IDs ignore named-binding order', async () => {
   const readStableId = async (bindings) => {
     await fs.writeFile(sourcePath, `import { ${bindings} } from './dep.js';\nexport function App() { return a + b; }\n`, 'utf8');
     const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-import-id-out-'));
-    await generateStaticSite({ rootDir, entry: 'src/app.js', outDir });
+    await generateStaticSite({ rootDir, entry: 'src/app.js', outDir, sourceMode: 'full' });
     activeHandler = await createStaticAnalysisRequestHandler({ outDir });
     const imports = await fetchJson('/api/v1/imports?sourcePath=src%2Fapp.js');
     return imports.body.data.items[0].stableId;
@@ -658,7 +690,7 @@ test('import stable IDs ignore named-binding order', async () => {
 
 test('viewer bridge stores structured state and presentation command acknowledgements', async () => {
   const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-bridge-'));
-  await generateStaticSite({ rootDir: fixtureRoot, entry: 'src/app.jsx', outDir });
+  await generateStaticSite({ rootDir: fixtureRoot, entry: 'src/app.jsx', outDir, sourceMode: 'full' });
   activeHandler = await createStaticAnalysisRequestHandler({ outDir });
 
   try {
@@ -738,7 +770,7 @@ test('viewer bridge stores structured state and presentation command acknowledge
 
 test('static analysis server rejects static symlink escapes', async (t) => {
   const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-server-symlink-'));
-  await generateStaticSite({ rootDir: fixtureRoot, entry: 'src/app.jsx', outDir });
+  await generateStaticSite({ rootDir: fixtureRoot, entry: 'src/app.jsx', outDir, sourceMode: 'full' });
   try {
     await fs.symlink(path.resolve('package.json'), path.join(outDir, 'package-link.json'));
   } catch {
