@@ -30,6 +30,8 @@ Examples
 Architecture diffs
 - compare two architecture snapshots from git refs without changing the checkout:
   `ironglancer diff ./my-app --base main --head HEAD --entry src/app.jsx --format html --sarif review.sarif`
+- run an opt-in review gate against an accepted prior diff and exact finding suppressions:
+  `ironglancer diff ./my-app --base main --head HEAD --entry src/app.jsx --format html --sarif review.sarif --baseline accepted-diff.json --suppressions ironglancer-suppressions.json --fail-on warning`
 - compare saved snapshots:
   `ironglancer diff --base ./before/output.json --head ./after-site --format json`
 - inputs can be git refs resolvable in the project repo, an `output.json` file, or a generated-site directory containing `output.json`
@@ -37,8 +39,12 @@ Architecture diffs
 - move and rename matching requires the analyzer's privacy-safe implementation fingerprint; older snapshots without that evidence remain conservative additions and removals
 - `--format json` writes machine-readable JSON to stdout unless `--out` is supplied; `--format html` writes one self-contained static report and defaults to `architecture-diff.html` when `--out` is omitted
 - `--sarif review.sarif` writes SARIF 2.1.0 findings alongside either JSON or HTML output
+- `--baseline accepted-diff.json` reads a previous IronGlancer diff JSON report and marks exact matching finding IDs as existing
+- `--suppressions ironglancer-suppressions.json` accepts only `{ "version": 1, "suppressions": [{ "findingId": "...", "reason": "..." }] }`; suppressions match exact finding IDs and unknown IDs are counted as unused
+- `--fail-on error|warning|note` is opt-in CI gating; without it, `ironglancer diff` exits 0 even with findings, and with it a triggered gate exits 2 after reports are written
+- gating considers only actionable findings: new findings that are not suppressed
 - diff reports include schema/build/commit labels, module/function/edge deltas, structural findings, severity counts, static-analysis limitations, and `privacy.sourceMode = "none"`
-- privacy guarantee: diff JSON, HTML, and SARIF intentionally exclude absolute `rootDir` values and source excerpts
+- privacy guarantee: diff JSON, HTML, and SARIF intentionally exclude absolute `rootDir` values, baseline paths, suppression paths, and source excerpts
 - caveat: findings are static structural review prompts, not runtime behavior claims; function edges are static identifier-use evidence
 - current limitations: git-ref inputs are analyzed from archived committed contents, so uncommitted work is not included; function move/rename pairing is conservative and leaves ambiguous candidates as ordinary add/remove changes; fan findings use the documented threshold of at least 3 new edges and at least 2x the previous count
 

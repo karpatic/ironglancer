@@ -11,6 +11,12 @@ import {
   renderDiffHtml,
   renderDiffSarif,
 } from './diff-snapshots.js';
+import {
+  DiffReviewError,
+  applyReviewPolicy,
+  validateBaselineReport,
+  validateSuppressionsConfig,
+} from './diff-review.js';
 import { analyzeProject } from './analyze-project.js';
 import { compareLocale, normalizeString } from './utils.js';
 
@@ -42,6 +48,21 @@ async function readJsonFile(filePath) {
     return JSON.parse(text);
   } catch (error) {
     throw new SnapshotDiffError(`Malformed JSON in snapshot ${filePath}: ${error.message}`, 'malformed_snapshot');
+  }
+}
+
+async function readReviewJsonFile(filePath, label, code) {
+  let text = '';
+  try {
+    text = await fs.readFile(filePath, 'utf8');
+  } catch (error) {
+    const detail = error?.code ? ` (${error.code})` : '';
+    throw new DiffReviewError(`Unable to read ${label}${detail}.`, code);
+  }
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new DiffReviewError(`Malformed JSON in ${label}: ${error.message}`, code);
   }
 }
 
@@ -266,10 +287,51 @@ function normalizedFormat(format) {
   return value;
 }
 
-function assertNoOutputCollision(outPath, sarifPath) {
-  if (!outPath || !sarifPath) return;
-  if (path.resolve(outPath) === path.resolve(sarifPath)) {
+function assertNoOutputCollision(outPath, sarifPath, { baselinePath, suppressionsPath } = {}) {
+  const resolvedOutPath = outPath ? path.resolve(outPath) : null;
+  const resolvedSarifPath = sarifPath ? path.resolve(sarifPath) : null;
+  if (resolvedOutPath && resolvedSarifPath && resolvedOutPath === resolvedSarifPath) {
     throw new SnapshotDiffError('Diff --out and --sarif must not point to the same path.', 'output_collision');
+  }
+
+  const reportPaths = new Set([resolvedOutPath, resolvedSarifPath].filter(Boolean));
+  const reviewInputPaths = [baselinePath, suppressionsPath]
+    .filter(Boolean)
+    .map((filePath) => path.resolve(filePath));
+  if (reviewInputPaths.some((filePath) => reportPaths.has(filePath))) {
+    throw new SnapshotDiffError(
+      'Diff review input and report output must not point to the same path.',
+      'review_input_output_collision',
+    );
+  }
+}
+
+async function canonicalExistingPath(filePath) {
+  if (!filePath) return null;
+  try {
+    return await fs.realpath(filePath);
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return null;
+    throw new SnapshotDiffError(
+      'Unable to inspect a diff review input or report output path.',
+      'review_path_inspection_failed',
+    );
+  }
+}
+
+async function assertNoFilesystemOutputCollision(outPath, sarifPath, { baselinePath, suppressionsPath } = {}) {
+  const [resolvedOutPath, resolvedSarifPath, resolvedBaselinePath, resolvedSuppressionsPath] = await Promise.all([
+    canonicalExistingPath(outPath),
+    canonicalExistingPath(sarifPath),
+    canonicalExistingPath(baselinePath),
+    canonicalExistingPath(suppressionsPath),
+  ]);
+  const reportPaths = new Set([resolvedOutPath, resolvedSarifPath].filter(Boolean));
+  if ([resolvedBaselinePath, resolvedSuppressionsPath].filter(Boolean).some((filePath) => reportPaths.has(filePath))) {
+    throw new SnapshotDiffError(
+      'Diff review input and report output must not point to the same filesystem entry.',
+      'review_input_output_alias',
+    );
   }
 }
 
@@ -362,13 +424,24 @@ export async function createArchitectureDiff({
   format = 'json',
   outPath,
   sarifPath,
+  baselinePath,
+  suppressionsPath,
+  failOn,
   generatedAt = new Date().toISOString(),
 } = {}) {
   if (!base) throw new SnapshotDiffError('ironglancer diff requires --base <input>.', 'missing_base');
   if (!head) throw new SnapshotDiffError('ironglancer diff requires --head <input>.', 'missing_head');
   const resolvedFormat = normalizedFormat(format);
   const effectiveOutPath = resolvedFormat === 'html' ? outPath || 'architecture-diff.html' : outPath;
-  assertNoOutputCollision(effectiveOutPath, sarifPath);
+  assertNoOutputCollision(effectiveOutPath, sarifPath, { baselinePath, suppressionsPath });
+  await assertNoFilesystemOutputCollision(effectiveOutPath, sarifPath, { baselinePath, suppressionsPath });
+
+  const [baselineReport, suppressionsConfig] = await Promise.all([
+    baselinePath ? readReviewJsonFile(baselinePath, 'baseline report', 'baseline_read_failed') : null,
+    suppressionsPath ? readReviewJsonFile(suppressionsPath, 'suppressions file', 'suppressions_read_failed') : null,
+  ]);
+  if (baselineReport) validateBaselineReport(baselineReport);
+  if (suppressionsConfig) validateSuppressionsConfig(suppressionsConfig);
 
   const [baseInput, headInput] = await Promise.all([
     loadSnapshotInput({ folder, input: base, entry, routeAliases, generatedAt }),
@@ -379,12 +452,17 @@ export async function createArchitectureDiff({
     headLabel: headInput.label,
     generatedAt,
   });
+  const reviewedDiff = applyReviewPolicy(diff, {
+    baseline: baselineReport,
+    suppressions: suppressionsConfig,
+    failOn,
+  });
 
   let stdoutText = null;
   let outputPath = null;
   const reports = [];
   if (resolvedFormat === 'json') {
-    const json = JSON.stringify(diff, null, 2) + '\n';
+    const json = JSON.stringify(reviewedDiff, null, 2) + '\n';
     if (effectiveOutPath) {
       reports.push({ filePath: effectiveOutPath, text: json });
       outputPath = path.resolve(effectiveOutPath);
@@ -392,22 +470,23 @@ export async function createArchitectureDiff({
       stdoutText = json;
     }
   } else {
-    reports.push({ filePath: effectiveOutPath, text: renderDiffHtml(diff) });
+    reports.push({ filePath: effectiveOutPath, text: renderDiffHtml(reviewedDiff) });
     outputPath = path.resolve(effectiveOutPath);
   }
 
   let resolvedSarifPath = null;
   if (sarifPath) {
-    reports.push({ filePath: sarifPath, text: JSON.stringify(renderDiffSarif(diff), null, 2) + '\n' });
+    reports.push({ filePath: sarifPath, text: JSON.stringify(renderDiffSarif(reviewedDiff), null, 2) + '\n' });
     resolvedSarifPath = path.resolve(sarifPath);
   }
   if (reports.length > 0) await writeTextFiles(reports);
 
   return {
-    diff,
+    diff: reviewedDiff,
     format: resolvedFormat,
     stdoutText,
     outputPath,
     sarifPath: resolvedSarifPath,
+    exitCode: reviewedDiff.reviewPolicy?.gateTriggered ? 2 : 0,
   };
 }

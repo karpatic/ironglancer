@@ -8,6 +8,7 @@ import {
   renderDiffHtml,
   renderDiffSarif,
 } from '../src/lib/diff-snapshots.js';
+import { applyReviewPolicy } from '../src/lib/diff-review.js';
 import * as publicApi from '../src/index.js';
 
 function snapshot({
@@ -128,7 +129,7 @@ test('compareSnapshots returns an empty deterministic diff for unchanged snapsho
     generatedAt: '2026-08-06T12:00:00.000Z',
   });
 
-  assert.equal(diff.schemaVersion, '1.0.0');
+  assert.equal(diff.schemaVersion, '1.1.0');
   assert.equal(diff.generatedAt, '2026-08-06T12:00:00.000Z');
   assert.equal(diff.privacy.sourceMode, 'none');
   assert.equal(diff.base.label, 'base');
@@ -875,6 +876,71 @@ test('renderDiffHtml escapes snapshot content and omits private roots and source
   assert.equal(html.includes('secretSourceText'), false);
   assert.ok(html.includes('sourceMode'));
   assert.ok(html.includes('Static-analysis limitations'));
+  assert.match(html, /Actionable findings<\/span><strong>1<\/strong>/);
+});
+
+test('renderDiffHtml shows review state, suppression reason, and gate summary safely', () => {
+  const base = snapshot({
+    label: 'base',
+    modules: [module('src/api.js')],
+    functions: [fn('fn_public', 'src/api.js', 'publicApi', {
+      exported: true,
+      exportedNames: ['publicApi'],
+    })],
+  });
+  const diff = compareSnapshots(base, snapshot({ label: 'head', modules: [], functions: [] }), { generatedAt: 'fixed' });
+  const finding = diff.findings[0];
+  const reviewed = applyReviewPolicy(diff, {
+    baseline: { findings: [{ id: finding.id }] },
+    suppressions: {
+      version: 1,
+      suppressions: [{
+        findingId: finding.id,
+        reason: 'Accepted by architecture council <script>alert("x")</script>.',
+      }],
+    },
+    failOn: 'error',
+  });
+
+  const html = renderDiffHtml(reviewed);
+
+  assert.match(html, /Review Gate/);
+  assert.match(html, /Existing/);
+  assert.match(html, /Suppressed/);
+  assert.match(html, /Gate clear/);
+  assert.match(html, /Actionable findings/);
+  assert.ok(html.includes('Accepted by architecture council &lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;.'));
+  assert.equal(html.includes('<script>'), false);
+});
+
+test('renderDiffSarif maps review state and exact suppressions to SARIF result fields', () => {
+  const base = snapshot({
+    modules: [module('src/api.js')],
+    functions: [fn('fn_public', 'src/api.js', 'publicApi', {
+      exported: true,
+      exportedNames: ['publicApi'],
+      startLine: 7,
+      endLine: 9,
+    })],
+  });
+  const diff = compareSnapshots(base, snapshot({ modules: [], functions: [] }));
+  const finding = diff.findings[0];
+  const reason = 'Accepted external compatibility waiver.';
+  const reviewed = applyReviewPolicy(diff, {
+    baseline: { findings: [{ id: finding.id }] },
+    suppressions: {
+      version: 1,
+      suppressions: [{ findingId: finding.id, reason }],
+    },
+  });
+  const sarif = renderDiffSarif(reviewed);
+  const result = sarif.runs[0].results[0];
+
+  assert.equal(result.baselineState, 'unchanged');
+  assert.deepEqual(result.suppressions, [{ kind: 'external', justification: reason }]);
+  assert.equal(result.properties.confidence, 'high');
+  assert.deepEqual(result.properties.evidence.exportedNames, ['publicApi']);
+  assert.deepEqual(result.locations[0].physicalLocation.artifactLocation, { uri: 'src/api.js' });
 });
 
 test('renderDiffSarif emits valid SARIF 2.1.0 structure with relative locations and evidence properties', () => {
@@ -902,6 +968,7 @@ test('renderDiffSarif emits valid SARIF 2.1.0 structure with relative locations 
   const result = sarif.runs[0].results[0];
   assert.equal(result.ruleId, 'IRONG_DIFF_EXPORT_REMOVED');
   assert.equal(result.level, 'error');
+  assert.equal(result.baselineState, 'new');
   assert.equal(result.message.text.includes('publicApi'), true);
   assert.deepEqual(result.properties.confidence, 'high');
   assert.deepEqual(result.properties.evidence.exportedNames, ['publicApi']);

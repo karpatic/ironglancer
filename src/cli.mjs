@@ -13,7 +13,7 @@ const DEFAULT_PORT = 4173;
 function usage() {
   return [
     'Usage: ironglancer <folder> [--entry src/app.jsx] [--out ./ironglancer-site] [--route-alias /app/=src/app/]',
-    '       ironglancer diff [folder] --base <input> --head <input> [--entry src/app.jsx] [--format json|html] [--out architecture-diff.html] [--sarif review.sarif]',
+    '       ironglancer diff [folder] --base <input> --head <input> [--entry src/app.jsx] [--format json|html] [--out architecture-diff.html] [--sarif review.sarif] [--baseline accepted-diff.json] [--suppressions ironglancer-suppressions.json] [--fail-on error|warning|note]',
     '',
     'Options:',
     '  --entry <path>              Entry module inside the project root.',
@@ -29,11 +29,16 @@ function usage() {
     '                              Precedence: output.json file or directory containing output.json wins; otherwise inputs resolve as Git refs.',
     '  --format json|html          Diff report format. Defaults to json; HTML defaults to architecture-diff.html.',
     '  --sarif <path>              Write SARIF 2.1.0 review findings alongside the selected format.',
+    '  --baseline <diff.json>      Previous IronGlancer diff JSON report used to mark findings existing.',
+    '  --suppressions <file.json>  Exact finding suppressions with nonempty human reasons.',
+    '  --fail-on error|warning|note',
+    '                              Exit 2 when actionable new unsuppressed findings meet the severity threshold.',
     '  -h, --help                 Show this help.',
     '',
     'Examples:',
     '  ironglancer ./my-app --entry src/app.jsx --out ./ironglancer-site',
     '  ironglancer diff --base main --head HEAD --entry src/app.jsx --format html --out architecture-diff.html --sarif review.sarif',
+    '  ironglancer diff ./my-app --base main --head HEAD --entry src/app.jsx --format html --sarif review.sarif --baseline accepted-diff.json --suppressions ironglancer-suppressions.json --fail-on warning',
     '  ironglancer diff ./my-app --base ./before/output.json --head ./after-site --format json',
     '',
   ].join('\n');
@@ -111,6 +116,9 @@ export async function runCli(args = process.argv.slice(2), {
       head: { type: 'string' },
       format: { type: 'string' },
       sarif: { type: 'string' },
+      baseline: { type: 'string' },
+      suppressions: { type: 'string' },
+      'fail-on': { type: 'string' },
       serve: { type: 'boolean' },
       host: { type: 'string' },
       port: { type: 'string' },
@@ -134,9 +142,12 @@ export async function runCli(args = process.argv.slice(2), {
       format: values.format || 'json',
       outPath: values.out,
       sarifPath: values.sarif,
+      baselinePath: values.baseline,
+      suppressionsPath: values.suppressions,
+      failOn: values['fail-on'],
     });
     if (result.stdoutText) await writeStream(stdout, result.stdoutText);
-    return 0;
+    return result.exitCode ?? 0;
   }
 
   const rootDir = positionals[0] || '.';

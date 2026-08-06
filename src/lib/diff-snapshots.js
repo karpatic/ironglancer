@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
 
+import { applyReviewPolicy } from './diff-review.js';
 import { compareLocale, normalizeString } from './utils.js';
 
-export const DIFF_SCHEMA_VERSION = '1.0.0';
+export const DIFF_SCHEMA_VERSION = '1.1.0';
 export const SUPPORTED_SNAPSHOT_SCHEMA_VERSION = '1.2.0';
 
 const STATIC_LIMITATIONS = [
@@ -1318,7 +1319,7 @@ function buildDiff(base, head, options) {
     head: snapshotIdentity(head, options.headLabel || 'head'),
     privacy: {
       sourceMode: 'none',
-      excludes: ['absolute rootDir', 'source text'],
+      excludes: ['absolute rootDir', 'baseline path', 'suppression path', 'source text'],
     },
     limitations: Array.from(new Set([...base.limitations, ...head.limitations])).sort(compareLocale),
     summary: {
@@ -1371,7 +1372,7 @@ export function compareSnapshots(baseSnapshot, headSnapshot, options = {}) {
   if (base.meta.schemaVersion !== head.meta.schemaVersion) {
     throw new SnapshotDiffError('Snapshot schema versions are incompatible.', 'incompatible_snapshot');
   }
-  return buildDiff(base, head, options);
+  return applyReviewPolicy(buildDiff(base, head, options));
 }
 
 function escapeHtml(value) {
@@ -1385,6 +1386,39 @@ function escapeHtml(value) {
 
 function renderStat(label, value) {
   return `<div class="stat"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`;
+}
+
+function reviewStateLabel(value) {
+  return value === 'existing' ? 'Existing' : 'New';
+}
+
+function renderReviewActionBadge(review = {}) {
+  if (review.suppressed) return '<span class="badge suppressed">Suppressed</span>';
+  if (review.baselineState === 'new') return '<span class="badge actionable">Actionable</span>';
+  return '<span class="badge">Accepted baseline</span>';
+}
+
+function renderReviewPolicy(policy = {}) {
+  const findings = policy.findings || {};
+  const gateText = policy.gateTriggered ? 'Gate triggered' : 'Gate clear';
+  const failOn = policy.failOn || 'off';
+  const gateIds = Array.isArray(policy.gateFindingIds) ? policy.gateFindingIds : [];
+  return [
+    '<section>',
+    '<h2>Review Gate</h2>',
+    '<div class="summary">',
+    renderStat('Gate', gateText),
+    renderStat('Fail on', failOn),
+    renderStat('Baseline findings', policy.baselineProvided ? policy.baselineFindingCount || 0 : 'none'),
+    renderStat('Suppressions', `${policy.suppressionCount || 0} total, ${policy.unusedSuppressionCount || 0} unused`),
+    renderStat('Review states', `${findings.new || 0} new, ${findings.existing || 0} existing, ${findings.suppressed || 0} suppressed`),
+    renderStat('Actionable findings', findings.actionable || 0),
+    '</div>',
+    gateIds.length
+      ? `<p class="muted">Gate finding IDs: ${escapeHtml(gateIds.join(', '))}</p>`
+      : '<p class="muted">No gate-triggering findings.</p>',
+    '</section>',
+  ].join('');
 }
 
 function renderIdentity(label, identity = {}) {
@@ -1415,11 +1449,19 @@ function renderFinding(finding) {
   const location = finding.location?.path
     ? `${finding.location.path}${finding.location.startLine ? `:${finding.location.startLine}` : ''}`
     : 'No location';
+  const review = finding.review || { baselineState: 'new', suppressed: false };
   return [
     '<article class="finding">',
     `<h4>${escapeHtml(finding.ruleId)} <span>${escapeHtml(finding.severity)}</span></h4>`,
+    '<p class="badges">',
+    `<span class="badge">${escapeHtml(reviewStateLabel(review.baselineState))}</span>`,
+    renderReviewActionBadge(review),
+    '</p>',
     `<p>${escapeHtml(finding.message)}</p>`,
     `<p class="muted">${escapeHtml(location)} · confidence ${escapeHtml(finding.confidence)}</p>`,
+    review.suppressed
+      ? `<p class="muted"><strong>Suppression reason:</strong> ${escapeHtml(review.suppressionReason || '')}</p>`
+      : '',
     '<details>',
     '<summary>Evidence</summary>',
     `<pre>${escapeHtml(JSON.stringify(finding.evidence, null, 2))}</pre>`,
@@ -1516,6 +1558,7 @@ export function renderDiffHtml(diff = {}) {
     '.summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}.stat{border:1px solid var(--line);border-radius:8px;padding:12px;background:#fff}.stat span{display:block;color:var(--muted);font-size:12px}.stat strong{font-size:22px}',
     '.identities{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}.identity{display:grid;grid-template-columns:72px 1fr;gap:6px 10px;margin:0}.identity dt{color:var(--muted)}.identity dd{margin:0;overflow-wrap:anywhere}',
     'details{border:1px solid var(--line);border-radius:8px;background:#fff;padding:12px}summary{cursor:pointer;font-weight:700}.group{margin-bottom:10px}.finding{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}.finding h4 span{font-weight:600;color:var(--muted)}',
+    '.badges{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 6px}.badge{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;padding:2px 8px;font-size:12px;font-weight:700;background:var(--band)}.badge.suppressed{border-color:#7c3aed;color:#5b21b6}.badge.actionable{border-color:#0f766e;color:#0f766e}',
     '.columns{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}.list ul{margin:0;padding-left:18px}.list li{margin:6px 0;overflow-wrap:anywhere}.muted{color:var(--muted)}code,pre{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}pre{white-space:pre-wrap;background:var(--band);padding:10px;border-radius:6px;overflow:auto}',
     '</style>',
     '</head>',
@@ -1535,6 +1578,7 @@ export function renderDiffHtml(diff = {}) {
     renderStat('Findings', `${summary.findingsBySeverity?.error || 0} errors, ${summary.findingsBySeverity?.warning || 0} warnings, ${summary.findingsBySeverity?.note || 0} notes`),
     '</div>',
     '</section>',
+    renderReviewPolicy(diff.reviewPolicy || {}),
     '<section>',
     '<h2>Snapshot Identity</h2>',
     '<div class="identities">',
@@ -1612,17 +1656,26 @@ export function renderDiffSarif(diff = {}) {
   const ruleIndexById = new Map(rules.map((rule, index) => [rule.id, index]));
   const results = (Array.isArray(diff.findings) ? diff.findings : []).map((finding) => {
     const location = sarifLocation(finding.location);
+    const review = finding.review || { baselineState: 'new', suppressed: false };
     return {
       ruleId: finding.ruleId,
       ruleIndex: ruleIndexById.get(finding.ruleId) ?? -1,
       level: sarifLevel(finding.severity),
+      baselineState: review.baselineState === 'existing' ? 'unchanged' : 'new',
       message: { text: normalizeString(finding.message) },
       ...(location ? { locations: [location] } : {}),
+      ...(review.suppressed ? {
+        suppressions: [{
+          kind: 'external',
+          justification: normalizeString(review.suppressionReason),
+        }],
+      } : {}),
       properties: {
         id: finding.id,
         severity: finding.severity,
         confidence: finding.confidence,
         evidence: finding.evidence || {},
+        review,
       },
     };
   });
@@ -1645,6 +1698,7 @@ export function renderDiffSarif(diff = {}) {
           head: diff.head || {},
           privacy: diff.privacy || { sourceMode: 'none' },
           limitations: diff.limitations || [],
+          reviewPolicy: diff.reviewPolicy || {},
         },
       }],
       results,

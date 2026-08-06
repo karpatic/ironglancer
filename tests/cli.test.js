@@ -57,6 +57,94 @@ function diffSnapshot({ label, modules = [], functions = [], edges = [] } = {}) 
   };
 }
 
+function diffModule(pathValue, options = {}) {
+  return {
+    path: pathValue,
+    lineCount: options.lineCount ?? 1,
+    reachable: options.reachable ?? true,
+    isJsx: options.isJsx ?? false,
+    localDependencies: options.localDependencies || [],
+    externalDependencies: options.externalDependencies || [],
+  };
+}
+
+function diffFunction(stableId, modulePath, name, options = {}) {
+  return {
+    id: options.id || `${stableId}_id`,
+    stableId,
+    modulePath,
+    name,
+    declarationName: options.declarationName || name,
+    kind: options.kind || 'function',
+    component: options.component ?? false,
+    reachable: options.reachable ?? true,
+    exported: options.exported ?? false,
+    exportedNames: options.exportedNames || [],
+    exportKinds: options.exportKinds || [],
+    scopePath: options.scopePath || '',
+    startLine: options.startLine ?? 1,
+    endLine: options.endLine ?? 1,
+    lineCount: options.lineCount ?? 1,
+  };
+}
+
+function diffEdge(source, target, options = {}) {
+  return {
+    id: options.id || `${source.id}->${target.id}`,
+    scope: options.scope || (source.modulePath === target.modulePath ? 'same-module' : 'imported'),
+    relationKind: options.relationKind || 'static-call',
+    syntaxKinds: options.syntaxKinds || ['call'],
+    referenceCount: options.referenceCount ?? 1,
+    sourceId: source.id,
+    sourceModulePath: source.modulePath,
+    sourceFunction: source.name,
+    sourceKind: source.kind,
+    sourceStartLine: source.startLine,
+    sourceEndLine: source.endLine,
+    targetId: target.id,
+    targetModulePath: target.modulePath,
+    targetFunction: target.name,
+    targetKind: target.kind,
+    targetStartLine: target.startLine,
+    targetEndLine: target.endLine,
+  };
+}
+
+function reviewGateSnapshots() {
+  const removedPublic = diffFunction('fn_removed_public', 'src/api.js', 'removedPublic', {
+    exported: true,
+    exportedNames: ['removedPublic'],
+    exportKinds: ['named'],
+  });
+  const baseWorker = diffFunction('fn_worker', 'src/worker.js', 'worker', { reachable: true });
+  const headWorker = diffFunction('fn_worker', 'src/worker.js', 'worker', { reachable: false });
+  const app = diffFunction('fn_app', 'src/app.js', 'app');
+  const helper = diffFunction('fn_helper', 'src/helper.js', 'helper');
+
+  return {
+    base: diffSnapshot({
+      label: 'base',
+      modules: [
+        diffModule('src/api.js'),
+        diffModule('src/worker.js', { reachable: true }),
+        diffModule('src/app.js'),
+        diffModule('src/helper.js'),
+      ],
+      functions: [removedPublic, baseWorker, app, helper],
+    }),
+    head: diffSnapshot({
+      label: 'head',
+      modules: [
+        diffModule('src/worker.js', { reachable: false }),
+        diffModule('src/app.js'),
+        diffModule('src/helper.js'),
+      ],
+      functions: [headWorker, app, helper],
+      edges: [diffEdge(app, helper, { scope: 'imported' })],
+    }),
+  };
+}
+
 async function writeJson(filePath, payload) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   await fs.writeFile(filePath, JSON.stringify(payload, null, 2) + '\n', 'utf8');
@@ -325,6 +413,160 @@ test('cli diff writes HTML and SARIF files for saved snapshots', async () => {
   assert.equal(sarif.runs[0].results[0].ruleId, 'IRONG_DIFF_EXPORT_REMOVED');
 });
 
+test('cli diff defaults to exit 0 and fail-on gates only actionable new unsuppressed findings after reports are written', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-review-gate-'));
+  const basePath = path.join(tempDir, 'base.json');
+  const headPath = path.join(tempDir, 'head.json');
+  const baselinePath = path.join(tempDir, 'accepted-diff.json');
+  const suppressionsPath = path.join(tempDir, 'ironglancer-suppressions.json');
+  const snapshots = reviewGateSnapshots();
+  await writeJson(basePath, snapshots.base);
+  await writeJson(headPath, snapshots.head);
+
+  const stdout = memoryStream();
+  const defaultExitCode = await runCli([
+    'diff',
+    '--base',
+    basePath,
+    '--head',
+    headPath,
+    '--format',
+    'json',
+  ], { stdout });
+
+  assert.equal(defaultExitCode, 0);
+  const defaultReport = JSON.parse(stdout.text());
+  assert.deepEqual(defaultReport.reviewPolicy, {
+    baselineProvided: false,
+    baselineFindingCount: 0,
+    suppressionCount: 0,
+    unusedSuppressionCount: 0,
+    findings: {
+      new: defaultReport.findings.length,
+      existing: 0,
+      suppressed: 0,
+      actionable: defaultReport.findings.length,
+    },
+    failOn: null,
+    gateTriggered: false,
+    gateFindingIds: [],
+  });
+  assert.ok(defaultReport.findings.every((finding) => (
+    finding.review.baselineState === 'new' && finding.review.suppressed === false
+  )));
+
+  const errorFinding = defaultReport.findings.find((finding) => finding.severity === 'error');
+  const warningFindings = defaultReport.findings.filter((finding) => finding.severity === 'warning');
+  const noteFinding = defaultReport.findings.find((finding) => finding.severity === 'note');
+  assert.ok(errorFinding);
+  assert.ok(warningFindings.length > 0);
+  assert.ok(noteFinding);
+  await writeJson(baselinePath, { findings: [errorFinding] });
+  await writeJson(suppressionsPath, {
+    version: 1,
+    suppressions: warningFindings.map((finding) => ({
+      findingId: finding.id,
+      reason: `Accepted warning ${finding.id}.`,
+    })),
+  });
+
+  const cases = [
+    { failOn: 'error', expectedExitCode: 0, expectedGateIds: [] },
+    { failOn: 'warning', expectedExitCode: 0, expectedGateIds: [] },
+    { failOn: 'note', expectedExitCode: 2, expectedGateIds: [noteFinding.id] },
+  ];
+  for (const { failOn, expectedExitCode, expectedGateIds } of cases) {
+    const jsonPath = path.join(tempDir, `${failOn}-review.json`);
+    const sarifPath = path.join(tempDir, `${failOn}-review.sarif`);
+    const exitCode = await runCli([
+      'diff',
+      '--base',
+      basePath,
+      '--head',
+      headPath,
+      '--format',
+      'json',
+      '--out',
+      jsonPath,
+      '--sarif',
+      sarifPath,
+      '--baseline',
+      baselinePath,
+      '--suppressions',
+      suppressionsPath,
+      '--fail-on',
+      failOn,
+    ], { stdout: memoryStream() });
+
+    assert.equal(exitCode, expectedExitCode);
+    const report = JSON.parse(await fs.readFile(jsonPath, 'utf8'));
+    const sarif = JSON.parse(await fs.readFile(sarifPath, 'utf8'));
+    assert.equal(sarif.version, '2.1.0');
+    assert.deepEqual(report.reviewPolicy.gateFindingIds, expectedGateIds);
+    assert.equal(report.reviewPolicy.gateTriggered, expectedExitCode === 2);
+    assert.equal(report.reviewPolicy.findings.existing, 1);
+    assert.equal(report.reviewPolicy.findings.suppressed, warningFindings.length);
+    assert.equal(report.reviewPolicy.findings.actionable, 1);
+  }
+});
+
+test('cli diff review reports omit absolute baseline and suppression paths and source excerpts', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-review-privacy-'));
+  const basePath = path.join(tempDir, 'base.json');
+  const headPath = path.join(tempDir, 'head.json');
+  const baselinePath = path.join(tempDir, 'accepted-diff.json');
+  const suppressionsPath = path.join(tempDir, 'ironglancer-suppressions.json');
+  const reportPath = path.join(tempDir, 'review.json');
+  const snapshots = reviewGateSnapshots();
+  snapshots.base.meta.rootDir = path.join(tempDir, 'private-base-root');
+  snapshots.head.meta.rootDir = path.join(tempDir, 'private-head-root');
+  snapshots.head.sourceCode = {
+    modules: [{ path: 'src/app.js', code: 'const shouldNeverLeakSource = true;' }],
+  };
+  await writeJson(basePath, snapshots.base);
+  await writeJson(headPath, snapshots.head);
+
+  const stdout = memoryStream();
+  await runCli(['diff', '--base', basePath, '--head', headPath, '--format', 'json'], { stdout });
+  const defaultReport = JSON.parse(stdout.text());
+  const errorFinding = defaultReport.findings.find((finding) => finding.severity === 'error');
+  const warningFinding = defaultReport.findings.find((finding) => finding.severity === 'warning');
+  await writeJson(baselinePath, { findings: [errorFinding] });
+  await writeJson(suppressionsPath, {
+    version: 1,
+    suppressions: [{ findingId: warningFinding.id, reason: 'Accepted local warning.' }],
+  });
+
+  const exitCode = await runCli([
+    'diff',
+    '--base',
+    basePath,
+    '--head',
+    headPath,
+    '--format',
+    'json',
+    '--out',
+    reportPath,
+    '--baseline',
+    baselinePath,
+    '--suppressions',
+    suppressionsPath,
+    '--fail-on',
+    'note',
+  ], { stdout: memoryStream() });
+
+  assert.equal(exitCode, 2);
+  const reportText = await fs.readFile(reportPath, 'utf8');
+  const report = JSON.parse(reportText);
+  assert.equal(report.privacy.sourceMode, 'none');
+  assert.ok(report.privacy.excludes.includes('baseline path'));
+  assert.ok(report.privacy.excludes.includes('suppression path'));
+  assert.equal(reportText.includes(tempDir), false);
+  assert.equal(reportText.includes(baselinePath), false);
+  assert.equal(reportText.includes(suppressionsPath), false);
+  assert.equal(reportText.includes('shouldNeverLeakSource'), false);
+});
+
 test('cli diff replaces report files atomically without sibling temporary residue', async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-atomic-files-'));
   const basePath = path.join(tempDir, 'base.json');
@@ -494,6 +736,90 @@ test('cli diff rejects unsupported formats and output path collisions', async ()
     /must not point to the same path/,
   );
   assert.equal(await fs.readFile(samePath, 'utf8'), 'pre-existing report\n');
+
+  const baselineCollisionPath = path.join(tempDir, 'accepted-diff.json');
+  const suppressionsCollisionPath = path.join(tempDir, 'ironglancer-suppressions.json');
+  await writeJson(baselineCollisionPath, { findings: [] });
+  await writeJson(suppressionsCollisionPath, { version: 1, suppressions: [] });
+  const collisionCases = [
+    ['--baseline', baselineCollisionPath, '--out', baselineCollisionPath],
+    ['--baseline', baselineCollisionPath, '--sarif', baselineCollisionPath],
+    ['--suppressions', suppressionsCollisionPath, '--out', suppressionsCollisionPath],
+    ['--suppressions', suppressionsCollisionPath, '--sarif', suppressionsCollisionPath],
+  ];
+  for (const [inputFlag, inputPath, outputFlag, outputPath] of collisionCases) {
+    const before = await fs.readFile(inputPath, 'utf8');
+    await assert.rejects(
+      runCli([
+        'diff',
+        '--base',
+        basePath,
+        '--head',
+        headPath,
+        '--format',
+        'html',
+        inputFlag,
+        inputPath,
+        outputFlag,
+        outputPath,
+      ], { stdout: memoryStream() }),
+      /review input and report output must not point to the same path/,
+    );
+    assert.equal(await fs.readFile(inputPath, 'utf8'), before);
+  }
+
+  const aliasedBaselineTarget = path.join(tempDir, 'aliased-baseline-target.json');
+  const aliasedBaselineInput = path.join(tempDir, 'aliased-baseline-input.json');
+  await writeJson(aliasedBaselineTarget, { findings: [] });
+  await fs.symlink(aliasedBaselineTarget, aliasedBaselineInput);
+  const aliasedBaselineBefore = await fs.readFile(aliasedBaselineTarget, 'utf8');
+  await assert.rejects(
+    runCli([
+      'diff',
+      '--base',
+      basePath,
+      '--head',
+      headPath,
+      '--format',
+      'json',
+      '--baseline',
+      aliasedBaselineInput,
+      '--out',
+      aliasedBaselineTarget,
+    ], { stdout: memoryStream() }),
+    /review input and report output must not point to the same filesystem entry/,
+  );
+  assert.equal(await fs.readFile(aliasedBaselineTarget, 'utf8'), aliasedBaselineBefore);
+});
+
+test('cli diff rejects non-JSON review config files without leaking absolute paths', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-bad-review-config-'));
+  const basePath = path.join(tempDir, 'base.json');
+  const headPath = path.join(tempDir, 'head.json');
+  const suppressionsPath = path.join(tempDir, 'ironglancer-suppressions.json');
+  await writeJson(basePath, diffSnapshot({ label: 'base', modules: [] }));
+  await writeJson(headPath, diffSnapshot({ label: 'head', modules: [] }));
+  await writeText(suppressionsPath, 'not json\n');
+
+  await assert.rejects(
+    execFile('node', [
+      path.resolve('src/cli.mjs'),
+      'diff',
+      '--base',
+      basePath,
+      '--head',
+      headPath,
+      '--suppressions',
+      suppressionsPath,
+    ], { cwd: path.resolve('.') }),
+    (error) => {
+      assert.equal(error.code, 1);
+      assert.match(error.stderr, /Malformed JSON in suppressions file/);
+      assert.equal(error.stderr.includes(tempDir), false);
+      assert.equal(error.stderr.includes(suppressionsPath), false);
+      return true;
+    },
+  );
 });
 
 test('cli diff reports missing entry at a git ref without leaving temp residue', async () => {
