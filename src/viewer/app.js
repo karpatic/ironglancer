@@ -41,6 +41,11 @@ const networkLayoutModeAliases = new Map([
   ['force', 'network'],
   ['flow', 'radial'],
 ]);
+const networkNodeVisibilityStorageKey = 'ironglancer:function-network-node-levels';
+const networkNodeModes = [
+  { id: 'files', label: 'Files', accessibilityLabel: 'Show file nodes' },
+  { id: 'functions', label: 'Functions', accessibilityLabel: 'Show function nodes' },
+];
 
 const subtitleEl = document.getElementById('subtitle');
 const buildMetaEl = document.getElementById('build-meta');
@@ -70,7 +75,10 @@ const networkFitBtn = document.getElementById('network-fit-btn');
 const networkResetViewBtn = document.getElementById('network-reset-view-btn');
 const networkResetSelectionBtn = document.getElementById('network-reset-selection-btn');
 const networkLayoutSwitchEl = document.getElementById('network-layout-switch');
+const networkNodeSwitchEl = document.getElementById('network-node-switch');
+const networkHelpEl = document.getElementById('function-network-help');
 const fileLegendEl = document.getElementById('file-legend');
+const selectedTitleEl = document.getElementById('selected-title');
 const selectedFunctionEl = document.getElementById('selected-function');
 const sourceDialogEl = document.getElementById('source-dialog');
 const sourceDialogBodyEl = sourceDialogEl.querySelector('.source-dialog-body');
@@ -92,10 +100,16 @@ let functionMapPayload = { limitations: [], functions: [], edges: [] };
 let latestModuleSvg = '';
 let functions = [];
 let edges = [];
+let fileNodes = [];
 let functionById = new Map();
 let functionByStableId = new Map();
+let fileByPath = new Map();
 let edgesBySourceId = new Map();
 let edgesByTargetId = new Map();
+let fileEdges = [];
+let fileEdgesBySourcePath = new Map();
+let fileEdgesByTargetPath = new Map();
+let functionIdsByFile = new Map();
 let declarationsByFunctionId = new Map();
 let declarationsByFunctionStableId = new Map();
 let declarationsByModule = new Map();
@@ -120,9 +134,11 @@ let sourceMemberTargetCounter = 0;
 let sourceMemberTargets = new Map();
 let highlightedSourceRecord = null;
 let selectedFunctionId = '';
+let selectedFilePath = '';
 let activeRelationFilter = 'all';
 let activePrimaryView = 'function-graphs';
 let activeNetworkLayoutMode = 'network';
+let activeNetworkNodeVisibility = { files: false, functions: true };
 let latestFunctionGraphStatus = '';
 let networkNeedsFit = true;
 let moduleDiagramNeedsFit = true;
@@ -356,6 +372,103 @@ function indexFunctions() {
   }
 }
 
+function fileNodeId(modulePath) {
+  return 'file:' + modulePath;
+}
+
+function callCountForFunctionEdge(edge = {}) {
+  return Math.max(
+    1,
+    compactCount(edge.referenceCount)
+      || safeArray(edge.usageLines).length
+      || safeArray(edge.usages).length,
+  );
+}
+
+function compareFileNodeRecords(a, b) {
+  return String(a.modulePath || '').localeCompare(String(b.modulePath || ''));
+}
+
+function functionsForFile(modulePath) {
+  return safeArray(functionIdsByFile.get(modulePath))
+    .map((id) => functionById.get(id))
+    .filter(Boolean)
+    .sort(sortFunctions);
+}
+
+function indexFileGraph() {
+  functionIdsByFile = new Map();
+  const functionsByFile = new Map();
+  const moduleByPath = new Map(safeArray(outputPayload?.modules).map((module) => [module.path, module]));
+
+  for (const node of functions) {
+    if (!functionsByFile.has(node.modulePath)) functionsByFile.set(node.modulePath, []);
+    functionsByFile.get(node.modulePath).push(node);
+  }
+
+  fileNodes = Array.from(functionsByFile.entries())
+    .map(([modulePath, list]) => {
+      const sorted = list.slice().sort(sortFunctions);
+      functionIdsByFile.set(modulePath, sorted.map((node) => node.id));
+      const totalFunctionLines = sorted.reduce((total, node) => total + lineCountFor(node), 0);
+      const moduleRecord = moduleByPath.get(modulePath) || {};
+      return {
+        nodeType: 'file',
+        id: fileNodeId(modulePath),
+        stableId: fileNodeId(modulePath),
+        modulePath,
+        path: modulePath,
+        name: fileName(modulePath),
+        functionCount: sorted.length,
+        totalFunctionLines,
+        lineCount: totalFunctionLines,
+        moduleLineCount: compactCount(moduleRecord.lineCount),
+        reachable: sorted.some((node) => node.reachable) || Boolean(moduleRecord.reachable),
+      };
+    })
+    .sort(compareFileNodeRecords);
+  fileByPath = new Map(fileNodes.map((node) => [node.modulePath, node]));
+
+  const aggregateByPair = new Map();
+  for (const edge of edges) {
+    const source = functionById.get(edge.sourceId);
+    const target = functionById.get(edge.targetId);
+    if (!source || !target) continue;
+    if (source.modulePath === target.modulePath) continue;
+    const key = source.modulePath + '\u0000' + target.modulePath;
+    if (!aggregateByPair.has(key)) {
+      aggregateByPair.set(key, {
+        id: 'file-edge:' + source.modulePath + '->' + target.modulePath,
+        edgeType: 'file-call',
+        sourceId: fileNodeId(source.modulePath),
+        targetId: fileNodeId(target.modulePath),
+        sourceFilePath: source.modulePath,
+        targetFilePath: target.modulePath,
+        functionEdgeCount: 0,
+        callCount: 0,
+        referenceCount: 0,
+      });
+    }
+    const record = aggregateByPair.get(key);
+    const callCount = callCountForFunctionEdge(edge);
+    record.functionEdgeCount += 1;
+    record.callCount += callCount;
+    record.referenceCount += callCount;
+  }
+
+  fileEdges = Array.from(aggregateByPair.values())
+    .sort((a, b) => a.sourceFilePath.localeCompare(b.sourceFilePath)
+      || a.targetFilePath.localeCompare(b.targetFilePath));
+  fileEdgesBySourcePath = new Map();
+  fileEdgesByTargetPath = new Map();
+  for (const edge of fileEdges) {
+    if (!fileEdgesBySourcePath.has(edge.sourceFilePath)) fileEdgesBySourcePath.set(edge.sourceFilePath, []);
+    if (!fileEdgesByTargetPath.has(edge.targetFilePath)) fileEdgesByTargetPath.set(edge.targetFilePath, []);
+    fileEdgesBySourcePath.get(edge.sourceFilePath).push(edge);
+    fileEdgesByTargetPath.get(edge.targetFilePath).push(edge);
+  }
+}
+
 function buildModuleOrder() {
   const modules = new Map(safeArray(outputPayload?.modules).map((module) => [module.path, module]));
   const ordered = [];
@@ -415,6 +528,52 @@ function scaledNodeRadius(node, minLines, maxLines) {
   if (maxLines <= minLines) return 15;
   const ratio = (lines - minLines) / Math.max(1, maxLines - minLines);
   return minRadius + (Math.sqrt(Math.max(0, Math.min(1, ratio))) * (maxRadius - minRadius));
+}
+
+function scaledFileRadius(node, minMeasure, maxMeasure) {
+  const minRadius = 21;
+  const maxRadius = 38;
+  const measure = compactCount(node.totalFunctionLines) || compactCount(node.functionCount);
+  if (maxMeasure <= minMeasure) return 27;
+  const ratio = (measure - minMeasure) / Math.max(1, maxMeasure - minMeasure);
+  return minRadius + (Math.sqrt(Math.max(0, Math.min(1, ratio))) * (maxRadius - minRadius));
+}
+
+function fileNodeWidth(node, radius) {
+  const labelLength = shortLabel(node.modulePath, 24).length;
+  return clamp(112 + radius * 2.25 + labelLength * 2.2, 142, 218);
+}
+
+function fileNodeHeight(radius) {
+  return clamp(42 + radius * 0.42, 48, 58);
+}
+
+function layoutHorizontalRadius(item = {}) {
+  return item.width ? item.width / 2 : item.radius;
+}
+
+function layoutVerticalRadius(item = {}) {
+  return item.height ? item.height / 2 : item.radius;
+}
+
+function layoutCollisionRadius(item = {}) {
+  return item.collisionRadius || Math.max(layoutHorizontalRadius(item), layoutVerticalRadius(item), item.radius || 0);
+}
+
+function layoutEdgeRadius(item = {}) {
+  return item.edgeRadius || item.radius;
+}
+
+function membershipEdges() {
+  if (!networkShowsFilesAndFunctions()) return [];
+  return functions.map((node) => ({
+    id: 'membership:' + node.id,
+    edgeType: 'membership',
+    sourceId: fileNodeId(node.modulePath),
+    targetId: node.id,
+    sourceFilePath: node.modulePath,
+    targetFilePath: node.modulePath,
+  }));
 }
 
 function stableHash(value) {
@@ -498,6 +657,115 @@ function persistNetworkLayoutMode(modeId) {
   }
 }
 
+function normalizeNetworkNodeVisibility(value = {}) {
+  const files = Boolean(value.files);
+  const nodeFunctions = Boolean(value.functions);
+  if (!files && !nodeFunctions) return { files: false, functions: true };
+  return { files, functions: nodeFunctions };
+}
+
+function parseNetworkNodeVisibility(savedValue) {
+  const value = String(savedValue || '').trim();
+  if (value === 'files') return { files: true, functions: false };
+  if (value === 'functions') return { files: false, functions: true };
+  if (value === 'files+functions' || value === 'functions+files') {
+    return { files: true, functions: true };
+  }
+  if (value.startsWith('{')) {
+    try {
+      return normalizeNetworkNodeVisibility(JSON.parse(value));
+    } catch {
+      return { files: false, functions: true };
+    }
+  }
+  return { files: false, functions: true };
+}
+
+function serializeNetworkNodeVisibility(visibility = activeNetworkNodeVisibility) {
+  const normalized = normalizeNetworkNodeVisibility(visibility);
+  if (normalized.files && normalized.functions) return 'files+functions';
+  return normalized.files ? 'files' : 'functions';
+}
+
+function loadNetworkNodeVisibility() {
+  const storage = storageForViewerPreferences();
+  const savedValue = storage ? storage.getItem(networkNodeVisibilityStorageKey) : '';
+  const visibility = parseNetworkNodeVisibility(savedValue);
+  if (storage && savedValue && savedValue !== serializeNetworkNodeVisibility(visibility)) {
+    try {
+      storage.setItem(networkNodeVisibilityStorageKey, serializeNetworkNodeVisibility(visibility));
+    } catch {
+      // Migration is best-effort; the normalized visibility is still used for this session.
+    }
+  }
+  return visibility;
+}
+
+function persistNetworkNodeVisibility(visibility = activeNetworkNodeVisibility) {
+  const storage = storageForViewerPreferences();
+  if (!storage) return;
+  try {
+    storage.setItem(networkNodeVisibilityStorageKey, serializeNetworkNodeVisibility(visibility));
+  } catch {
+    // Node-level persistence is a convenience; the viewer still works without it.
+  }
+}
+
+function networkShowsFiles() {
+  return Boolean(activeNetworkNodeVisibility.files);
+}
+
+function networkShowsFunctions() {
+  return Boolean(activeNetworkNodeVisibility.functions);
+}
+
+function networkShowsFilesAndFunctions() {
+  return networkShowsFiles() && networkShowsFunctions();
+}
+
+function networkLevelLabel(visibility = activeNetworkNodeVisibility) {
+  const normalized = normalizeNetworkNodeVisibility(visibility);
+  if (normalized.files && normalized.functions) return 'Files + functions';
+  return normalized.files ? 'Files' : 'Functions';
+}
+
+function graphStatusLabel(modeId = networkLayout?.mode || activeNetworkLayoutMode) {
+  return networkLayoutModeRecord(modeId).statusLabel + ' · ' + networkLevelLabel();
+}
+
+function networkHelpText() {
+  if (networkShowsFilesAndFunctions()) {
+    return 'Drag to pan. Use the zoom buttons, pinch, or Ctrl/Cmd + wheel to zoom. Select a file to focus its children, or a function to inspect callers and source.';
+  }
+  if (networkShowsFiles()) {
+    return 'Drag to pan. Use the zoom buttons, pinch, or Ctrl/Cmd + wheel to zoom. Select a file to see which files use it and which files it uses.';
+  }
+  return 'Drag to pan. Use the zoom buttons, pinch, or Ctrl/Cmd + wheel to zoom. Select a function in the graph to highlight who uses it and what it uses.';
+}
+
+function renderNetworkNodeSwitch() {
+  networkNodeSwitchEl.textContent = '';
+  for (const mode of networkNodeModes) {
+    const active = Boolean(activeNetworkNodeVisibility[mode.id]);
+    const otherActive = mode.id === 'files'
+      ? activeNetworkNodeVisibility.functions
+      : activeNetworkNodeVisibility.files;
+    const button = createElement('button', active ? 'is-active' : '', mode.label);
+    button.type = 'button';
+    button.setAttribute('aria-label', mode.accessibilityLabel);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    if (active && !otherActive) {
+      button.setAttribute('aria-disabled', 'true');
+      button.setAttribute('title', 'At least one node level stays visible.');
+    }
+    button.addEventListener('click', () => {
+      if (active && !otherActive) return;
+      setNetworkNodeVisibility({ ...activeNetworkNodeVisibility, [mode.id]: !active });
+    });
+    networkNodeSwitchEl.appendChild(button);
+  }
+}
+
 function renderPrimaryViewSwitch() {
   primaryViewSwitchEl.textContent = '';
   for (const mode of primaryViewModes) {
@@ -531,6 +799,7 @@ function updateVisualizationStatus() {
       : 'JSX map: loading file composition.';
     return;
   }
+  networkHelpEl.textContent = networkHelpText();
   networkStatusEl.textContent = latestFunctionGraphStatus;
 }
 
@@ -542,7 +811,11 @@ function fitCurrentNetworkLayout() {
   networkNeedsFit = false;
   requestAnimationFrame(() => {
     fitNetworkToViewport();
-    if (selectedFunctionId) scrollFunctionIntoView(selectedFunctionId);
+    if (selectedFunctionId) {
+      scrollFunctionIntoView(selectedFunctionId);
+    } else if (selectedFilePath) {
+      scrollFileIntoView(selectedFilePath);
+    }
   });
 }
 
@@ -579,11 +852,35 @@ function setNetworkLayoutMode(modeId) {
   if (nextMode === activeNetworkLayoutMode && networkLayout) return;
   activeNetworkLayoutMode = nextMode;
   persistNetworkLayoutMode(nextMode);
+  reconcileSelectionForNodeVisibility();
   renderNetworkLayoutSwitch();
+  renderSelectedFunctionPanel();
   layoutFunctionNetwork();
   renderFunctionNetwork();
   fitCurrentNetworkLayout();
   sendViewerBridgeState('switch-network-layout');
+}
+
+function setNetworkNodeVisibility(nextVisibility, { reason = 'switch-node-levels', focusFilePath = '' } = {}) {
+  const normalized = normalizeNetworkNodeVisibility(nextVisibility);
+  const changed = normalized.files !== activeNetworkNodeVisibility.files
+    || normalized.functions !== activeNetworkNodeVisibility.functions;
+  if (!changed && !focusFilePath) return;
+
+  activeNetworkNodeVisibility = normalized;
+  persistNetworkNodeVisibility(normalized);
+  if (focusFilePath && fileByPath.has(focusFilePath)) {
+    selectedFilePath = focusFilePath;
+    selectedFunctionId = '';
+    activeRelationFilter = 'all';
+  }
+  reconcileSelectionForNodeVisibility();
+  renderNetworkNodeSwitch();
+  renderSelectedFunctionPanel();
+  layoutFunctionNetwork();
+  renderFunctionNetwork();
+  fitCurrentNetworkLayout();
+  sendViewerBridgeState(reason);
 }
 
 function moduleClusterCenters(fileOrder, width, height) {
@@ -660,7 +957,7 @@ function simulateForceLayout(layoutNodes, layoutEdges, clusterCenters, width, he
           distanceSq = dx * dx + dy * dy;
         }
         const distance = Math.sqrt(distanceSq);
-        const minDistance = a.radius + b.radius + 30;
+        const minDistance = layoutCollisionRadius(a) + layoutCollisionRadius(b) + 30;
         const collisionBoost = distance < minDistance ? (minDistance - distance) * 0.38 : 0;
         const force = ((repelStrength / Math.max(90, distanceSq)) + collisionBoost) * cooling;
         const ux = dx / distance;
@@ -680,8 +977,10 @@ function simulateForceLayout(layoutNodes, layoutEdges, clusterCenters, width, he
       const dy = target.y - source.y;
       const distance = Math.max(1, Math.hypot(dx, dy));
       const sameFile = source.node.modulePath === target.node.modulePath;
-      const desired = source.radius + target.radius + (sameFile ? 74 : 118);
-      const force = (distance - desired) * edgeStrength;
+      const membership = edge.edgeType === 'membership';
+      const desired = layoutCollisionRadius(source) + layoutCollisionRadius(target)
+        + (membership ? 38 : (sameFile ? 74 : 118));
+      const force = (distance - desired) * (membership ? edgeStrength * 2.7 : edgeStrength);
       const ux = dx / distance;
       const uy = dy / distance;
       source.vx += ux * force;
@@ -696,8 +995,9 @@ function simulateForceLayout(layoutNodes, layoutEdges, clusterCenters, width, he
       item.vy += (cluster.y - item.y) * clusterStrength * cooling;
       item.vx += (center.x - item.x) * centerStrength;
       item.vy += (center.y - item.y) * centerStrength;
-      item.x = clamp(item.x + item.vx, item.radius + 28, width - item.radius - 28);
-      item.y = clamp(item.y + item.vy, item.radius + 28, height - item.radius - 44);
+      const collisionRadius = layoutCollisionRadius(item);
+      item.x = clamp(item.x + item.vx, collisionRadius + 28, width - collisionRadius - 28);
+      item.y = clamp(item.y + item.vy, collisionRadius + 28, height - collisionRadius - 44);
     }
   }
 }
@@ -734,10 +1034,10 @@ function normalizeNetworkBounds(layoutNodes) {
   }
 
   const labelPadding = 72;
-  const minX = Math.min(...nodes.map((item) => item.x - item.radius - labelPadding));
-  const maxX = Math.max(...nodes.map((item) => item.x + item.radius + labelPadding));
-  const minY = Math.min(...nodes.map((item) => item.y - item.radius - 42));
-  const maxY = Math.max(...nodes.map((item) => item.y + item.radius + 54));
+  const minX = Math.min(...nodes.map((item) => item.x - layoutHorizontalRadius(item) - labelPadding));
+  const maxX = Math.max(...nodes.map((item) => item.x + layoutHorizontalRadius(item) + labelPadding));
+  const minY = Math.min(...nodes.map((item) => item.y - layoutVerticalRadius(item) - 42));
+  const maxY = Math.max(...nodes.map((item) => item.y + layoutVerticalRadius(item) + 54));
   const padding = 72;
   const width = Math.max(920, Math.ceil(maxX - minX + padding * 2));
   const height = Math.max(560, Math.ceil(maxY - minY + padding * 2));
@@ -758,12 +1058,40 @@ function networkLineExtents() {
   };
 }
 
+function networkFileMeasureExtents() {
+  const measures = fileNodes
+    .map((node) => compactCount(node.totalFunctionLines) || compactCount(node.functionCount))
+    .filter((count) => count > 0);
+  return {
+    minMeasure: measures.length ? Math.min(...measures) : 1,
+    maxMeasure: measures.length ? Math.max(...measures) : 1,
+  };
+}
+
 function networkLayoutNode(node, x, y, { minLines, maxLines }, extra = {}) {
   return {
     node,
     x,
     y,
     radius: scaledNodeRadius(node, minLines, maxLines),
+    color: fileColorByPath.get(node.modulePath) || '#64748b',
+    ...extra,
+  };
+}
+
+function fileLayoutNode(node, x, y, { minMeasure, maxMeasure }, extra = {}) {
+  const radius = scaledFileRadius(node, minMeasure, maxMeasure);
+  const width = fileNodeWidth(node, radius);
+  const height = fileNodeHeight(radius);
+  return {
+    node,
+    x,
+    y,
+    radius,
+    width,
+    height,
+    edgeRadius: Math.max(width / 2, height / 2),
+    collisionRadius: Math.max(width / 2, height / 2) + 10,
     color: fileColorByPath.get(node.modulePath) || '#64748b',
     ...extra,
   };
@@ -779,16 +1107,79 @@ function functionNodesByFile(fileOrder) {
   return nodesByFile;
 }
 
-function layoutForceFunctionNetwork(fileOrder, lineExtents) {
-  const count = Math.max(1, functions.length);
-  const width = Math.max(1040, Math.ceil(Math.sqrt(count) * 195));
-  const height = Math.max(680, Math.ceil(Math.sqrt(count) * 155));
+function layoutForceFunctionNetwork(fileOrder, lineExtents, fileExtents) {
+  if (!networkShowsFiles()) {
+    const count = Math.max(1, functions.length);
+    const width = Math.max(1040, Math.ceil(Math.sqrt(count) * 195));
+    const height = Math.max(680, Math.ceil(Math.sqrt(count) * 155));
+    const nodes = new Map();
+    const clusterCenters = moduleClusterCenters(fileOrder, width, height);
+
+    functions.forEach((node, index) => {
+      const cluster = clusterCenters.get(node.modulePath) || { x: width / 2, y: height / 2 };
+      const position = networkInitialPosition(node, index, functions.length, cluster, width, height);
+      nodes.set(node.id, {
+        ...networkLayoutNode(node, position.x, position.y, lineExtents),
+        vx: 0,
+        vy: 0,
+      });
+    });
+
+    simulateForceLayout(nodes, edges, clusterCenters, width, height);
+    expandNetworkSpread(nodes);
+    const bounds = normalizeNetworkBounds(nodes);
+    networkLayout = { mode: 'network', width: bounds.width, height: bounds.height, nodes };
+    return;
+  }
+
+  const visibleFileOrder = fileOrder.filter((modulePath) => fileByPath.has(modulePath));
+  if (!networkShowsFunctions()) {
+    const count = Math.max(1, visibleFileOrder.length);
+    const width = Math.max(960, Math.ceil(Math.sqrt(count) * 245));
+    const height = Math.max(620, Math.ceil(Math.sqrt(count) * 185));
+    const center = { x: width / 2, y: height / 2 };
+    const clusterCenters = new Map(visibleFileOrder.map((modulePath) => [modulePath, center]));
+    const nodes = new Map();
+
+    visibleFileOrder.forEach((modulePath, index) => {
+      const node = fileByPath.get(modulePath);
+      const position = networkInitialPosition(node, index, visibleFileOrder.length, center, width, height);
+      nodes.set(node.id, {
+        ...fileLayoutNode(node, position.x, position.y, fileExtents),
+        vx: 0,
+        vy: 0,
+      });
+    });
+
+    simulateForceLayout(nodes, fileEdges, clusterCenters, width, height);
+    expandNetworkSpread(nodes);
+    const bounds = normalizeNetworkBounds(nodes);
+    networkLayout = { mode: 'network', width: bounds.width, height: bounds.height, nodes };
+    return;
+  }
+
+  const count = Math.max(1, functions.length + visibleFileOrder.length);
+  const width = Math.max(1120, Math.ceil(Math.sqrt(count) * 185));
+  const height = Math.max(760, Math.ceil(Math.sqrt(count) * 145));
   const nodes = new Map();
   const clusterCenters = moduleClusterCenters(fileOrder, width, height);
 
+  visibleFileOrder.forEach((modulePath) => {
+    const fileNode = fileByPath.get(modulePath);
+    const cluster = clusterCenters.get(modulePath) || { x: width / 2, y: height / 2 };
+    nodes.set(fileNode.id, {
+      ...fileLayoutNode(fileNode, cluster.x, cluster.y, fileExtents),
+      vx: 0,
+      vy: 0,
+    });
+  });
+
   functions.forEach((node, index) => {
     const cluster = clusterCenters.get(node.modulePath) || { x: width / 2, y: height / 2 };
-    const position = networkInitialPosition(node, index, functions.length, cluster, width, height);
+    const siblings = functionsForFile(node.modulePath);
+    const siblingCount = siblings.length;
+    const siblingIndex = siblings.findIndex((candidate) => candidate.id === node.id);
+    const position = networkInitialPosition(node, siblingIndex >= 0 ? siblingIndex : index, siblingCount || functions.length, cluster, width, height);
     nodes.set(node.id, {
       ...networkLayoutNode(node, position.x, position.y, lineExtents),
       vx: 0,
@@ -796,15 +1187,88 @@ function layoutForceFunctionNetwork(fileOrder, lineExtents) {
     });
   });
 
-  simulateForceLayout(nodes, edges, clusterCenters, width, height);
+  simulateForceLayout(nodes, [...edges, ...membershipEdges()], clusterCenters, width, height);
   expandNetworkSpread(nodes);
   const bounds = normalizeNetworkBounds(nodes);
   networkLayout = { mode: 'network', width: bounds.width, height: bounds.height, nodes };
 }
 
-function layoutByFileFunctionNetwork(fileOrder, lineExtents) {
+function layoutByFileFunctionNetwork(fileOrder, lineExtents, fileExtents) {
   const nodesByFile = functionNodesByFile(fileOrder);
   const visibleFileOrder = fileOrder.filter((modulePath) => (nodesByFile.get(modulePath) || []).length > 0);
+
+  if (networkShowsFiles() && !networkShowsFunctions()) {
+    const columns = Math.min(5, Math.max(1, Math.ceil(Math.sqrt(visibleFileOrder.length * 1.25))));
+    const rows = Math.max(1, Math.ceil(visibleFileOrder.length / columns));
+    const cellWidth = 245;
+    const cellHeight = 155;
+    const laneWidth = 212;
+    const laneHeight = 116;
+    const marginX = 126;
+    const marginY = 96;
+    const width = Math.max(920, marginX * 2 + Math.max(0, columns - 1) * cellWidth);
+    const height = Math.max(560, marginY * 2 + Math.max(0, rows - 1) * cellHeight);
+    const nodes = new Map();
+    const lanes = [];
+
+    visibleFileOrder.forEach((modulePath, fileIndex) => {
+      const column = fileIndex % columns;
+      const row = Math.floor(fileIndex / columns);
+      const x = marginX + column * cellWidth;
+      const y = marginY + row * cellHeight;
+      lanes.push({
+        modulePath,
+        x: x - laneWidth / 2,
+        y: y - laneHeight / 2,
+        width: laneWidth,
+        height: laneHeight,
+      });
+      const fileNode = fileByPath.get(modulePath);
+      nodes.set(fileNode.id, fileLayoutNode(fileNode, x, y, fileExtents));
+    });
+
+    networkBaseWidth = width;
+    networkBaseHeight = height;
+    networkLayout = { mode: 'by-file', width, height, lanes, nodes };
+    return;
+  }
+
+  if (networkShowsFilesAndFunctions()) {
+    const columnGap = 255;
+    const laneWidth = 218;
+    const rowGap = 66;
+    const marginX = 118;
+    const hubY = 82;
+    const firstFunctionY = 150;
+    const maxRows = Math.max(1, ...visibleFileOrder.map((modulePath) => nodesByFile.get(modulePath).length));
+    const width = Math.max(960, marginX * 2 + Math.max(1, visibleFileOrder.length - 1) * columnGap + laneWidth);
+    const height = Math.max(620, firstFunctionY + (maxRows - 1) * rowGap + 110);
+    const nodes = new Map();
+    const lanes = [];
+
+    visibleFileOrder.forEach((modulePath, fileIndex) => {
+      const x = marginX + fileIndex * columnGap;
+      lanes.push({
+        modulePath,
+        x: x - laneWidth / 2,
+        y: 34,
+        width: laneWidth,
+        height: height - 68,
+      });
+      const fileNode = fileByPath.get(modulePath);
+      nodes.set(fileNode.id, fileLayoutNode(fileNode, x, hubY, fileExtents));
+      const list = nodesByFile.get(modulePath) || [];
+      list.forEach((node, index) => {
+        nodes.set(node.id, networkLayoutNode(node, x, firstFunctionY + index * rowGap, lineExtents));
+      });
+    });
+
+    networkBaseWidth = width;
+    networkBaseHeight = height;
+    networkLayout = { mode: 'by-file', width, height, lanes, nodes };
+    return;
+  }
+
   const columnGap = 245;
   const laneWidth = 205;
   const rowGap = 66;
@@ -1074,23 +1538,168 @@ function layoutRadialFunctionNetwork(lineExtents) {
   networkLayout = { mode: 'radial', width, height, nodes, center };
 }
 
+function radialSectorForIndex(index, count) {
+  if (count <= 1) {
+    return { startAngle: -Math.PI / 2, endAngle: (-Math.PI / 2) + Math.PI * 2 };
+  }
+  const fullSpan = (Math.PI * 2) / count;
+  const gap = Math.min(0.12, fullSpan * 0.18);
+  const startAngle = (-Math.PI / 2) + index * fullSpan + gap / 2;
+  return { startAngle, endAngle: startAngle + fullSpan - gap };
+}
+
+function layoutRadialFileNetwork(fileOrder, fileExtents) {
+  const visibleFileOrder = fileOrder.filter((modulePath) => fileByPath.has(modulePath));
+  const nodes = new Map();
+  if (visibleFileOrder.length === 0) {
+    networkBaseWidth = 900;
+    networkBaseHeight = 420;
+    networkLayout = { mode: 'radial', width: networkBaseWidth, height: networkBaseHeight, nodes, center: { x: 450, y: 210 } };
+    return;
+  }
+
+  const count = visibleFileOrder.length;
+  const radius = count <= 1 ? 0 : Math.max(220, (count * 138) / (Math.PI * 2));
+  const padding = 230;
+  const width = Math.max(980, Math.ceil(radius * 2 + padding * 2));
+  const height = Math.max(640, Math.ceil(radius * 2 + padding * 2));
+  const center = { x: width / 2, y: height / 2 };
+
+  visibleFileOrder.forEach((modulePath, index) => {
+    const sector = radialSectorForIndex(index, count);
+    const angle = (sector.startAngle + sector.endAngle) / 2;
+    const node = fileByPath.get(modulePath);
+    nodes.set(node.id, fileLayoutNode(
+      node,
+      center.x + Math.cos(angle) * radius,
+      center.y + Math.sin(angle) * radius,
+      fileExtents,
+      { radialAngle: angle, radialDistance: 0, radialRootId: node.id },
+    ));
+  });
+
+  networkBaseWidth = width;
+  networkBaseHeight = height;
+  networkLayout = { mode: 'radial', width, height, nodes, center };
+}
+
+function radialChildCapacity(sectorSpan, radius) {
+  return Math.max(1, Math.floor((sectorSpan * Math.max(1, radius)) / 78));
+}
+
+function layoutRadialFileFunctionNetwork(fileOrder, lineExtents, fileExtents) {
+  const visibleFileOrder = fileOrder.filter((modulePath) => fileByPath.has(modulePath));
+  const nodesByFile = functionNodesByFile(fileOrder);
+  const nodes = new Map();
+  if (visibleFileOrder.length === 0) {
+    networkBaseWidth = 900;
+    networkBaseHeight = 420;
+    networkLayout = { mode: 'radial', width: networkBaseWidth, height: networkBaseHeight, nodes, center: { x: 450, y: 210 } };
+    return;
+  }
+
+  const count = visibleFileOrder.length;
+  const hubRadius = count <= 1 ? 0 : Math.max(220, (count * 136) / (Math.PI * 2));
+  const baseChildRadius = count <= 1 ? 145 : hubRadius + 118;
+  const ringGap = 92;
+  let maxOuterRadius = baseChildRadius;
+  const sectors = new Map();
+
+  visibleFileOrder.forEach((modulePath, index) => {
+    const sector = radialSectorForIndex(index, count);
+    const sectorSpan = sector.endAngle - sector.startAngle;
+    const childCount = (nodesByFile.get(modulePath) || []).length;
+    let remaining = childCount;
+    let ring = 0;
+    while (remaining > 0) {
+      const ringRadius = baseChildRadius + ring * ringGap;
+      const capacity = count <= 1
+        ? Math.max(6, radialChildCapacity(Math.PI * 2, ringRadius))
+        : radialChildCapacity(sectorSpan, ringRadius);
+      remaining -= capacity;
+      maxOuterRadius = Math.max(maxOuterRadius, ringRadius);
+      ring += 1;
+    }
+    sectors.set(modulePath, sector);
+  });
+
+  const padding = 230;
+  const width = Math.max(1080, Math.ceil(maxOuterRadius * 2 + padding * 2));
+  const height = Math.max(720, Math.ceil(maxOuterRadius * 2 + padding * 2));
+  const center = { x: width / 2, y: height / 2 };
+
+  visibleFileOrder.forEach((modulePath) => {
+    const sector = sectors.get(modulePath);
+    const angle = (sector.startAngle + sector.endAngle) / 2;
+    const fileNode = fileByPath.get(modulePath);
+    nodes.set(fileNode.id, fileLayoutNode(
+      fileNode,
+      center.x + Math.cos(angle) * hubRadius,
+      center.y + Math.sin(angle) * hubRadius,
+      fileExtents,
+      { radialAngle: angle, radialDistance: 0, radialRootId: fileNode.id },
+    ));
+
+    const list = nodesByFile.get(modulePath) || [];
+    let cursor = 0;
+    let ring = 0;
+    while (cursor < list.length) {
+      const ringRadius = baseChildRadius + ring * ringGap;
+      const sectorSpan = sector.endAngle - sector.startAngle;
+      const capacity = count <= 1
+        ? Math.max(6, radialChildCapacity(Math.PI * 2, ringRadius))
+        : radialChildCapacity(sectorSpan, ringRadius);
+      const ringItems = list.slice(cursor, cursor + capacity);
+      ringItems.forEach((node, itemIndex) => {
+        const itemAngle = count <= 1
+          ? (-Math.PI / 2) + (Math.PI * 2 * itemIndex) / Math.max(1, ringItems.length)
+          : (ringItems.length <= 1
+            ? angle
+            : sector.startAngle + ((itemIndex + 0.5) * sectorSpan) / ringItems.length);
+        nodes.set(node.id, networkLayoutNode(
+          node,
+          center.x + Math.cos(itemAngle) * ringRadius,
+          center.y + Math.sin(itemAngle) * ringRadius,
+          lineExtents,
+          { radialAngle: itemAngle, radialDistance: ring + 1, radialRootId: fileNode.id },
+        ));
+      });
+      cursor += ringItems.length;
+      ring += 1;
+    }
+  });
+
+  networkBaseWidth = width;
+  networkBaseHeight = height;
+  networkLayout = { mode: 'radial', width, height, nodes, center };
+}
+
 function layoutFunctionNetwork() {
   const fileOrder = buildModuleOrder();
   assignFileColors(fileOrder);
   renderFileLegend(fileOrder);
   const lineExtents = networkLineExtents();
+  const fileExtents = networkFileMeasureExtents();
 
   networkNeedsFit = true;
 
   if (activeNetworkLayoutMode === 'radial') {
+    if (networkShowsFilesAndFunctions()) {
+      layoutRadialFileFunctionNetwork(fileOrder, lineExtents, fileExtents);
+      return;
+    }
+    if (networkShowsFiles()) {
+      layoutRadialFileNetwork(fileOrder, fileExtents);
+      return;
+    }
     layoutRadialFunctionNetwork(lineExtents);
     return;
   }
   if (activeNetworkLayoutMode === 'by-file') {
-    layoutByFileFunctionNetwork(fileOrder, lineExtents);
+    layoutByFileFunctionNetwork(fileOrder, lineExtents, fileExtents);
     return;
   }
-  layoutForceFunctionNetwork(fileOrder, lineExtents);
+  layoutForceFunctionNetwork(fileOrder, lineExtents, fileExtents);
 }
 
 function edgeEndpoint(source, target, sourceRadius, targetRadius) {
@@ -1144,7 +1753,7 @@ function selfEdgePath(source) {
 }
 
 function forceEdgePath(edge, source, target) {
-  const endpoints = edgeEndpoint(source, target, source.radius, target.radius);
+  const endpoints = edgeEndpoint(source, target, layoutEdgeRadius(source), layoutEdgeRadius(target));
   const dx = endpoints.endX - endpoints.startX;
   const dy = endpoints.endY - endpoints.startY;
   const length = Math.max(1, Math.hypot(dx, dy));
@@ -1162,7 +1771,7 @@ function forceEdgePath(edge, source, target) {
 }
 
 function radialEdgePath(edge, source, target) {
-  const endpoints = edgeEndpoint(source, target, source.radius, target.radius);
+  const endpoints = edgeEndpoint(source, target, layoutEdgeRadius(source), layoutEdgeRadius(target));
   const center = networkLayout.center || { x: networkLayout.width / 2, y: networkLayout.height / 2 };
   const dx = endpoints.endX - endpoints.startX;
   const dy = endpoints.endY - endpoints.startY;
@@ -1199,7 +1808,7 @@ function radialEdgePath(edge, source, target) {
 }
 
 function byFileEdgePath(source, target) {
-  const endpoints = edgeEndpoint(source, target, source.radius, target.radius);
+  const endpoints = edgeEndpoint(source, target, layoutEdgeRadius(source), layoutEdgeRadius(target));
   if (source.node.modulePath === target.node.modulePath) {
     const curveX = Math.max(source.x, target.x) + 72;
     return [
@@ -1236,13 +1845,47 @@ function connectionSummary(node) {
     + (outgoing + extras) + ' ' + plural(outgoing + extras, 'thing') + '.';
 }
 
+function fileConnectionSummary(node = {}) {
+  const incoming = safeArray(fileEdgesByTargetPath.get(node.modulePath)).length;
+  const outgoing = safeArray(fileEdgesBySourcePath.get(node.modulePath)).length;
+  return incoming + ' ' + plural(incoming, 'file') + ' use it; it uses '
+    + outgoing + ' ' + plural(outgoing, 'file') + '.';
+}
+
 function nodeAriaLabel(node) {
+  if (node?.nodeType === 'file') {
+    return node.modulePath + ', file. '
+      + compactCount(node.functionCount) + ' ' + plural(compactCount(node.functionCount), 'function') + ', '
+      + compactCount(node.totalFunctionLines) + ' total function '
+      + plural(compactCount(node.totalFunctionLines), 'line') + '. '
+      + fileConnectionSummary(node);
+  }
   return displayName(node) + ', ' + fileName(node.modulePath) + ', '
     + lineCountFor(node) + ' ' + plural(lineCountFor(node), 'line') + '. '
     + connectionSummary(node);
 }
 
+function fileEdgeCallLabel(edge = {}) {
+  const callCount = compactCount(edge.callCount);
+  const functionEdgeCount = compactCount(edge.functionEdgeCount);
+  if (functionEdgeCount > 0 && functionEdgeCount !== callCount) {
+    return callCount + ' saved ' + plural(callCount, 'call') + ' across '
+      + functionEdgeCount + ' function ' + plural(functionEdgeCount, 'link');
+  }
+  return callCount + ' saved ' + plural(callCount, 'call');
+}
+
 function edgeAriaLabel(edge) {
+  if (edge.edgeType === 'membership') {
+    const source = fileByPath.get(edge.sourceFilePath);
+    const target = functionById.get(edge.targetId);
+    return displayName(target) + ' belongs to ' + (source?.modulePath || edge.sourceFilePath) + '.';
+  }
+  if (edge.edgeType === 'file-call') {
+    return (edge.sourceFilePath || 'unknown file') + ' uses '
+      + (edge.targetFilePath || 'unknown file') + ': '
+      + fileEdgeCallLabel(edge) + '. Select ' + (edge.targetFilePath || 'that file') + '.';
+  }
   const source = functionById.get(edge.sourceId);
   const target = functionById.get(edge.targetId);
   return displayName(source) + ' uses ' + displayName(target) + '. Select ' + displayName(target) + '.';
@@ -1270,16 +1913,19 @@ function renderFunctionNetwork() {
     });
     message.textContent = 'No saved function relationships were found.';
     networkSvgEl.appendChild(message);
-    latestFunctionGraphStatus = networkLayoutModeRecord(activeNetworkLayoutMode).statusLabel
+    latestFunctionGraphStatus = graphStatusLabel(activeNetworkLayoutMode)
       + ': no saved function relationships were found.';
     updateVisualizationStatus();
     return;
   }
 
   networkSvgEl.setAttribute('viewBox', '0 0 ' + networkLayout.width + ' ' + networkLayout.height);
-  networkSvgEl.setAttribute('aria-label', 'Function graph, ' + networkLayoutModeRecord(networkLayout.mode).statusLabel);
+  networkSvgEl.setAttribute('aria-label', graphStatusLabel(networkLayout.mode));
   networkSvgEl.style.width = (networkLayout.width * networkZoom) + 'px';
   networkSvgEl.style.height = (networkLayout.height * networkZoom) + 'px';
+  networkSvgEl.classList.toggle('has-file-nodes', networkShowsFiles());
+  networkSvgEl.classList.toggle('has-function-nodes', networkShowsFunctions());
+  networkSvgEl.classList.toggle('has-file-hubs', networkShowsFilesAndFunctions());
 
   const defs = createSvgElement('defs');
   const marker = createSvgElement('marker', {
@@ -1321,22 +1967,51 @@ function renderFunctionNetwork() {
     networkSvgEl.appendChild(laneGroup);
   }
 
-  const edgeGroup = createSvgElement('g', { class: 'network-edges' });
-  for (const edge of edges) {
+  const membershipGroup = createSvgElement('g', { class: 'network-membership-edges' });
+  for (const edge of membershipEdges()) {
     const path = edgePath(edge);
     if (!path) continue;
     const label = edgeAriaLabel(edge);
     const visiblePath = createSvgElement('path', {
-      class: 'network-edge',
+      class: 'network-edge is-membership',
       d: path,
       'data-edge-id': edge.id,
       'data-source-id': edge.sourceId,
       'data-target-id': edge.targetId,
+      'data-source-file': edge.sourceFilePath,
+      'data-target-file': edge.targetFilePath,
+      'aria-hidden': 'true',
+      focusable: 'false',
+      'aria-label': label,
+    });
+    const title = createSvgElement('title');
+    title.textContent = label;
+    visiblePath.appendChild(title);
+    membershipGroup.appendChild(visiblePath);
+  }
+  networkSvgEl.appendChild(membershipGroup);
+
+  const edgeGroup = createSvgElement('g', { class: 'network-edges' });
+  const visibleCallEdges = networkShowsFunctions() ? edges : fileEdges;
+  for (const edge of visibleCallEdges) {
+    const path = edgePath(edge);
+    if (!path) continue;
+    const label = edgeAriaLabel(edge);
+    const fileEdge = edge.edgeType === 'file-call';
+    const visiblePath = createSvgElement('path', {
+      class: 'network-edge' + (fileEdge ? ' is-file-call' : ''),
+      d: path,
+      'data-edge-id': edge.id,
+      'data-source-id': edge.sourceId,
+      'data-target-id': edge.targetId,
+      'data-source-file': fileEdge ? edge.sourceFilePath : edge.sourceModulePath,
+      'data-target-file': fileEdge ? edge.targetFilePath : edge.targetModulePath,
       'marker-end': 'url(#network-arrow)',
       role: 'button',
       tabindex: 0,
       focusable: 'true',
       'aria-label': label,
+      style: fileEdge ? '--edge-width:' + clamp(1.8 + Math.sqrt(compactCount(edge.callCount)) * 0.36, 2.1, 4.8).toFixed(2) + 'px' : null,
     });
     const hitPath = createSvgElement('path', {
       class: 'network-edge-hit',
@@ -1349,7 +2024,11 @@ function renderFunctionNetwork() {
     visiblePath.appendChild(title);
     const activate = (event) => {
       if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
-      selectFunction(edge.targetId, { reason: 'select-function-edge', restoreFocusEl: visiblePath, scroll: true });
+      if (fileEdge) {
+        selectFile(edge.targetFilePath, { reason: 'select-file-edge', restoreFocusEl: visiblePath, scroll: true });
+      } else {
+        selectFunction(edge.targetId, { reason: 'select-function-edge', restoreFocusEl: visiblePath, scroll: true });
+      }
     };
     addKeyboardActivation(visiblePath, activate);
     hitPath.addEventListener('click', activate);
@@ -1358,37 +2037,83 @@ function renderFunctionNetwork() {
   networkSvgEl.appendChild(edgeGroup);
 
   const nodeGroup = createSvgElement('g', { class: 'network-nodes' });
-  for (const layoutNode of networkLayout.nodes.values()) {
+  const layoutNodes = Array.from(networkLayout.nodes.values());
+  const orderedLayoutNodes = networkShowsFilesAndFunctions()
+    ? [
+      ...layoutNodes.filter((layoutNode) => layoutNode.node.nodeType !== 'file'),
+      ...layoutNodes.filter((layoutNode) => layoutNode.node.nodeType === 'file'),
+    ]
+    : layoutNodes;
+  for (const layoutNode of orderedLayoutNodes) {
     const node = layoutNode.node;
+    const isFileNode = node.nodeType === 'file';
     const group = createSvgElement('g', {
-      class: 'network-node',
+      class: 'network-node' + (isFileNode ? ' file-network-node' : ''),
       role: 'button',
       tabindex: 0,
-      'data-function-id': node.id,
+      'data-node-kind': isFileNode ? 'file' : 'function',
+      'data-function-id': isFileNode ? null : node.id,
+      'data-file-path': isFileNode ? node.modulePath : node.modulePath,
       'aria-label': nodeAriaLabel(node),
     });
     const title = createSvgElement('title');
-    title.textContent = displayName(node) + ' in ' + node.modulePath + ', '
-      + lineCountFor(node) + ' ' + plural(lineCountFor(node), 'line') + '. '
-      + connectionSummary(node);
-    const circle = createSvgElement('circle', {
-      cx: layoutNode.x,
-      cy: layoutNode.y,
-      r: layoutNode.radius,
-      fill: layoutNode.color,
-    });
-    const label = createSvgElement('text', {
-      x: layoutNode.x,
-      y: layoutNode.y + layoutNode.radius + 17,
-      'text-anchor': 'middle',
-    });
-    label.textContent = shortLabel(displayName(node), 16);
-    group.append(title, circle, label);
-    addKeyboardActivation(group, (event) => {
-      if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
-      selectFunction(node.id, { reason: 'select-function', restoreFocusEl: group });
-    });
-    group.addEventListener('dblclick', () => showSourceDialogForFunctionId(node.id, group));
+    title.textContent = isFileNode
+      ? node.modulePath + ', ' + compactCount(node.functionCount) + ' '
+        + plural(compactCount(node.functionCount), 'function') + ', '
+        + compactCount(node.totalFunctionLines) + ' function '
+        + plural(compactCount(node.totalFunctionLines), 'line') + '. '
+        + fileConnectionSummary(node)
+      : displayName(node) + ' in ' + node.modulePath + ', '
+        + lineCountFor(node) + ' ' + plural(lineCountFor(node), 'line') + '. '
+        + connectionSummary(node);
+    if (isFileNode) {
+      const rect = createSvgElement('rect', {
+        x: layoutNode.x - layoutNode.width / 2,
+        y: layoutNode.y - layoutNode.height / 2,
+        width: layoutNode.width,
+        height: layoutNode.height,
+        rx: 7,
+        fill: layoutNode.color,
+      });
+      const label = createSvgElement('text', {
+        x: layoutNode.x,
+        y: layoutNode.y - 3,
+        'text-anchor': 'middle',
+      });
+      label.textContent = shortLabel(node.modulePath, 24);
+      const metric = createSvgElement('text', {
+        class: 'file-node-metric',
+        x: layoutNode.x,
+        y: layoutNode.y + 14,
+        'text-anchor': 'middle',
+      });
+      metric.textContent = compactCount(node.functionCount) + ' fn'
+        + ' | ' + compactCount(node.totalFunctionLines) + ' lines';
+      group.append(title, rect, label, metric);
+      addKeyboardActivation(group, (event) => {
+        if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
+        selectFile(node.modulePath, { reason: 'select-file', restoreFocusEl: group });
+      });
+    } else {
+      const circle = createSvgElement('circle', {
+        cx: layoutNode.x,
+        cy: layoutNode.y,
+        r: layoutNode.radius,
+        fill: layoutNode.color,
+      });
+      const label = createSvgElement('text', {
+        x: layoutNode.x,
+        y: layoutNode.y + layoutNode.radius + 17,
+        'text-anchor': 'middle',
+      });
+      label.textContent = shortLabel(displayName(node), 16);
+      group.append(title, circle, label);
+      addKeyboardActivation(group, (event) => {
+        if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
+        selectFunction(node.id, { reason: 'select-function', restoreFocusEl: group });
+      });
+      group.addEventListener('dblclick', () => showSourceDialogForFunctionId(node.id, group));
+    }
     nodeGroup.appendChild(group);
   }
   networkSvgEl.appendChild(nodeGroup);
@@ -1397,6 +2122,10 @@ function renderFunctionNetwork() {
 
 function networkNodeElement(functionId) {
   return networkSvgEl.querySelector('.network-node[data-function-id="' + CSS.escape(functionId) + '"]');
+}
+
+function networkFileNodeElement(modulePath) {
+  return networkSvgEl.querySelector('.network-node[data-file-path="' + CSS.escape(modulePath) + '"][data-node-kind="file"]');
 }
 
 function setNetworkZoom(nextZoom, anchorClientX = null, anchorClientY = null) {
@@ -1456,6 +2185,14 @@ function resetNetworkView() {
 
 function scrollFunctionIntoView(functionId) {
   const layoutNode = networkLayout?.nodes.get(functionId);
+  if (!layoutNode) return false;
+  networkViewportEl.scrollLeft = Math.max(0, (layoutNode.x * networkZoom) - networkViewportEl.clientWidth / 2);
+  networkViewportEl.scrollTop = Math.max(0, (layoutNode.y * networkZoom) - networkViewportEl.clientHeight / 2);
+  return true;
+}
+
+function scrollFileIntoView(modulePath) {
+  const layoutNode = networkLayout?.nodes.get(fileNodeId(modulePath));
   if (!layoutNode) return false;
   networkViewportEl.scrollLeft = Math.max(0, (layoutNode.x * networkZoom) - networkViewportEl.clientWidth / 2);
   networkViewportEl.scrollTop = Math.max(0, (layoutNode.y * networkZoom) - networkViewportEl.clientHeight / 2);
@@ -2372,6 +3109,115 @@ function renderStaticChips(parent, node) {
   parent.appendChild(row);
 }
 
+function functionConnectionScore(node = {}) {
+  return safeArray(edgesByTargetId.get(node.id)).length
+    + safeArray(edgesBySourceId.get(node.id)).length
+    + externalRelationshipsForNode(node).length;
+}
+
+function mostConnectedFunctionForFile(modulePath) {
+  return functionsForFile(modulePath)
+    .sort((a, b) => functionConnectionScore(b) - functionConnectionScore(a) || sortFunctions(a, b))[0] || null;
+}
+
+function fileTakeaway(node = {}) {
+  const incoming = safeArray(fileEdgesByTargetPath.get(node.modulePath)).length;
+  const outgoing = safeArray(fileEdgesBySourcePath.get(node.modulePath)).length;
+  return node.modulePath + ' contains ' + compactCount(node.functionCount) + ' saved '
+    + plural(compactCount(node.functionCount), 'function') + ' totaling '
+    + compactCount(node.totalFunctionLines) + ' function '
+    + plural(compactCount(node.totalFunctionLines), 'line') + '; '
+    + incoming + ' ' + plural(incoming, 'file') + ' use it, and it uses '
+    + outgoing + ' ' + plural(outgoing, 'file') + '.';
+}
+
+function renderFileMetrics(parent, node = {}) {
+  const incoming = safeArray(fileEdgesByTargetPath.get(node.modulePath)).length;
+  const outgoing = safeArray(fileEdgesBySourcePath.get(node.modulePath)).length;
+  const row = createElement('div', 'connection-metrics');
+  for (const item of [
+    { label: 'Functions', value: compactCount(node.functionCount), className: '' },
+    { label: 'Function lines', value: compactCount(node.totalFunctionLines), className: '' },
+    { label: 'Used by files', value: incoming, className: 'is-incoming' },
+    { label: 'Uses files', value: outgoing, className: 'is-outgoing' },
+  ]) {
+    const metric = createElement('span', 'connection-metric ' + item.className);
+    metric.append(createElement('strong', '', String(item.value)), createElement('span', '', item.label));
+    row.appendChild(metric);
+  }
+  parent.appendChild(row);
+}
+
+function renderRelatedFilePill(edge, direction) {
+  const modulePath = direction === 'incoming' ? edge.sourceFilePath : edge.targetFilePath;
+  const fileNode = fileByPath.get(modulePath);
+  const button = createElement('button', 'related-node');
+  button.type = 'button';
+  button.setAttribute('aria-label', 'Select ' + modulePath);
+  button.addEventListener('click', () => {
+    selectFile(modulePath, { reason: 'select-related-file', restoreFocusEl: button, scroll: true });
+  });
+  const swatch = createElement('span', 'related-node-swatch');
+  swatch.style.background = fileColorByPath.get(modulePath) || '#64748b';
+  button.append(
+    swatch,
+    createElement('span', 'related-node-label', shortLabel(modulePath, 24)),
+    createElement('span', 'related-node-meta', fileNode ? fileEdgeCallLabel(edge) : 'file link'),
+  );
+  return button;
+}
+
+function renderFileConnectionGroup(parent, title, edgesForGroup, direction) {
+  const section = createElement('section', 'relationship-group');
+  section.appendChild(createElement('h4', '', title));
+  if (edgesForGroup.length === 0) {
+    section.appendChild(createElement('p', 'empty-note', 'No saved file links in this direction.'));
+  } else {
+    const strip = createElement('div', 'related-node-strip');
+    for (const edge of edgesForGroup) strip.appendChild(renderRelatedFilePill(edge, direction));
+    section.appendChild(strip);
+  }
+  parent.appendChild(section);
+}
+
+function renderSelectedFilePanel(node) {
+  selectedTitleEl.textContent = 'File Details';
+  const titleRow = createElement('div', 'function-title');
+  const titleGroup = createElement('div');
+  titleGroup.append(
+    createElement('h3', '', node.modulePath),
+    createElement('p', 'function-path', compactCount(node.functionCount) + ' '
+      + plural(compactCount(node.functionCount), 'function') + ' in this source file'),
+  );
+  const actions = createElement('div', 'toolbar-group');
+  const showFunctionsButton = createElement('button', '', 'Show its functions');
+  showFunctionsButton.type = 'button';
+  showFunctionsButton.addEventListener('click', () => {
+    setNetworkNodeVisibility(
+      { files: true, functions: true },
+      { reason: 'show-file-functions', focusFilePath: node.modulePath },
+    );
+  });
+  actions.appendChild(showFunctionsButton);
+  titleRow.append(titleGroup, actions);
+
+  selectedFunctionEl.appendChild(titleRow);
+  selectedFunctionEl.appendChild(createElement('p', 'takeaway', fileTakeaway(node)));
+  renderFileMetrics(selectedFunctionEl, node);
+  renderFileConnectionGroup(
+    selectedFunctionEl,
+    'Files that use it',
+    safeArray(fileEdgesByTargetPath.get(node.modulePath)),
+    'incoming',
+  );
+  renderFileConnectionGroup(
+    selectedFunctionEl,
+    'Files it uses',
+    safeArray(fileEdgesBySourcePath.get(node.modulePath)),
+    'outgoing',
+  );
+}
+
 function relationshipGroupTitle(groupId) {
   return ({
     incoming: 'Used by',
@@ -2444,12 +3290,25 @@ function renderRelationshipList(parent, node, { mode = 'panel', filterId = activ
 
 function renderSelectedFunctionPanel() {
   selectedFunctionEl.textContent = '';
+  const selectedFile = selectedFilePath ? fileByPath.get(selectedFilePath) : null;
+  if (selectedFile) {
+    renderSelectedFilePanel(selectedFile);
+    return;
+  }
+
+  selectedTitleEl.textContent = 'Function Details';
   const node = selectedFunctionId ? functionById.get(selectedFunctionId) : null;
   if (!node) {
+    selectedTitleEl.textContent = 'Graph Details';
+    const emptyText = networkShowsFilesAndFunctions()
+      ? 'Select a file to see its role, or select a function to see who uses it, what it uses, and its source.'
+      : (networkShowsFiles()
+        ? 'Select a file in the graph to see which files use it and which files it uses.'
+        : 'Select a function in the graph to see who uses it, what it uses, and its source.');
     selectedFunctionEl.appendChild(createElement(
       'p',
       'empty-note',
-      'Select a function in the graph to see who uses it, what it uses, and its source.',
+      emptyText,
     ));
     return;
   }
@@ -2489,8 +3348,25 @@ function filterMatchedEdgeIds(items) {
     .filter(Boolean));
 }
 
+function filePathForRenderedNode(nodeEl) {
+  return nodeEl.getAttribute('data-file-path') || '';
+}
+
+function renderedNodeKind(nodeEl) {
+  return nodeEl.getAttribute('data-node-kind') || 'function';
+}
+
+function functionEdgeIsIncomingToFile(edge, modulePath) {
+  return edge.targetModulePath === modulePath && edge.sourceModulePath !== modulePath;
+}
+
+function functionEdgeIsOutgoingFromFile(edge, modulePath) {
+  return edge.sourceModulePath === modulePath && edge.targetModulePath !== modulePath;
+}
+
 function updateNetworkHighlights() {
   const selectedNode = selectedFunctionId ? functionById.get(selectedFunctionId) : null;
+  const selectedFile = selectedFilePath ? fileByPath.get(selectedFilePath) : null;
   const incomingEdges = selectedNode ? safeArray(edgesByTargetId.get(selectedNode.id)) : [];
   const outgoingEdges = selectedNode ? safeArray(edgesBySourceId.get(selectedNode.id)) : [];
   const incomingSources = new Set(incomingEdges.map((edge) => edge.sourceId));
@@ -2498,35 +3374,96 @@ function updateNetworkHighlights() {
   const items = selectedNode ? relationshipItemsForNode(selectedNode) : [];
   const matchedNodeIds = selectedNode ? filterMatchedNodeIds(selectedNode, items) : new Set();
   const matchedEdgeIds = selectedNode ? filterMatchedEdgeIds(items) : new Set();
+  const incomingFilePaths = new Set(safeArray(fileEdgesByTargetPath.get(selectedFile?.modulePath))
+    .map((edge) => edge.sourceFilePath));
+  const outgoingFilePaths = new Set(safeArray(fileEdgesBySourcePath.get(selectedFile?.modulePath))
+    .map((edge) => edge.targetFilePath));
+  const childFunctionIds = new Set(safeArray(functionIdsByFile.get(selectedFile?.modulePath)));
 
-  networkSvgEl.classList.toggle('has-selection', Boolean(selectedNode));
+  networkSvgEl.classList.toggle('has-selection', Boolean(selectedNode || selectedFile));
   networkSvgEl.classList.toggle('has-filter', Boolean(selectedNode && activeRelationFilter !== 'all'));
-  networkResetSelectionBtn.disabled = !selectedNode;
+  networkResetSelectionBtn.disabled = !(selectedNode || selectedFile);
 
   for (const nodeEl of Array.from(networkSvgEl.querySelectorAll('.network-node'))) {
+    const nodeKind = renderedNodeKind(nodeEl);
+    const filePath = filePathForRenderedNode(nodeEl);
     const functionId = nodeEl.getAttribute('data-function-id');
-    nodeEl.classList.toggle('is-selected', functionId === selectedNode?.id);
-    nodeEl.classList.toggle('is-caller', incomingSources.has(functionId));
-    nodeEl.classList.toggle('is-callee', outgoingTargets.has(functionId));
-    nodeEl.classList.toggle('is-filter-match', matchedNodeIds.has(functionId));
+    if (nodeKind === 'file') {
+      nodeEl.classList.toggle('is-selected', filePath === selectedFile?.modulePath);
+      nodeEl.classList.toggle('is-caller', incomingFilePaths.has(filePath));
+      nodeEl.classList.toggle('is-callee', outgoingFilePaths.has(filePath));
+      nodeEl.classList.toggle('is-child', false);
+      nodeEl.classList.toggle('is-parent', Boolean(selectedNode && filePath === selectedNode.modulePath));
+      nodeEl.classList.toggle('is-filter-match', Boolean(selectedNode && filePath === selectedNode.modulePath));
+    } else {
+      nodeEl.classList.toggle('is-selected', functionId === selectedNode?.id);
+      nodeEl.classList.toggle('is-caller', incomingSources.has(functionId));
+      nodeEl.classList.toggle('is-callee', outgoingTargets.has(functionId));
+      nodeEl.classList.toggle('is-child', childFunctionIds.has(functionId));
+      nodeEl.classList.toggle('is-parent', false);
+      nodeEl.classList.toggle('is-filter-match', matchedNodeIds.has(functionId));
+    }
   }
   for (const edgeEl of Array.from(networkSvgEl.querySelectorAll('.network-edge'))) {
     const edgeId = edgeEl.getAttribute('data-edge-id');
     const sourceId = edgeEl.getAttribute('data-source-id');
     const targetId = edgeEl.getAttribute('data-target-id');
-    edgeEl.classList.toggle('is-incoming', Boolean(selectedNode && targetId === selectedNode.id));
-    edgeEl.classList.toggle('is-outgoing', Boolean(selectedNode && sourceId === selectedNode.id));
+    const sourceFile = edgeEl.getAttribute('data-source-file') || '';
+    const targetFile = edgeEl.getAttribute('data-target-file') || '';
+    const membership = edgeEl.classList.contains('is-membership');
+    const fileCall = edgeEl.classList.contains('is-file-call');
+    const incomingToSelectedFile = Boolean(selectedFile && (
+      fileCall
+        ? targetFile === selectedFile.modulePath
+        : functionEdgeIsIncomingToFile({ sourceModulePath: sourceFile, targetModulePath: targetFile }, selectedFile.modulePath)
+    ));
+    const outgoingFromSelectedFile = Boolean(selectedFile && (
+      fileCall
+        ? sourceFile === selectedFile.modulePath
+        : functionEdgeIsOutgoingFromFile({ sourceModulePath: sourceFile, targetModulePath: targetFile }, selectedFile.modulePath)
+    ));
+    const insideSelectedFile = Boolean(selectedFile && sourceFile === selectedFile.modulePath && targetFile === selectedFile.modulePath);
+    edgeEl.classList.toggle('is-incoming', Boolean(
+      (selectedNode && targetId === selectedNode.id)
+        || (!membership && incomingToSelectedFile && sourceFile !== selectedFile?.modulePath),
+    ));
+    edgeEl.classList.toggle('is-outgoing', Boolean(
+      (selectedNode && sourceId === selectedNode.id)
+        || (!membership && outgoingFromSelectedFile && targetFile !== selectedFile?.modulePath),
+    ));
+    edgeEl.classList.toggle('is-child', Boolean(
+      (membership && selectedFile && sourceFile === selectedFile.modulePath)
+        || (!membership && insideSelectedFile)
+        || (membership && selectedNode && targetId === selectedNode.id),
+    ));
     edgeEl.classList.toggle('is-filter-match', matchedEdgeIds.has(edgeId));
   }
 
-  const modeLabel = networkLayoutModeRecord(networkLayout?.mode).statusLabel;
+  const modeLabel = graphStatusLabel(networkLayout?.mode);
   if (selectedNode) {
     const usedBy = incomingEdges.length;
     const uses = outgoingEdges.length + externalRelationshipsForNode(selectedNode).length;
     latestFunctionGraphStatus = modeLabel + ': selected ' + displayName(selectedNode) + ': '
       + usedBy + ' ' + plural(usedBy, 'function') + ' use it; it uses ' + uses + '.';
+  } else if (selectedFile) {
+    const usedBy = safeArray(fileEdgesByTargetPath.get(selectedFile.modulePath)).length;
+    const uses = safeArray(fileEdgesBySourcePath.get(selectedFile.modulePath)).length;
+    latestFunctionGraphStatus = modeLabel + ': selected ' + selectedFile.modulePath + ': '
+      + compactCount(selectedFile.functionCount) + ' '
+      + plural(compactCount(selectedFile.functionCount), 'function') + '; '
+      + usedBy + ' ' + plural(usedBy, 'file') + ' use it; it uses '
+      + uses + ' ' + plural(uses, 'file') + '.';
   } else {
-    latestFunctionGraphStatus = modeLabel + ': ' + functions.length + ' functions, ' + edges.length + ' saved function links.';
+    if (networkShowsFilesAndFunctions()) {
+      latestFunctionGraphStatus = modeLabel + ': ' + fileNodes.length + ' files, '
+        + functions.length + ' functions, ' + edges.length + ' saved function links.';
+    } else if (networkShowsFiles()) {
+      latestFunctionGraphStatus = modeLabel + ': ' + fileNodes.length + ' files, '
+        + fileEdges.length + ' aggregated file links.';
+    } else {
+      latestFunctionGraphStatus = modeLabel + ': ' + functions.length + ' functions, '
+        + edges.length + ' saved function links.';
+    }
   }
   updateVisualizationStatus();
 }
@@ -2542,6 +3479,7 @@ function setRelationFilter(filterId) {
 function selectFunction(functionId, { reason = 'select-function', restoreFocusEl = null, scroll = false } = {}) {
   if (!functionById.has(functionId)) return false;
   selectedFunctionId = functionId;
+  selectedFilePath = '';
   if (!relationshipItemsForNode(functionById.get(functionId)).some((item) => item.tags.includes(activeRelationFilter))) {
     activeRelationFilter = 'all';
   }
@@ -2553,12 +3491,52 @@ function selectFunction(functionId, { reason = 'select-function', restoreFocusEl
   return true;
 }
 
-function clearSelection() {
+function selectFile(modulePath, { reason = 'select-file', restoreFocusEl = null, scroll = false } = {}) {
+  if (!fileByPath.has(modulePath)) return false;
+  selectedFilePath = modulePath;
   selectedFunctionId = '';
   activeRelationFilter = 'all';
   renderSelectedFunctionPanel();
   updateNetworkHighlights();
+  if (scroll) scrollFileIntoView(modulePath);
+  if (restoreFocusEl) sourceDialogRestoreFocusEl = restoreFocusEl;
+  sendViewerBridgeState(reason);
+  return true;
+}
+
+function clearSelection() {
+  selectedFunctionId = '';
+  selectedFilePath = '';
+  activeRelationFilter = 'all';
+  renderSelectedFunctionPanel();
+  updateNetworkHighlights();
   sendViewerBridgeState('clear-selection');
+}
+
+function reconcileSelectionForNodeVisibility() {
+  if (selectedFunctionId) {
+    const selectedNode = functionById.get(selectedFunctionId);
+    if (selectedNode && networkShowsFunctions()) {
+      selectedFilePath = '';
+      return;
+    }
+    selectedFunctionId = '';
+    activeRelationFilter = 'all';
+    if (selectedNode && networkShowsFiles() && fileByPath.has(selectedNode.modulePath)) {
+      selectedFilePath = selectedNode.modulePath;
+      return;
+    }
+  }
+
+  if (selectedFilePath) {
+    if (networkShowsFiles() && fileByPath.has(selectedFilePath)) return;
+    const previousFilePath = selectedFilePath;
+    selectedFilePath = '';
+    if (networkShowsFunctions()) {
+      const child = mostConnectedFunctionForFile(previousFilePath);
+      if (child) selectedFunctionId = child.id;
+    }
+  }
 }
 
 function dialogGroupForNode(node) {
@@ -3288,15 +4266,18 @@ async function main() {
   functionMapPayload = outputPayload.functionMap || { limitations: [], functions: [], edges: [] };
   buildDeclarationIndexes(sourcePayload);
   indexFunctions();
+  indexFileGraph();
 
   activePrimaryView = loadPrimaryViewMode();
   activeNetworkLayoutMode = loadNetworkLayoutMode();
+  activeNetworkNodeVisibility = loadNetworkNodeVisibility();
   rawRenderText();
   subtitleEl.textContent = (outputPayload.entry || 'unknown entry') + '  |  ' + (outputPayload.rootDir || 'unknown root');
   buildMetaEl.textContent = formatBuildMeta(outputPayload.meta);
   renderStats();
   applyPrimaryViewMode();
   renderNetworkLayoutSwitch();
+  renderNetworkNodeSwitch();
   renderSelectedFunctionPanel();
   layoutFunctionNetwork();
   renderFunctionNetwork();

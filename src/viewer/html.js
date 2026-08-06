@@ -143,6 +143,16 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         align-items:center;
         gap:10px;
       }
+      .control-set {
+        display:inline-flex;
+        align-items:center;
+        gap:5px;
+      }
+      .control-label {
+        color:#475467;
+        font-size:.76rem;
+        font-weight:850;
+      }
       .segmented-control {
         display:inline-flex;
         align-items:center;
@@ -164,6 +174,7 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         padding:6px 9px;
       }
       .segmented-control button:hover { background:#f8fbff; }
+      .segmented-control button[aria-disabled="true"] { cursor:not-allowed; }
       .segmented-control button.is-active {
         background:#ffffff;
         color:#173a8a;
@@ -207,6 +218,19 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         stroke-width:1.6;
         opacity:.62;
       }
+      .network-edge.is-file-call {
+        stroke-width:var(--edge-width, 2.1);
+      }
+      .network-edge.is-membership {
+        stroke:#9aa8bb;
+        stroke-width:1.1;
+        stroke-dasharray:3 5;
+        opacity:.34;
+      }
+      .network-edge:hover {
+        stroke:var(--accent);
+        opacity:1;
+      }
       .network-edge-hit {
         fill:none;
         stroke:transparent;
@@ -225,6 +249,11 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         stroke-width:2.5;
         filter:drop-shadow(0 4px 8px rgba(15,23,42,.14));
       }
+      .network-node rect {
+        stroke:rgba(17,24,39,.22);
+        stroke-width:2.5;
+        filter:drop-shadow(0 5px 10px rgba(15,23,42,.16));
+      }
       .network-node text {
         fill:#1f2937;
         font-size:12px;
@@ -235,23 +264,47 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         stroke-linejoin:round;
         pointer-events:none;
       }
+      .network-node.file-network-node text {
+        fill:#ffffff;
+        font-size:11px;
+        stroke:none;
+      }
+      .network-node.file-network-node .file-node-metric {
+        font-size:10px;
+        font-weight:750;
+        opacity:.9;
+      }
       .network-svg.has-selection .network-node,
       .network-svg.has-selection .network-edge { opacity:.18; }
       .network-svg.has-selection .network-node.is-selected,
       .network-svg.has-selection .network-node.is-caller,
       .network-svg.has-selection .network-node.is-callee,
+      .network-svg.has-selection .network-node.is-child,
+      .network-svg.has-selection .network-node.is-parent,
       .network-svg.has-selection .network-edge.is-incoming,
-      .network-svg.has-selection .network-edge.is-outgoing { opacity:1; }
-      .network-node.is-selected circle {
+      .network-svg.has-selection .network-edge.is-outgoing,
+      .network-svg.has-selection .network-edge.is-child { opacity:1; }
+      .network-node.is-selected circle,
+      .network-node.is-selected rect {
         stroke:#111827;
         stroke-width:4;
       }
-      .network-node.is-caller circle {
+      .network-node.is-caller circle,
+      .network-node.is-caller rect {
         stroke:var(--good);
         stroke-width:4;
       }
-      .network-node.is-callee circle {
+      .network-node.is-callee circle,
+      .network-node.is-callee rect {
         stroke:var(--warn);
+        stroke-width:3.5;
+      }
+      .network-node.is-child circle {
+        stroke:#111827;
+        stroke-width:3;
+      }
+      .network-node.is-parent rect {
+        stroke:#111827;
         stroke-width:3.5;
       }
       .network-edge.is-incoming {
@@ -820,6 +873,10 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
               <div class="network-toolbar">
                 <div class="toolbar-group network-primary-controls">
                   <div id="network-layout-switch" class="segmented-control" role="group" aria-label="Function graph layout"></div>
+                  <div class="control-set">
+                    <span class="control-label">Nodes</span>
+                    <div id="network-node-switch" class="segmented-control" role="group" aria-label="Function graph node levels"></div>
+                  </div>
                   <div class="toolbar-group" aria-label="Function graph view controls">
                     <button id="network-zoom-out-btn" type="button" aria-label="Zoom out">-</button>
                     <button id="network-zoom-in-btn" type="button" aria-label="Zoom in">+</button>
@@ -833,7 +890,7 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
                 </div>
               </div>
               <div id="file-legend" class="legend" aria-label="File color legend"></div>
-              <div class="network-help">Drag to pan. Use the zoom buttons, pinch, or Ctrl/Cmd + wheel to zoom. Select a function in the graph to highlight who uses it and what it uses.</div>
+              <div id="function-network-help" class="network-help">Drag to pan. Use the zoom buttons, pinch, or Ctrl/Cmd + wheel to zoom. Select a function in the graph to highlight who uses it and what it uses.</div>
               <div id="function-network-viewport" class="network-viewport">
                 <svg id="function-network-svg" class="network-svg" role="img" aria-label="Function graph"></svg>
               </div>
