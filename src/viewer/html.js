@@ -275,7 +275,7 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         opacity:.9;
       }
       .network-svg.has-selection .network-node,
-      .network-svg.has-selection .network-edge { opacity:.18; }
+      .network-svg.has-selection .network-edge { opacity:1; }
       .network-svg.has-selection .network-node.is-selected,
       .network-svg.has-selection .network-node.is-caller,
       .network-svg.has-selection .network-node.is-callee,
@@ -872,10 +872,21 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
             <section id="function-graphs-view" class="visualization-view" aria-label="Function graphs">
               <div class="network-toolbar">
                 <div class="toolbar-group network-primary-controls">
-                  <div id="network-layout-switch" class="segmented-control" role="group" aria-label="Function graph layout"></div>
+                  <div class="control-set">
+                    <span class="control-label">Layout</span>
+                    <div id="network-layout-switch" class="segmented-control" role="group" aria-label="Function graph layout"></div>
+                  </div>
                   <div class="control-set">
                     <span class="control-label">Nodes</span>
                     <div id="network-node-switch" class="segmented-control" role="group" aria-label="Function graph node levels"></div>
+                  </div>
+                  <div class="control-set">
+                    <span class="control-label">Scope</span>
+                    <div id="network-scope-switch" class="segmented-control" role="group" aria-label="Function graph scope"></div>
+                  </div>
+                  <div class="control-set">
+                    <span class="control-label">Depth</span>
+                    <div id="network-depth-switch" class="segmented-control" role="group" aria-label="Function graph depth"></div>
                   </div>
                   <div class="toolbar-group" aria-label="Function graph view controls">
                     <button id="network-zoom-out-btn" type="button" aria-label="Zoom out">-</button>

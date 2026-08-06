@@ -12,6 +12,13 @@ const packageMeta = require('../package.json');
 const MCP_PROTOCOL_VERSION = '2024-11-05';
 const SERVER_NAME = 'ironglancer-mcp';
 const DEFAULT_BRIDGE_URL = 'http://127.0.0.1:4173/bridge/v1/';
+const NEIGHBORHOOD_DIRECTIONS = new Set(['both', 'dependencies', 'users']);
+const NEIGHBORHOOD_RELATION_ORDER = new Map([
+  ['root', 0],
+  ['dependency', 1],
+  ['user', 2],
+  ['both', 3],
+]);
 
 function parseArgs(argv = process.argv.slice(2)) {
   const options = {
@@ -48,6 +55,48 @@ function jsonText(value) {
 
 function lower(value) {
   return String(value || '').trim().toLowerCase();
+}
+
+function compareText(a, b) {
+  return String(a || '').localeCompare(String(b || ''));
+}
+
+function compactCount(value) {
+  const count = Number(value);
+  return Number.isInteger(count) && count >= 0 ? count : 0;
+}
+
+function parseBoundedInteger(value, defaultValue, { min, max, name }) {
+  if (value == null || value === '') return defaultValue;
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < min || number > max) {
+    throw new Error(`${name} must be an integer from ${min} to ${max}.`);
+  }
+  return number;
+}
+
+function compareFunctionRecords(a, b) {
+  return compareText(a?.modulePath, b?.modulePath)
+    || compactCount(a?.startLine) - compactCount(b?.startLine)
+    || compactCount(a?.endLine) - compactCount(b?.endLine)
+    || compareText(a?.name, b?.name)
+    || compareText(a?.id, b?.id);
+}
+
+function compareFunctionIds(index, a, b) {
+  return compareFunctionRecords(index.functionById.get(a), index.functionById.get(b));
+}
+
+function compareFunctionEdges(index, a, b) {
+  const sourceA = index.functionById.get(a?.sourceId);
+  const sourceB = index.functionById.get(b?.sourceId);
+  const targetA = index.functionById.get(a?.targetId);
+  const targetB = index.functionById.get(b?.targetId);
+  return compareFunctionRecords(sourceA, sourceB)
+    || compareFunctionRecords(targetA, targetB)
+    || compareText(a?.scope, b?.scope)
+    || compareText(a?.relationKind, b?.relationKind)
+    || compareText(a?.id, b?.id);
 }
 
 function compactFunction(index, node) {
@@ -188,6 +237,166 @@ function getFunction({ index }, args = {}) {
   };
 }
 
+function compactNeighborhoodFunction(index, node, { depth, relation }) {
+  return {
+    ...compactFunction(index, node),
+    depth,
+    relation,
+  };
+}
+
+function compactNeighborhoodEdge(index, edge, traversalRelations = new Set()) {
+  const source = index.functionById.get(edge.sourceId);
+  const target = index.functionById.get(edge.targetId);
+  return {
+    id: edge.id,
+    stableId: edge.stableId,
+    sourceId: edge.sourceId,
+    sourceStableId: source?.stableId || null,
+    sourceName: source?.name || edge.sourceFunction || null,
+    sourceModulePath: source?.modulePath || edge.sourceModulePath || null,
+    targetId: edge.targetId,
+    targetStableId: target?.stableId || null,
+    targetName: target?.name || edge.targetFunction || null,
+    targetModulePath: target?.modulePath || edge.targetModulePath || null,
+    relationKind: edge.relationKind,
+    syntaxKinds: edge.syntaxKinds,
+    usageLines: edge.usageLines,
+    referenceCount: edge.referenceCount,
+    traversalRelations: Array.from(traversalRelations).sort(compareText),
+  };
+}
+
+function normalizeNeighborhoodDirection(value) {
+  const direction = lower(value || 'both') || 'both';
+  if (!NEIGHBORHOOD_DIRECTIONS.has(direction)) {
+    throw new Error('direction must be one of: both, dependencies, users.');
+  }
+  return direction;
+}
+
+function neighborhoodTraversalDirections(direction) {
+  if (direction === 'dependencies') return ['dependency'];
+  if (direction === 'users') return ['user'];
+  return ['dependency', 'user'];
+}
+
+function neighborEntriesForDirection(index, functionId, relation) {
+  const edges = relation === 'dependency'
+    ? (index.dependenciesByFunctionId.get(functionId) || [])
+    : (index.usersByFunctionId.get(functionId) || []);
+  return edges
+    .map((edge) => ({
+      id: relation === 'dependency' ? edge.targetId : edge.sourceId,
+      edge,
+      relation,
+    }))
+    .filter((entry) => index.functionById.has(entry.id))
+    .sort((a, b) => compareFunctionIds(index, a.id, b.id)
+      || compareFunctionEdges(index, a.edge, b.edge)
+      || compareText(a.relation, b.relation));
+}
+
+function relationLabelFor(tags) {
+  if (tags.has('root')) return 'root';
+  if (tags.has('dependency') && tags.has('user')) return 'both';
+  if (tags.has('dependency')) return 'dependency';
+  if (tags.has('user')) return 'user';
+  return 'unknown';
+}
+
+function functionNeighborhood({ index }, args = {}) {
+  const root = resolveFunction(index, args);
+  const direction = normalizeNeighborhoodDirection(args.direction);
+  const maxDepth = parseBoundedInteger(args.maxDepth, 2, {
+    min: 1,
+    max: 50,
+    name: 'maxDepth',
+  });
+  const limit = parseBoundedInteger(args.limit, 200, {
+    min: 1,
+    max: 1000,
+    name: 'limit',
+  });
+
+  const queue = [{ id: root.id, depth: 0 }];
+  const depthById = new Map([[root.id, 0]]);
+  const relationTagsById = new Map([[root.id, new Set(['root'])]]);
+  const edgeRelationsById = new Map();
+  const truncationReasons = new Set();
+  let visitedCount = 1;
+
+  for (let position = 0; position < queue.length; position += 1) {
+    const current = queue[position];
+    const traversalDirections = neighborhoodTraversalDirections(direction);
+    if (current.depth >= maxDepth) {
+      if (traversalDirections.some((relation) => neighborEntriesForDirection(index, current.id, relation)
+        .some((entry) => !depthById.has(entry.id)))) {
+        truncationReasons.add('maxDepth');
+      }
+      continue;
+    }
+
+    for (const relation of traversalDirections) {
+      for (const entry of neighborEntriesForDirection(index, current.id, relation)) {
+        if (!edgeRelationsById.has(entry.edge.id)) edgeRelationsById.set(entry.edge.id, {
+          edge: entry.edge,
+          relations: new Set(),
+        });
+        edgeRelationsById.get(entry.edge.id).relations.add(relation);
+
+        if (!relationTagsById.has(entry.id)) relationTagsById.set(entry.id, new Set());
+        relationTagsById.get(entry.id).add(relation);
+        if (depthById.has(entry.id)) continue;
+        if (depthById.size >= limit) {
+          truncationReasons.add('limit');
+          continue;
+        }
+        const depth = current.depth + 1;
+        depthById.set(entry.id, depth);
+        visitedCount += 1;
+        queue.push({ id: entry.id, depth });
+      }
+    }
+  }
+
+  const nodeIds = Array.from(depthById.keys()).sort((a, b) => (
+    (depthById.get(a) || 0) - (depthById.get(b) || 0)
+      || (NEIGHBORHOOD_RELATION_ORDER.get(relationLabelFor(relationTagsById.get(a) || new Set())) || 9)
+        - (NEIGHBORHOOD_RELATION_ORDER.get(relationLabelFor(relationTagsById.get(b) || new Set())) || 9)
+      || compareFunctionIds(index, a, b)
+  ));
+  const nodeIdSet = new Set(nodeIds);
+  const neighborhoodEdges = Array.from(edgeRelationsById.values())
+    .filter(({ edge }) => nodeIdSet.has(edge.sourceId) && nodeIdSet.has(edge.targetId))
+    .sort((a, b) => compareFunctionEdges(index, a.edge, b.edge));
+
+  return {
+    root: compactNeighborhoodFunction(index, root, { depth: 0, relation: 'root' }),
+    direction,
+    maxDepth,
+    limit,
+    nodes: nodeIds.map((id) => {
+      const node = index.functionById.get(id);
+      return compactNeighborhoodFunction(index, node, {
+        depth: depthById.get(id) || 0,
+        relation: relationLabelFor(relationTagsById.get(id) || new Set()),
+      });
+    }),
+    edges: neighborhoodEdges.map(({ edge, relations }) => compactNeighborhoodEdge(index, edge, relations)),
+    metadata: {
+      visitedCount,
+      returnedNodeCount: nodeIds.length,
+      returnedEdgeCount: neighborhoodEdges.length,
+      truncated: truncationReasons.size > 0,
+      truncationReasons: Array.from(truncationReasons).sort(compareText),
+    },
+    staticAnalysis: {
+      functionDependencies: index.functionLimitations,
+    },
+  };
+}
+
 function getSource({ index }, args = {}) {
   const modulePath = String(args.modulePath || args.path || '').trim();
   if (!modulePath) throw new Error('Provide modulePath.');
@@ -234,6 +443,12 @@ async function viewerCommand(options, args = {}) {
     modulePath: args.modulePath,
     name: args.name || args.functionName,
     startLine: args.startLine || args.line,
+    primaryView: args.primaryView,
+    layout: args.layout,
+    scope: args.scope,
+    depth: args.depth,
+    showFiles: args.showFiles,
+    showFunctions: args.showFunctions,
   };
   return fetchBridgeJson(new URL('commands', bridgeUrl), {
     method: 'POST',
@@ -276,6 +491,25 @@ const tools = [
         name: { type: 'string' },
         modulePath: { type: 'string' },
         contextLines: { type: 'integer', minimum: 0, maximum: 40 },
+      },
+    },
+  },
+  {
+    name: 'ironglancer_function_neighborhood',
+    description: 'Return a deterministic multi-hop static function neighborhood from the saved snapshot without requiring a viewer.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        id: { type: 'string' },
+        stableId: { type: 'string' },
+        functionId: { type: 'string' },
+        functionStableId: { type: 'string' },
+        name: { type: 'string' },
+        modulePath: { type: 'string' },
+        direction: { enum: ['both', 'dependencies', 'users'] },
+        maxDepth: { type: 'integer', minimum: 1, maximum: 50 },
+        limit: { type: 'integer', minimum: 1, maximum: 1000 },
       },
     },
   },
@@ -327,7 +561,7 @@ const tools = [
       additionalProperties: false,
       properties: {
         bridgeUrl: { type: 'string' },
-        type: { enum: ['focusFunction', 'openFunction', 'openSource', 'highlightFunction', 'scrollToFunction', 'clearHighlight'] },
+        type: { enum: ['focusFunction', 'openFunction', 'openSource', 'highlightFunction', 'scrollToFunction', 'clearHighlight', 'setGraphView'] },
         targetStableId: { type: 'string' },
         targetId: { type: 'string' },
         functionStableId: { type: 'string' },
@@ -335,6 +569,12 @@ const tools = [
         modulePath: { type: 'string' },
         name: { type: 'string' },
         startLine: { type: 'integer', minimum: 1 },
+        primaryView: { enum: ['function-graphs', 'jsx-map'] },
+        layout: { enum: ['network', 'radial', 'by-file'] },
+        scope: { enum: ['full', 'dependencies', 'parents', 'both'] },
+        depth: { enum: ['1', '2', '3', 'all'] },
+        showFiles: { type: 'boolean' },
+        showFunctions: { type: 'boolean' },
       },
     },
   },
@@ -370,6 +610,7 @@ function createServer(options) {
     if (name === 'ironglancer_run_summary') return runSummary(run);
     if (name === 'ironglancer_search_functions') return searchFunctions(run, args);
     if (name === 'ironglancer_get_function') return getFunction(run, args);
+    if (name === 'ironglancer_function_neighborhood') return functionNeighborhood(run, args);
     if (name === 'ironglancer_investigate_function_placement') {
       const payload = getFunction(run, args);
       return {

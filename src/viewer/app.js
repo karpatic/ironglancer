@@ -46,6 +46,26 @@ const networkNodeModes = [
   { id: 'files', label: 'Files', accessibilityLabel: 'Show file nodes' },
   { id: 'functions', label: 'Functions', accessibilityLabel: 'Show function nodes' },
 ];
+const networkScopeStorageKey = 'ironglancer:function-network-scope';
+const legacyNetworkDirectionStorageKey = 'ironglancer:function-network-direction';
+const networkDepthStorageKey = 'ironglancer:function-network-depth';
+const legacyNetworkHopsStorageKey = 'ironglancer:function-network-hops';
+const networkScopeModes = [
+  { id: 'full', label: 'Full', accessibilityLabel: 'Show the full function graph', statusLabel: 'Full scope' },
+  { id: 'dependencies', label: 'Dependencies', accessibilityLabel: 'Show selected node dependencies', statusLabel: 'Dependencies' },
+  { id: 'parents', label: 'Parents', accessibilityLabel: 'Show selected node parents and users', statusLabel: 'Parents' },
+  { id: 'both', label: 'Both', accessibilityLabel: 'Show selected node dependencies and parents', statusLabel: 'Dependencies + parents' },
+];
+const networkScopeAliases = new Map([
+  ['uses', 'dependencies'],
+  ['used-by', 'parents'],
+]);
+const networkDepthModes = [
+  { id: '1', label: '1', statusLabel: 'Depth 1', accessibilityLabel: 'Show one graph hop from the selected node' },
+  { id: '2', label: '2', statusLabel: 'Depth 2', accessibilityLabel: 'Show two graph hops from the selected node' },
+  { id: '3', label: '3', statusLabel: 'Depth 3', accessibilityLabel: 'Show three graph hops from the selected node' },
+  { id: 'all', label: 'All', statusLabel: 'All depths', accessibilityLabel: 'Show all graph hops from the selected node' },
+];
 
 const subtitleEl = document.getElementById('subtitle');
 const buildMetaEl = document.getElementById('build-meta');
@@ -76,6 +96,8 @@ const networkResetViewBtn = document.getElementById('network-reset-view-btn');
 const networkResetSelectionBtn = document.getElementById('network-reset-selection-btn');
 const networkLayoutSwitchEl = document.getElementById('network-layout-switch');
 const networkNodeSwitchEl = document.getElementById('network-node-switch');
+const networkScopeSwitchEl = document.getElementById('network-scope-switch');
+const networkDepthSwitchEl = document.getElementById('network-depth-switch');
 const networkHelpEl = document.getElementById('function-network-help');
 const fileLegendEl = document.getElementById('file-legend');
 const selectedTitleEl = document.getElementById('selected-title');
@@ -139,6 +161,9 @@ let activeRelationFilter = 'all';
 let activePrimaryView = 'function-graphs';
 let activeNetworkLayoutMode = 'network';
 let activeNetworkNodeVisibility = { files: false, functions: true };
+let activeNetworkScope = 'full';
+let activeNetworkDepth = '1';
+let visibleNetworkGraph = null;
 let latestFunctionGraphStatus = '';
 let networkNeedsFit = true;
 let moduleDiagramNeedsFit = true;
@@ -506,7 +531,7 @@ function assignFileColors(fileOrder) {
 
 function renderFileLegend(fileOrder) {
   fileLegendEl.textContent = '';
-  const visibleFiles = fileOrder.filter((modulePath) => functions.some((node) => node.modulePath === modulePath));
+  const visibleFiles = fileOrder.filter((modulePath) => networkFunctions().some((node) => node.modulePath === modulePath));
   for (const modulePath of visibleFiles.slice(0, 12)) {
     const item = createElement('span', 'legend-item');
     const swatch = createElement('span', 'legend-swatch');
@@ -576,7 +601,7 @@ function layoutEdgeRadius(item = {}) {
 
 function membershipEdges() {
   if (!networkShowsFilesAndFunctions()) return [];
-  return functions.map((node) => ({
+  return networkFunctions().map((node) => ({
     id: 'membership:' + node.id,
     edgeType: 'membership',
     sourceId: fileNodeId(node.modulePath),
@@ -584,6 +609,231 @@ function membershipEdges() {
     sourceFilePath: node.modulePath,
     targetFilePath: node.modulePath,
   }));
+}
+
+function compareFilePaths(a, b) {
+  return String(a || '').localeCompare(String(b || ''));
+}
+
+function networkFunctionIdsByFileFor(nodes) {
+  const idsByFile = new Map();
+  for (const node of nodes) {
+    if (!idsByFile.has(node.modulePath)) idsByFile.set(node.modulePath, []);
+    idsByFile.get(node.modulePath).push(node.id);
+  }
+  for (const ids of idsByFile.values()) ids.sort(compareFunctionIds);
+  return idsByFile;
+}
+
+function createNetworkGraph({ functionIds, functionEdgeIds, filePaths, fileEdgeIds, filtered }) {
+  const visibleFunctionIds = functionIds || new Set(functions.map((node) => node.id));
+  const visibleFilePaths = filePaths || new Set(fileNodes.map((node) => node.modulePath));
+  const visibleFunctionEdgeIds = functionEdgeIds || new Set(edges.map((edge) => edge.id));
+  const visibleFileEdgeIds = fileEdgeIds || new Set(fileEdges.map((edge) => edge.id));
+  const graphFunctions = functions.filter((node) => visibleFunctionIds.has(node.id));
+  const graphEdges = edges.filter((edge) => (
+    visibleFunctionEdgeIds.has(edge.id)
+    && visibleFunctionIds.has(edge.sourceId)
+    && visibleFunctionIds.has(edge.targetId)
+  ));
+  const graphFileNodes = fileNodes.filter((node) => visibleFilePaths.has(node.modulePath));
+  const graphFileEdges = fileEdges.filter((edge) => (
+    visibleFileEdgeIds.has(edge.id)
+    && visibleFilePaths.has(edge.sourceFilePath)
+    && visibleFilePaths.has(edge.targetFilePath)
+  ));
+  return {
+    filtered: Boolean(filtered),
+    functions: graphFunctions,
+    edges: graphEdges,
+    fileNodes: graphFileNodes,
+    fileEdges: graphFileEdges,
+    functionIds: new Set(graphFunctions.map((node) => node.id)),
+    functionEdgeIds: new Set(graphEdges.map((edge) => edge.id)),
+    filePaths: new Set(graphFileNodes.map((node) => node.modulePath)),
+    fileEdgeIds: new Set(graphFileEdges.map((edge) => edge.id)),
+    fileByPath: new Map(graphFileNodes.map((node) => [node.modulePath, node])),
+    functionIdsByFile: networkFunctionIdsByFileFor(graphFunctions),
+  };
+}
+
+function fullNetworkGraph() {
+  return createNetworkGraph({ filtered: false });
+}
+
+function networkGraph() {
+  return visibleNetworkGraph || fullNetworkGraph();
+}
+
+function networkFunctions() {
+  return networkGraph().functions;
+}
+
+function networkEdges() {
+  return networkGraph().edges;
+}
+
+function networkFileNodes() {
+  return networkGraph().fileNodes;
+}
+
+function networkFileEdges() {
+  return networkGraph().fileEdges;
+}
+
+function networkFileByPath() {
+  return networkGraph().fileByPath;
+}
+
+function networkFunctionIdsByFile() {
+  return networkGraph().functionIdsByFile;
+}
+
+function networkFunctionsForFile(modulePath) {
+  return safeArray(networkFunctionIdsByFile().get(modulePath))
+    .map((id) => functionById.get(id))
+    .filter(Boolean)
+    .sort(sortFunctions);
+}
+
+function networkDepthLimit() {
+  return activeNetworkDepth === 'all' ? Infinity : Number(activeNetworkDepth) || 1;
+}
+
+function edgeEndpointId(edge, traversalDirection) {
+  return traversalDirection === 'incoming' ? edge.sourceId : edge.targetId;
+}
+
+function sortedFunctionNeighborEdges(edgeList, traversalDirection) {
+  return safeArray(edgeList)
+    .filter((edge) => functionById.has(edgeEndpointId(edge, traversalDirection)))
+    .sort((a, b) => compareFunctionIds(edgeEndpointId(a, traversalDirection), edgeEndpointId(b, traversalDirection))
+      || sortEdges(a, b));
+}
+
+function functionTraversalDirections() {
+  if (activeNetworkScope === 'dependencies') return ['outgoing'];
+  if (activeNetworkScope === 'parents') return ['incoming'];
+  if (activeNetworkScope === 'full') return [];
+  return ['outgoing', 'incoming'];
+}
+
+function traverseFunctionDirection(rootId, traversalDirection, maxDepth, nodeIds, edgeIds) {
+  const queue = [{ id: rootId, depth: 0 }];
+  const visitedForDirection = new Set([rootId]);
+  for (let position = 0; position < queue.length; position += 1) {
+    const current = queue[position];
+    if (current.depth >= maxDepth) continue;
+    const sourceEdges = traversalDirection === 'outgoing'
+      ? edgesBySourceId.get(current.id)
+      : edgesByTargetId.get(current.id);
+    for (const edge of sortedFunctionNeighborEdges(sourceEdges, traversalDirection)) {
+      const nextId = edgeEndpointId(edge, traversalDirection);
+      edgeIds.add(edge.id);
+      if (visitedForDirection.has(nextId)) continue;
+      visitedForDirection.add(nextId);
+      nodeIds.add(nextId);
+      queue.push({ id: nextId, depth: current.depth + 1 });
+    }
+  }
+}
+
+function traverseFunctionNeighborhood(rootId) {
+  const maxDepth = networkDepthLimit();
+  const nodeIds = new Set([rootId]);
+  const edgeIds = new Set();
+  for (const direction of functionTraversalDirections()) {
+    traverseFunctionDirection(rootId, direction, maxDepth, nodeIds, edgeIds);
+  }
+
+  return { nodeIds, edgeIds };
+}
+
+function fileEdgeEndpointPath(edge, traversalDirection) {
+  return traversalDirection === 'incoming' ? edge.sourceFilePath : edge.targetFilePath;
+}
+
+function sortedFileNeighborEdges(edgeList, traversalDirection) {
+  return safeArray(edgeList)
+    .filter((edge) => fileByPath.has(fileEdgeEndpointPath(edge, traversalDirection)))
+    .sort((a, b) => compareFilePaths(fileEdgeEndpointPath(a, traversalDirection), fileEdgeEndpointPath(b, traversalDirection))
+      || compareFilePaths(a.sourceFilePath, b.sourceFilePath)
+      || compareFilePaths(a.targetFilePath, b.targetFilePath));
+}
+
+function fileTraversalDirections() {
+  if (activeNetworkScope === 'dependencies') return ['outgoing'];
+  if (activeNetworkScope === 'parents') return ['incoming'];
+  if (activeNetworkScope === 'full') return [];
+  return ['outgoing', 'incoming'];
+}
+
+function traverseFileDirection(rootPath, traversalDirection, maxDepth, filePaths, fileEdgeIds) {
+  const queue = [{ modulePath: rootPath, depth: 0 }];
+  const visitedForDirection = new Set([rootPath]);
+  for (let position = 0; position < queue.length; position += 1) {
+    const current = queue[position];
+    if (current.depth >= maxDepth) continue;
+    const sourceEdges = traversalDirection === 'outgoing'
+      ? fileEdgesBySourcePath.get(current.modulePath)
+      : fileEdgesByTargetPath.get(current.modulePath);
+    for (const edge of sortedFileNeighborEdges(sourceEdges, traversalDirection)) {
+      const nextPath = fileEdgeEndpointPath(edge, traversalDirection);
+      fileEdgeIds.add(edge.id);
+      if (visitedForDirection.has(nextPath)) continue;
+      visitedForDirection.add(nextPath);
+      filePaths.add(nextPath);
+      queue.push({ modulePath: nextPath, depth: current.depth + 1 });
+    }
+  }
+}
+
+function traverseFileNeighborhood(rootPath) {
+  const maxDepth = networkDepthLimit();
+  const filePaths = new Set([rootPath]);
+  const fileEdgeIds = new Set();
+  for (const direction of fileTraversalDirections()) {
+    traverseFileDirection(rootPath, direction, maxDepth, filePaths, fileEdgeIds);
+  }
+
+  return { filePaths, fileEdgeIds };
+}
+
+function functionsInFiles(filePaths) {
+  const ids = new Set();
+  for (const modulePath of Array.from(filePaths).sort(compareFilePaths)) {
+    for (const id of safeArray(functionIdsByFile.get(modulePath))) ids.add(id);
+  }
+  return ids;
+}
+
+function computeVisibleNetworkGraph() {
+  if (activeNetworkScope === 'full') return fullNetworkGraph();
+  if (!hasNetworkSelection()) return fullNetworkGraph();
+  if (selectedFunctionId && functionById.has(selectedFunctionId)) {
+    const traversal = traverseFunctionNeighborhood(selectedFunctionId);
+    const filePaths = new Set(Array.from(traversal.nodeIds)
+      .map((id) => functionById.get(id)?.modulePath)
+      .filter(Boolean));
+    return createNetworkGraph({
+      functionIds: traversal.nodeIds,
+      functionEdgeIds: traversal.edgeIds,
+      filePaths,
+      filtered: true,
+    });
+  }
+
+  if (selectedFilePath && fileByPath.has(selectedFilePath)) {
+    const traversal = traverseFileNeighborhood(selectedFilePath);
+    return createNetworkGraph({
+      functionIds: functionsInFiles(traversal.filePaths),
+      filePaths: traversal.filePaths,
+      fileEdgeIds: traversal.fileEdgeIds,
+      filtered: true,
+    });
+  }
+
+  return fullNetworkGraph();
 }
 
 function stableHash(value) {
@@ -616,6 +866,21 @@ function normalizeNetworkLayoutModeId(modeId) {
 function networkLayoutModeRecord(modeId = activeNetworkLayoutMode) {
   const normalizedModeId = normalizeNetworkLayoutModeId(modeId);
   return networkLayoutModes.find((mode) => mode.id === normalizedModeId) || networkLayoutModes[0];
+}
+
+function networkScopeRecord(scopeId = activeNetworkScope) {
+  const rawScope = String(scopeId || '').trim();
+  const normalized = networkScopeAliases.get(rawScope) || rawScope;
+  return networkScopeModes.find((mode) => mode.id === normalized) || networkScopeModes[0];
+}
+
+function networkDepthRecord(depthId = activeNetworkDepth) {
+  const normalized = String(depthId || '').trim().toLowerCase();
+  return networkDepthModes.find((mode) => mode.id === normalized) || networkDepthModes[0];
+}
+
+function hasNetworkSelection() {
+  return Boolean(selectedFunctionId || selectedFilePath);
 }
 
 function storageForViewerPreferences() {
@@ -664,6 +929,42 @@ function persistNetworkLayoutMode(modeId) {
     storage.setItem(networkLayoutModeStorageKey, networkLayoutModeRecord(modeId).id);
   } catch {
     // Layout persistence is a convenience; the viewer still works without it.
+  }
+}
+
+function loadNetworkScope() {
+  const storage = storageForViewerPreferences();
+  const savedScope = storage
+    ? (storage.getItem(networkScopeStorageKey) || storage.getItem(legacyNetworkDirectionStorageKey))
+    : '';
+  return networkScopeRecord(savedScope).id;
+}
+
+function persistNetworkScope(scopeId) {
+  const storage = storageForViewerPreferences();
+  if (!storage) return;
+  try {
+    storage.setItem(networkScopeStorageKey, networkScopeRecord(scopeId).id);
+  } catch {
+    // Scope persistence is a convenience; the viewer still works without it.
+  }
+}
+
+function loadNetworkDepth() {
+  const storage = storageForViewerPreferences();
+  const savedDepth = storage
+    ? (storage.getItem(networkDepthStorageKey) || storage.getItem(legacyNetworkHopsStorageKey))
+    : '';
+  return networkDepthRecord(savedDepth).id;
+}
+
+function persistNetworkDepth(depthId) {
+  const storage = storageForViewerPreferences();
+  if (!storage) return;
+  try {
+    storage.setItem(networkDepthStorageKey, networkDepthRecord(depthId).id);
+  } catch {
+    // Depth persistence is a convenience; the viewer still works without it.
   }
 }
 
@@ -740,17 +1041,72 @@ function networkLevelLabel(visibility = activeNetworkNodeVisibility) {
 }
 
 function graphStatusLabel(modeId = networkLayout?.mode || activeNetworkLayoutMode) {
-  return networkLayoutModeRecord(modeId).statusLabel + ' · ' + networkLevelLabel();
+  const parts = [networkLayoutModeRecord(modeId).statusLabel, networkLevelLabel()];
+  const scope = networkScopeRecord(activeNetworkScope);
+  if (activeNetworkScope === 'full') return parts.concat(scope.statusLabel).join(' · ');
+  parts.push(scope.statusLabel);
+  if (hasNetworkSelection()) parts.push(networkDepthRecord(activeNetworkDepth).statusLabel);
+  return parts.join(' · ');
+}
+
+function networkUsesFileSemanticEdges() {
+  return networkShowsFiles()
+    && (!networkShowsFunctions() || (networkShowsFilesAndFunctions() && activeNetworkScope !== 'full' && selectedFilePath));
+}
+
+function networkSemanticEdgeCount(graph = networkGraph()) {
+  return networkUsesFileSemanticEdges() ? graph.fileEdges.length : graph.edges.length;
+}
+
+function networkSemanticEdgeLabel(graph = networkGraph()) {
+  return networkUsesFileSemanticEdges()
+    ? 'aggregated file ' + plural(graph.fileEdges.length, 'link')
+    : 'saved function ' + plural(graph.edges.length, 'link');
+}
+
+function networkVisibleNodeCount(graph = networkGraph()) {
+  return (networkShowsFiles() ? graph.fileNodes.length : 0)
+    + (networkShowsFunctions() ? graph.functions.length : 0);
+}
+
+function networkVisibleSummary(graph = networkGraph()) {
+  const visibleNodes = networkVisibleNodeCount(graph);
+  const prefix = visibleNodes + ' visible ' + plural(visibleNodes, 'node');
+  if (networkShowsFilesAndFunctions()) {
+    return prefix + ': ' + graph.fileNodes.length + ' '
+      + plural(graph.fileNodes.length, 'file') + ', '
+      + graph.functions.length + ' ' + plural(graph.functions.length, 'function') + ', '
+      + networkSemanticEdgeCount(graph) + ' ' + networkSemanticEdgeLabel(graph);
+  }
+  if (networkShowsFiles()) {
+    return prefix + ': ' + graph.fileNodes.length + ' '
+      + plural(graph.fileNodes.length, 'file') + ', '
+      + networkSemanticEdgeCount(graph) + ' ' + networkSemanticEdgeLabel(graph);
+  }
+  return prefix + ': ' + graph.functions.length + ' '
+    + plural(graph.functions.length, 'function') + ', '
+    + networkSemanticEdgeCount(graph) + ' ' + networkSemanticEdgeLabel(graph);
 }
 
 function networkHelpText() {
+  const scope = networkScopeRecord(activeNetworkScope);
+  const depth = networkDepthRecord(activeNetworkDepth);
+  if (activeNetworkScope === 'full') {
+    return 'Full scope shows the whole graph. Depth applies after choosing Dependencies, Parents, or Both.';
+  }
+  if (!hasNetworkSelection()) {
+    return 'Select a file or function to apply scope and depth. The full graph is shown until then.';
+  }
   if (networkShowsFilesAndFunctions()) {
-    return 'Drag to pan. Use the zoom buttons, pinch, or Ctrl/Cmd + wheel to zoom. Select a file to focus its children, or a function to inspect callers and source.';
+    return scope.statusLabel + ' · ' + depth.statusLabel
+      + ' filters the selected neighborhood. Select another file or function to move the focus.';
   }
   if (networkShowsFiles()) {
-    return 'Drag to pan. Use the zoom buttons, pinch, or Ctrl/Cmd + wheel to zoom. Select a file to see which files use it and which files it uses.';
+    return scope.statusLabel + ' · ' + depth.statusLabel
+      + ' filters file neighborhoods from the selected file.';
   }
-  return 'Drag to pan. Use the zoom buttons, pinch, or Ctrl/Cmd + wheel to zoom. Select a function in the graph to highlight who uses it and what it uses.';
+  return scope.statusLabel + ' · ' + depth.statusLabel
+    + ' filters function neighborhoods from the selected function.';
 }
 
 function renderNetworkNodeSwitch() {
@@ -773,6 +1129,32 @@ function renderNetworkNodeSwitch() {
       setNetworkNodeVisibility({ ...activeNetworkNodeVisibility, [mode.id]: !active });
     });
     networkNodeSwitchEl.appendChild(button);
+  }
+}
+
+function renderNetworkScopeSwitch() {
+  networkScopeSwitchEl.textContent = '';
+  for (const mode of networkScopeModes) {
+    const active = mode.id === activeNetworkScope;
+    const button = createElement('button', active ? 'is-active' : '', mode.label);
+    button.type = 'button';
+    button.setAttribute('aria-label', mode.accessibilityLabel);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    button.addEventListener('click', () => setNetworkScope(mode.id));
+    networkScopeSwitchEl.appendChild(button);
+  }
+}
+
+function renderNetworkDepthSwitch() {
+  networkDepthSwitchEl.textContent = '';
+  for (const mode of networkDepthModes) {
+    const active = mode.id === activeNetworkDepth;
+    const button = createElement('button', active ? 'is-active' : '', mode.label);
+    button.type = 'button';
+    button.setAttribute('aria-label', mode.accessibilityLabel);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    button.addEventListener('click', () => setNetworkDepth(mode.id));
+    networkDepthSwitchEl.appendChild(button);
   }
 }
 
@@ -871,6 +1253,33 @@ function setNetworkLayoutMode(modeId) {
   sendViewerBridgeState('switch-network-layout');
 }
 
+function setNetworkScope(scopeId) {
+  const nextScope = networkScopeRecord(scopeId).id;
+  if (nextScope === activeNetworkScope) return;
+  activeNetworkScope = nextScope;
+  persistNetworkScope(nextScope);
+  renderNetworkScopeSwitch();
+  renderNetworkDepthSwitch();
+  renderSelectedFunctionPanel();
+  layoutFunctionNetwork();
+  renderFunctionNetwork();
+  fitCurrentNetworkLayout();
+  sendViewerBridgeState('switch-network-scope');
+}
+
+function setNetworkDepth(depthId) {
+  const nextDepth = networkDepthRecord(depthId).id;
+  if (nextDepth === activeNetworkDepth) return;
+  activeNetworkDepth = nextDepth;
+  persistNetworkDepth(nextDepth);
+  renderNetworkDepthSwitch();
+  renderSelectedFunctionPanel();
+  layoutFunctionNetwork();
+  renderFunctionNetwork();
+  fitCurrentNetworkLayout();
+  sendViewerBridgeState('switch-network-depth');
+}
+
 function setNetworkNodeVisibility(nextVisibility, { reason = 'switch-node-levels', focusFilePath = '' } = {}) {
   const normalized = normalizeNetworkNodeVisibility(nextVisibility);
   const changed = normalized.files !== activeNetworkNodeVisibility.files
@@ -886,6 +1295,7 @@ function setNetworkNodeVisibility(nextVisibility, { reason = 'switch-node-levels
   }
   reconcileSelectionForNodeVisibility();
   renderNetworkNodeSwitch();
+  renderNetworkDepthSwitch();
   renderSelectedFunctionPanel();
   layoutFunctionNetwork();
   renderFunctionNetwork();
@@ -894,7 +1304,7 @@ function setNetworkNodeVisibility(nextVisibility, { reason = 'switch-node-levels
 }
 
 function moduleClusterCenters(fileOrder, width, height) {
-  const visibleFileOrder = fileOrder.filter((modulePath) => functions.some((node) => node.modulePath === modulePath));
+  const visibleFileOrder = fileOrder.filter((modulePath) => networkFunctions().some((node) => node.modulePath === modulePath));
   const centers = new Map();
   const centerX = width / 2;
   const centerY = height / 2;
@@ -1137,7 +1547,7 @@ function normalizeNetworkBounds(layoutNodes) {
 }
 
 function networkLineExtents() {
-  const lineCounts = functions.map(lineCountFor).filter((count) => count > 0);
+  const lineCounts = networkFunctions().map(lineCountFor).filter((count) => count > 0);
   return {
     minLines: lineCounts.length ? Math.min(...lineCounts) : 1,
     maxLines: lineCounts.length ? Math.max(...lineCounts) : 1,
@@ -1145,7 +1555,7 @@ function networkLineExtents() {
 }
 
 function networkFileMeasureExtents() {
-  const measures = fileNodes
+  const measures = networkFileNodes()
     .map((node) => compactCount(node.totalFunctionLines) || compactCount(node.functionCount))
     .filter((count) => count > 0);
   return {
@@ -1185,7 +1595,7 @@ function fileLayoutNode(node, x, y, { minMeasure, maxMeasure }, extra = {}) {
 
 function functionNodesByFile(fileOrder) {
   const nodesByFile = new Map(fileOrder.map((modulePath) => [modulePath, []]));
-  for (const node of functions) {
+  for (const node of networkFunctions()) {
     if (!nodesByFile.has(node.modulePath)) nodesByFile.set(node.modulePath, []);
     nodesByFile.get(node.modulePath).push(node);
   }
@@ -1194,16 +1604,20 @@ function functionNodesByFile(fileOrder) {
 }
 
 function layoutForceFunctionNetwork(fileOrder, lineExtents, fileExtents) {
+  const graphFunctions = networkFunctions();
+  const graphEdges = networkEdges();
+  const graphFileEdges = networkFileEdges();
+  const graphFileByPath = networkFileByPath();
   if (!networkShowsFiles()) {
-    const count = Math.max(1, functions.length);
+    const count = Math.max(1, graphFunctions.length);
     const width = Math.max(1040, Math.ceil(Math.sqrt(count) * 195));
     const height = Math.max(680, Math.ceil(Math.sqrt(count) * 155));
     const nodes = new Map();
     const clusterCenters = moduleClusterCenters(fileOrder, width, height);
 
-    functions.forEach((node, index) => {
+    graphFunctions.forEach((node, index) => {
       const cluster = clusterCenters.get(node.modulePath) || { x: width / 2, y: height / 2 };
-      const position = networkInitialPosition(node, index, functions.length, cluster, width, height);
+      const position = networkInitialPosition(node, index, graphFunctions.length, cluster, width, height);
       nodes.set(node.id, {
         ...networkLayoutNode(node, position.x, position.y, lineExtents),
         vx: 0,
@@ -1211,14 +1625,14 @@ function layoutForceFunctionNetwork(fileOrder, lineExtents, fileExtents) {
       });
     });
 
-    simulateForceLayout(nodes, edges, clusterCenters, width, height);
+    simulateForceLayout(nodes, graphEdges, clusterCenters, width, height);
     expandNetworkSpread(nodes);
     const bounds = normalizeNetworkBounds(nodes);
     networkLayout = { mode: 'network', width: bounds.width, height: bounds.height, nodes };
     return;
   }
 
-  const visibleFileOrder = fileOrder.filter((modulePath) => fileByPath.has(modulePath));
+  const visibleFileOrder = fileOrder.filter((modulePath) => graphFileByPath.has(modulePath));
   if (!networkShowsFunctions()) {
     const count = Math.max(1, visibleFileOrder.length);
     const width = Math.max(1120, Math.ceil(Math.sqrt(count) * 335));
@@ -1227,7 +1641,7 @@ function layoutForceFunctionNetwork(fileOrder, lineExtents, fileExtents) {
     const nodes = new Map();
 
     visibleFileOrder.forEach((modulePath, index) => {
-      const node = fileByPath.get(modulePath);
+      const node = graphFileByPath.get(modulePath);
       const cluster = clusterCenters.get(modulePath) || { x: width / 2, y: height / 2 };
       const position = networkInitialPosition(node, index, visibleFileOrder.length, cluster, width, height);
       nodes.set(node.id, {
@@ -1237,7 +1651,7 @@ function layoutForceFunctionNetwork(fileOrder, lineExtents, fileExtents) {
       });
     });
 
-    simulateForceLayout(nodes, fileEdges, clusterCenters, width, height, {
+    simulateForceLayout(nodes, graphFileEdges, clusterCenters, width, height, {
       repelScale: 1.35,
       clusterScale: 1.15,
       rectangleSeparationIterations: 60,
@@ -1249,14 +1663,14 @@ function layoutForceFunctionNetwork(fileOrder, lineExtents, fileExtents) {
     return;
   }
 
-  const count = Math.max(1, functions.length + visibleFileOrder.length);
+  const count = Math.max(1, graphFunctions.length + visibleFileOrder.length);
   const width = Math.max(1120, Math.ceil(Math.sqrt(count) * 185));
   const height = Math.max(760, Math.ceil(Math.sqrt(count) * 145));
   const nodes = new Map();
   const clusterCenters = moduleClusterCenters(fileOrder, width, height);
 
   visibleFileOrder.forEach((modulePath) => {
-    const fileNode = fileByPath.get(modulePath);
+    const fileNode = graphFileByPath.get(modulePath);
     const cluster = clusterCenters.get(modulePath) || { x: width / 2, y: height / 2 };
     nodes.set(fileNode.id, {
       ...fileLayoutNode(fileNode, cluster.x, cluster.y, fileExtents),
@@ -1265,12 +1679,12 @@ function layoutForceFunctionNetwork(fileOrder, lineExtents, fileExtents) {
     });
   });
 
-  functions.forEach((node, index) => {
+  graphFunctions.forEach((node, index) => {
     const cluster = clusterCenters.get(node.modulePath) || { x: width / 2, y: height / 2 };
-    const siblings = functionsForFile(node.modulePath);
+    const siblings = networkFunctionsForFile(node.modulePath);
     const siblingCount = siblings.length;
     const siblingIndex = siblings.findIndex((candidate) => candidate.id === node.id);
-    const position = networkInitialPosition(node, siblingIndex >= 0 ? siblingIndex : index, siblingCount || functions.length, cluster, width, height);
+    const position = networkInitialPosition(node, siblingIndex >= 0 ? siblingIndex : index, siblingCount || graphFunctions.length, cluster, width, height);
     nodes.set(node.id, {
       ...networkLayoutNode(node, position.x, position.y, lineExtents),
       vx: 0,
@@ -1278,13 +1692,14 @@ function layoutForceFunctionNetwork(fileOrder, lineExtents, fileExtents) {
     });
   });
 
-  simulateForceLayout(nodes, [...edges, ...membershipEdges()], clusterCenters, width, height);
+  simulateForceLayout(nodes, [...graphEdges, ...membershipEdges()], clusterCenters, width, height);
   expandNetworkSpread(nodes);
   const bounds = normalizeNetworkBounds(nodes);
   networkLayout = { mode: 'network', width: bounds.width, height: bounds.height, nodes };
 }
 
 function layoutByFileFunctionNetwork(fileOrder, lineExtents, fileExtents) {
+  const graphFileByPath = networkFileByPath();
   const nodesByFile = functionNodesByFile(fileOrder);
   const visibleFileOrder = fileOrder.filter((modulePath) => (nodesByFile.get(modulePath) || []).length > 0);
 
@@ -1314,7 +1729,7 @@ function layoutByFileFunctionNetwork(fileOrder, lineExtents, fileExtents) {
         width: laneWidth,
         height: laneHeight,
       });
-      const fileNode = fileByPath.get(modulePath);
+      const fileNode = graphFileByPath.get(modulePath);
       nodes.set(fileNode.id, fileLayoutNode(fileNode, x, y, fileExtents));
     });
 
@@ -1346,7 +1761,7 @@ function layoutByFileFunctionNetwork(fileOrder, lineExtents, fileExtents) {
         width: laneWidth,
         height: height - 68,
       });
-      const fileNode = fileByPath.get(modulePath);
+      const fileNode = graphFileByPath.get(modulePath);
       nodes.set(fileNode.id, fileLayoutNode(fileNode, x, hubY, fileExtents));
       const list = nodesByFile.get(modulePath) || [];
       list.forEach((node, index) => {
@@ -1402,10 +1817,12 @@ function sortedFunctionIds(ids) {
 }
 
 function radialGraphIndexes() {
-  const outgoing = new Map(functions.map((node) => [node.id, new Set()]));
-  const incoming = new Map(functions.map((node) => [node.id, new Set()]));
-  const undirected = new Map(functions.map((node) => [node.id, new Set()]));
-  for (const edge of edges) {
+  const graphFunctions = networkFunctions();
+  const graphEdges = networkEdges();
+  const outgoing = new Map(graphFunctions.map((node) => [node.id, new Set()]));
+  const incoming = new Map(graphFunctions.map((node) => [node.id, new Set()]));
+  const undirected = new Map(graphFunctions.map((node) => [node.id, new Set()]));
+  for (const edge of graphEdges) {
     if (!outgoing.has(edge.sourceId) || !outgoing.has(edge.targetId)) continue;
     outgoing.get(edge.sourceId).add(edge.targetId);
     incoming.get(edge.targetId).add(edge.sourceId);
@@ -1416,9 +1833,10 @@ function radialGraphIndexes() {
 }
 
 function connectedRadialComponents(undirected) {
-  const remaining = new Set(functions.map((node) => node.id));
+  const graphFunctions = networkFunctions();
+  const remaining = new Set(graphFunctions.map((node) => node.id));
   const components = [];
-  for (const node of functions) {
+  for (const node of graphFunctions) {
     if (!remaining.has(node.id)) continue;
     const component = [];
     const stack = [node.id];
@@ -1592,7 +2010,7 @@ function radialAngleFor(group, distance, index, count) {
 
 function layoutRadialFunctionNetwork(lineExtents) {
   const nodes = new Map();
-  if (functions.length === 0) {
+  if (networkFunctions().length === 0) {
     networkBaseWidth = 900;
     networkBaseHeight = 420;
     networkLayout = { mode: 'radial', width: networkBaseWidth, height: networkBaseHeight, nodes, center: { x: 450, y: 210 } };
@@ -1640,7 +2058,8 @@ function radialSectorForIndex(index, count) {
 }
 
 function layoutRadialFileNetwork(fileOrder, fileExtents) {
-  const visibleFileOrder = fileOrder.filter((modulePath) => fileByPath.has(modulePath));
+  const graphFileByPath = networkFileByPath();
+  const visibleFileOrder = fileOrder.filter((modulePath) => graphFileByPath.has(modulePath));
   const nodes = new Map();
   if (visibleFileOrder.length === 0) {
     networkBaseWidth = 900;
@@ -1659,7 +2078,7 @@ function layoutRadialFileNetwork(fileOrder, fileExtents) {
   visibleFileOrder.forEach((modulePath, index) => {
     const sector = radialSectorForIndex(index, count);
     const angle = (sector.startAngle + sector.endAngle) / 2;
-    const node = fileByPath.get(modulePath);
+    const node = graphFileByPath.get(modulePath);
     nodes.set(node.id, fileLayoutNode(
       node,
       center.x + Math.cos(angle) * radius,
@@ -1679,7 +2098,8 @@ function radialChildCapacity(sectorSpan, radius) {
 }
 
 function layoutRadialFileFunctionNetwork(fileOrder, lineExtents, fileExtents) {
-  const visibleFileOrder = fileOrder.filter((modulePath) => fileByPath.has(modulePath));
+  const graphFileByPath = networkFileByPath();
+  const visibleFileOrder = fileOrder.filter((modulePath) => graphFileByPath.has(modulePath));
   const nodesByFile = functionNodesByFile(fileOrder);
   const nodes = new Map();
   if (visibleFileOrder.length === 0) {
@@ -1722,7 +2142,7 @@ function layoutRadialFileFunctionNetwork(fileOrder, lineExtents, fileExtents) {
   visibleFileOrder.forEach((modulePath) => {
     const sector = sectors.get(modulePath);
     const angle = (sector.startAngle + sector.endAngle) / 2;
-    const fileNode = fileByPath.get(modulePath);
+    const fileNode = graphFileByPath.get(modulePath);
     nodes.set(fileNode.id, fileLayoutNode(
       fileNode,
       center.x + Math.cos(angle) * hubRadius,
@@ -1766,6 +2186,7 @@ function layoutRadialFileFunctionNetwork(fileOrder, lineExtents, fileExtents) {
 }
 
 function layoutFunctionNetwork() {
+  visibleNetworkGraph = computeVisibleNetworkGraph();
   const fileOrder = buildModuleOrder();
   assignFileColors(fileOrder);
   renderFileLegend(fileOrder);
@@ -1993,7 +2414,11 @@ function addKeyboardActivation(element, callback) {
 
 function renderFunctionNetwork() {
   networkSvgEl.textContent = '';
-  if (!networkLayout || functions.length === 0) {
+  const graph = networkGraph();
+  const hasRenderableNodes = networkShowsFunctions()
+    ? graph.functions.length > 0
+    : graph.fileNodes.length > 0;
+  if (!networkLayout || !hasRenderableNodes) {
     networkSvgEl.setAttribute('viewBox', '0 0 900 420');
     const message = createSvgElement('text', {
       x: 36,
@@ -2083,7 +2508,7 @@ function renderFunctionNetwork() {
   networkSvgEl.appendChild(membershipGroup);
 
   const edgeGroup = createSvgElement('g', { class: 'network-edges' });
-  const visibleCallEdges = networkShowsFunctions() ? edges : fileEdges;
+  const visibleCallEdges = networkUsesFileSemanticEdges() ? networkFileEdges() : networkEdges();
   for (const edge of visibleCallEdges) {
     const path = edgePath(edge);
     if (!path) continue;
@@ -2288,6 +2713,31 @@ function scrollFileIntoView(modulePath) {
   networkViewportEl.scrollLeft = Math.max(0, (layoutNode.x * networkZoom) - networkViewportEl.clientWidth / 2);
   networkViewportEl.scrollTop = Math.max(0, (layoutNode.y * networkZoom) - networkViewportEl.clientHeight / 2);
   return true;
+}
+
+function layoutNodeIsVisible(layoutNode, padding = 72) {
+  if (!layoutNode) return false;
+  const x = layoutNode.x * networkZoom;
+  const y = layoutNode.y * networkZoom;
+  return x >= networkViewportEl.scrollLeft + padding
+    && x <= networkViewportEl.scrollLeft + networkViewportEl.clientWidth - padding
+    && y >= networkViewportEl.scrollTop + padding
+    && y <= networkViewportEl.scrollTop + networkViewportEl.clientHeight - padding;
+}
+
+function scrollLayoutNodeIntoViewIfNeeded(layoutNode, { force = false } = {}) {
+  if (!layoutNode) return false;
+  if (!force && layoutNodeIsVisible(layoutNode)) return true;
+  networkViewportEl.scrollLeft = Math.max(0, (layoutNode.x * networkZoom) - networkViewportEl.clientWidth / 2);
+  networkViewportEl.scrollTop = Math.max(0, (layoutNode.y * networkZoom) - networkViewportEl.clientHeight / 2);
+  return true;
+}
+
+function scrollSelectionIntoViewIfNeeded({ force = false } = {}) {
+  const layoutNode = selectedFunctionId
+    ? networkLayout?.nodes.get(selectedFunctionId)
+    : (selectedFilePath ? networkLayout?.nodes.get(fileNodeId(selectedFilePath)) : null);
+  return scrollLayoutNodeIntoViewIfNeeded(layoutNode, { force });
 }
 
 function hasClass(element, className) {
@@ -3531,30 +3981,25 @@ function updateNetworkHighlights() {
   }
 
   const modeLabel = graphStatusLabel(networkLayout?.mode);
+  const graph = networkGraph();
+  const visibleSummary = networkVisibleSummary(graph);
   if (selectedNode) {
     const usedBy = incomingEdges.length;
     const uses = outgoingEdges.length + externalRelationshipsForNode(selectedNode).length;
-    latestFunctionGraphStatus = modeLabel + ': selected ' + displayName(selectedNode) + ': '
+    latestFunctionGraphStatus = modeLabel + ': selected ' + displayName(selectedNode) + '; '
+      + visibleSummary + '; '
       + usedBy + ' ' + plural(usedBy, 'function') + ' use it; it uses ' + uses + '.';
   } else if (selectedFile) {
     const usedBy = safeArray(fileEdgesByTargetPath.get(selectedFile.modulePath)).length;
     const uses = safeArray(fileEdgesBySourcePath.get(selectedFile.modulePath)).length;
-    latestFunctionGraphStatus = modeLabel + ': selected ' + selectedFile.modulePath + ': '
+    latestFunctionGraphStatus = modeLabel + ': selected ' + selectedFile.modulePath + '; '
+      + visibleSummary + '; '
       + compactCount(selectedFile.functionCount) + ' '
       + plural(compactCount(selectedFile.functionCount), 'function') + '; '
       + usedBy + ' ' + plural(usedBy, 'file') + ' use it; it uses '
       + uses + ' ' + plural(uses, 'file') + '.';
   } else {
-    if (networkShowsFilesAndFunctions()) {
-      latestFunctionGraphStatus = modeLabel + ': ' + fileNodes.length + ' files, '
-        + functions.length + ' functions, ' + edges.length + ' saved function links.';
-    } else if (networkShowsFiles()) {
-      latestFunctionGraphStatus = modeLabel + ': ' + fileNodes.length + ' files, '
-        + fileEdges.length + ' aggregated file links.';
-    } else {
-      latestFunctionGraphStatus = modeLabel + ': ' + functions.length + ' functions, '
-        + edges.length + ' saved function links.';
-    }
+    latestFunctionGraphStatus = modeLabel + ': ' + visibleSummary + '.';
   }
   updateVisualizationStatus();
 }
@@ -3567,6 +4012,12 @@ function setRelationFilter(filterId) {
   sendViewerBridgeState('focus-relationships');
 }
 
+function refreshNetworkForSelection({ forceScroll = false } = {}) {
+  layoutFunctionNetwork();
+  renderFunctionNetwork();
+  requestAnimationFrame(() => scrollSelectionIntoViewIfNeeded({ force: Boolean(forceScroll) }));
+}
+
 function selectFunction(functionId, { reason = 'select-function', restoreFocusEl = null, scroll = false } = {}) {
   if (!functionById.has(functionId)) return false;
   selectedFunctionId = functionId;
@@ -3575,8 +4026,7 @@ function selectFunction(functionId, { reason = 'select-function', restoreFocusEl
     activeRelationFilter = 'all';
   }
   renderSelectedFunctionPanel();
-  updateNetworkHighlights();
-  if (scroll) scrollFunctionIntoView(functionId);
+  refreshNetworkForSelection({ forceScroll: Boolean(scroll) });
   if (restoreFocusEl) sourceDialogRestoreFocusEl = restoreFocusEl;
   sendViewerBridgeState(reason);
   return true;
@@ -3588,8 +4038,7 @@ function selectFile(modulePath, { reason = 'select-file', restoreFocusEl = null,
   selectedFunctionId = '';
   activeRelationFilter = 'all';
   renderSelectedFunctionPanel();
-  updateNetworkHighlights();
-  if (scroll) scrollFileIntoView(modulePath);
+  refreshNetworkForSelection({ forceScroll: Boolean(scroll) });
   if (restoreFocusEl) sourceDialogRestoreFocusEl = restoreFocusEl;
   sendViewerBridgeState(reason);
   return true;
@@ -3600,7 +4049,7 @@ function clearSelection() {
   selectedFilePath = '';
   activeRelationFilter = 'all';
   renderSelectedFunctionPanel();
-  updateNetworkHighlights();
+  refreshNetworkForSelection();
   sendViewerBridgeState('clear-selection');
 }
 
@@ -3905,16 +4354,58 @@ function declarationSnapshotForFunctionId(functionId) {
   };
 }
 
+function fileSnapshotForModulePath(modulePath) {
+  const node = fileByPath.get(modulePath);
+  if (!node) return null;
+  return {
+    fileId: node.id,
+    fileStableId: node.stableId || node.id,
+    modulePath: node.modulePath,
+    path: node.path || node.modulePath,
+    name: node.name || fileName(node.modulePath),
+    functionCount: compactCount(node.functionCount),
+    totalFunctionLines: compactCount(node.totalFunctionLines),
+  };
+}
+
+function currentGraphPresentationState() {
+  const graph = networkGraph();
+  return {
+    primaryView: activePrimaryView,
+    layout: activeNetworkLayoutMode,
+    nodeVisibility: { ...activeNetworkNodeVisibility },
+    scope: activeNetworkScope,
+    depth: activeNetworkDepth,
+    selectedFunction: declarationSnapshotForFunctionId(selectedFunctionId),
+    selectedFile: fileSnapshotForModulePath(selectedFilePath),
+    visible: {
+      filtered: Boolean(graph.filtered),
+      files: graph.fileNodes.length,
+      functions: graph.functions.length,
+      functionEdges: graph.edges.length,
+      fileEdges: graph.fileEdges.length,
+    },
+  };
+}
+
 function currentViewerState(reason) {
   return {
     clientId: viewerBridge.clientId,
     revision: ++viewerBridge.stateRevision,
     reason,
     snapshot: viewerBridge.snapshot,
+    primaryView: activePrimaryView,
+    graph: currentGraphPresentationState(),
+    selectedFunction: declarationSnapshotForFunctionId(selectedFunctionId),
+    selectedFile: fileSnapshotForModulePath(selectedFilePath),
     openSource: declarationSnapshotForFunctionId(sourceDialogState.functionId),
     highlighted: declarationSnapshotForFunctionId(selectedFunctionId),
     viewport: {
       layout: activeNetworkLayoutMode,
+      primaryView: activePrimaryView,
+      nodeVisibility: { ...activeNetworkNodeVisibility },
+      scope: activeNetworkScope,
+      depth: activeNetworkDepth,
       zoom: networkZoom,
       scrollLeft: networkViewportEl.scrollLeft,
       scrollTop: networkViewportEl.scrollTop,
@@ -3953,8 +4444,110 @@ function functionIdForViewerCommand(command = {}) {
   ))?.id || '';
 }
 
+function hasCommandField(command, fieldName) {
+  return Object.prototype.hasOwnProperty.call(command, fieldName);
+}
+
+function commandBooleanValue(command, fieldName) {
+  if (!hasCommandField(command, fieldName)) return null;
+  return typeof command[fieldName] === 'boolean' ? command[fieldName] : null;
+}
+
+function commandScopeValue(command = {}) {
+  if (hasCommandField(command, 'scope')) return command.scope;
+  if (hasCommandField(command, 'direction')) return command.direction;
+  return null;
+}
+
+function commandDepthValue(command = {}) {
+  if (hasCommandField(command, 'depth')) return command.depth;
+  if (hasCommandField(command, 'hops')) return command.hops;
+  return null;
+}
+
+function applyGraphViewCommand(command = {}) {
+  let primaryChanged = false;
+  let graphChanged = false;
+  let controlsChanged = false;
+
+  if (hasCommandField(command, 'primaryView')) {
+    const nextPrimaryView = primaryViewRecord(command.primaryView).id;
+    if (nextPrimaryView !== activePrimaryView) {
+      activePrimaryView = nextPrimaryView;
+      persistPrimaryViewMode(nextPrimaryView);
+      primaryChanged = true;
+    }
+  }
+
+  if (hasCommandField(command, 'layout')) {
+    const nextLayout = networkLayoutModeRecord(command.layout).id;
+    if (nextLayout !== activeNetworkLayoutMode) {
+      activeNetworkLayoutMode = nextLayout;
+      persistNetworkLayoutMode(nextLayout);
+      graphChanged = true;
+      controlsChanged = true;
+    }
+  }
+
+  const nextScopeValue = commandScopeValue(command);
+  if (nextScopeValue !== null) {
+    const nextScope = networkScopeRecord(nextScopeValue).id;
+    if (nextScope !== activeNetworkScope) {
+      activeNetworkScope = nextScope;
+      persistNetworkScope(nextScope);
+      graphChanged = true;
+      controlsChanged = true;
+    }
+  }
+
+  const nextDepthValue = commandDepthValue(command);
+  if (nextDepthValue !== null) {
+    const nextDepth = networkDepthRecord(nextDepthValue).id;
+    if (nextDepth !== activeNetworkDepth) {
+      activeNetworkDepth = nextDepth;
+      persistNetworkDepth(nextDepth);
+      graphChanged = true;
+      controlsChanged = true;
+    }
+  }
+
+  const showFiles = commandBooleanValue(command, 'showFiles');
+  const showFunctions = commandBooleanValue(command, 'showFunctions');
+  if (showFiles !== null || showFunctions !== null) {
+    const nextVisibility = normalizeNetworkNodeVisibility({
+      files: showFiles === null ? activeNetworkNodeVisibility.files : showFiles,
+      functions: showFunctions === null ? activeNetworkNodeVisibility.functions : showFunctions,
+    });
+    if (nextVisibility.files !== activeNetworkNodeVisibility.files
+      || nextVisibility.functions !== activeNetworkNodeVisibility.functions) {
+      activeNetworkNodeVisibility = nextVisibility;
+      persistNetworkNodeVisibility(nextVisibility);
+      graphChanged = true;
+      controlsChanged = true;
+    }
+  }
+
+  if (controlsChanged) {
+    reconcileSelectionForNodeVisibility();
+    renderNetworkLayoutSwitch();
+    renderNetworkNodeSwitch();
+    renderNetworkScopeSwitch();
+    renderNetworkDepthSwitch();
+    renderSelectedFunctionPanel();
+    layoutFunctionNetwork();
+    renderFunctionNetwork();
+  }
+
+  if (primaryChanged) applyPrimaryViewMode();
+  if (graphChanged) fitCurrentNetworkLayout();
+  if (!primaryChanged && !graphChanged) updateVisualizationStatus();
+  sendViewerBridgeState('set-graph-view');
+  return { applied: true, message: graphChanged || primaryChanged ? 'graph view updated' : 'graph view unchanged' };
+}
+
 function applyViewerBridgeCommand(command = {}) {
   const type = String(command.type || command.command || '').trim();
+  if (type === 'setGraphView') return applyGraphViewCommand(command);
   if (type === 'clearHighlight') {
     clearSourceHighlight();
     clearSelection();
@@ -4362,6 +4955,8 @@ async function main() {
   activePrimaryView = loadPrimaryViewMode();
   activeNetworkLayoutMode = loadNetworkLayoutMode();
   activeNetworkNodeVisibility = loadNetworkNodeVisibility();
+  activeNetworkScope = loadNetworkScope();
+  activeNetworkDepth = loadNetworkDepth();
   rawRenderText();
   subtitleEl.textContent = (outputPayload.entry || 'unknown entry') + '  |  ' + (outputPayload.rootDir || 'unknown root');
   buildMetaEl.textContent = formatBuildMeta(outputPayload.meta);
@@ -4369,6 +4964,8 @@ async function main() {
   applyPrimaryViewMode();
   renderNetworkLayoutSwitch();
   renderNetworkNodeSwitch();
+  renderNetworkScopeSwitch();
+  renderNetworkDepthSwitch();
   renderSelectedFunctionPanel();
   layoutFunctionNetwork();
   renderFunctionNetwork();

@@ -31,7 +31,17 @@ const VIEWER_COMMAND_TYPES = new Set([
   'highlightFunction',
   'scrollToFunction',
   'clearHighlight',
+  'setGraphView',
 ]);
+const VIEWER_PRIMARY_VIEW_VALUES = new Set(['function-graphs', 'jsx-map']);
+const VIEWER_GRAPH_LAYOUT_VALUES = new Set(['network', 'radial', 'by-file']);
+const VIEWER_GRAPH_SCOPE_VALUES = new Set(['full', 'dependencies', 'parents', 'both']);
+const VIEWER_LEGACY_GRAPH_DIRECTION_ALIASES = new Map([
+  ['both', 'both'],
+  ['uses', 'dependencies'],
+  ['used-by', 'parents'],
+]);
+const VIEWER_GRAPH_DEPTH_VALUES = new Set(['1', '2', '3', 'all']);
 const PAGINATION_QUERY_PARAMS = ['limit', 'offset'];
 const MODULE_LIST_QUERY_PARAMS = [
   'search', 'q', 'extension', 'reachable', 'jsx', 'sort', 'order', 'fields', ...PAGINATION_QUERY_PARAMS,
@@ -1152,6 +1162,10 @@ function updateBridgeViewerState(bridge, payload = {}) {
       receivedAt: new Date().toISOString(),
       reason: normalizeString(payload.reason).trim() || null,
       snapshot: payload.snapshot && typeof payload.snapshot === 'object' ? payload.snapshot : null,
+      primaryView: normalizeString(payload.primaryView).trim() || null,
+      graph: payload.graph && typeof payload.graph === 'object' ? payload.graph : null,
+      selectedFunction: payload.selectedFunction && typeof payload.selectedFunction === 'object' ? payload.selectedFunction : null,
+      selectedFile: payload.selectedFile && typeof payload.selectedFile === 'object' ? payload.selectedFile : null,
       openSource: payload.openSource && typeof payload.openSource === 'object' ? payload.openSource : null,
       highlighted: payload.highlighted && typeof payload.highlighted === 'object' ? payload.highlighted : null,
       viewport: payload.viewport && typeof payload.viewport === 'object' ? payload.viewport : null,
@@ -1165,6 +1179,71 @@ function updateBridgeViewerState(bridge, payload = {}) {
   };
 }
 
+function validateViewerEnumCommandValue(command, fieldName, allowedValues) {
+  if (!Object.prototype.hasOwnProperty.call(command, fieldName)) return;
+  const value = normalizeString(command[fieldName]).trim();
+  if (!allowedValues.has(value)) {
+    throw apiError(
+      400,
+      'invalid_bridge_command',
+      `${fieldName} must be one of: ${Array.from(allowedValues).sort(compareLocale).join(', ')}.`,
+    );
+  }
+  command[fieldName] = value;
+}
+
+function validateViewerBooleanCommandValue(command, fieldName) {
+  if (!Object.prototype.hasOwnProperty.call(command, fieldName)) return;
+  if (typeof command[fieldName] !== 'boolean') {
+    throw apiError(400, 'invalid_bridge_command', `${fieldName} must be a boolean.`);
+  }
+}
+
+function normalizeViewerEnumCommandAlias(command, aliasField, canonicalField, allowedValues, aliases = null) {
+  if (!Object.prototype.hasOwnProperty.call(command, aliasField)) return;
+  const aliasValue = normalizeString(command[aliasField]).trim();
+  const value = aliases ? aliases.get(aliasValue) : aliasValue;
+  if (!allowedValues.has(value)) {
+    throw apiError(
+      400,
+      'invalid_bridge_command',
+      `${aliasField} must be one of: ${Array.from(aliases ? aliases.keys() : allowedValues).sort(compareLocale).join(', ')}.`,
+    );
+  }
+  if (Object.prototype.hasOwnProperty.call(command, canonicalField)) {
+    const canonicalValue = normalizeString(command[canonicalField]).trim();
+    if (canonicalValue !== value) {
+      throw apiError(
+        400,
+        'invalid_bridge_command',
+        `${aliasField} conflicts with ${canonicalField}.`,
+      );
+    }
+  }
+  command[canonicalField] = value;
+  delete command[aliasField];
+}
+
+function validateSetGraphViewCommand(command) {
+  normalizeViewerEnumCommandAlias(
+    command,
+    'direction',
+    'scope',
+    VIEWER_GRAPH_SCOPE_VALUES,
+    VIEWER_LEGACY_GRAPH_DIRECTION_ALIASES,
+  );
+  normalizeViewerEnumCommandAlias(command, 'hops', 'depth', VIEWER_GRAPH_DEPTH_VALUES);
+  validateViewerEnumCommandValue(command, 'primaryView', VIEWER_PRIMARY_VIEW_VALUES);
+  validateViewerEnumCommandValue(command, 'layout', VIEWER_GRAPH_LAYOUT_VALUES);
+  validateViewerEnumCommandValue(command, 'scope', VIEWER_GRAPH_SCOPE_VALUES);
+  validateViewerEnumCommandValue(command, 'depth', VIEWER_GRAPH_DEPTH_VALUES);
+  validateViewerBooleanCommandValue(command, 'showFiles');
+  validateViewerBooleanCommandValue(command, 'showFunctions');
+  if (command.showFiles === false && command.showFunctions === false) {
+    throw apiError(400, 'invalid_bridge_command', 'showFiles and showFunctions cannot both be false.');
+  }
+}
+
 function queueBridgeCommand(bridge, payload = {}) {
   const rawCommand = payload.command && typeof payload.command === 'object' ? payload.command : payload;
   const type = normalizeString(rawCommand.type || rawCommand.command).trim();
@@ -1176,6 +1255,7 @@ function queueBridgeCommand(bridge, payload = {}) {
     type,
   };
   delete command.command;
+  if (type === 'setGraphView') validateSetGraphViewCommand(command);
   const record = {
     commandId: normalizeString(payload.commandId).trim() || `vcmd_${++bridge.commandOrdinal}`,
     revision: ++bridge.commandRevision,

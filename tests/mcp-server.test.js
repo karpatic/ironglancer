@@ -90,6 +90,7 @@ test('ironglancer MCP server exposes saved function placement tools over newline
       'ironglancer_run_summary',
       'ironglancer_search_functions',
       'ironglancer_get_function',
+      'ironglancer_function_neighborhood',
       'ironglancer_investigate_function_placement',
       'ironglancer_source_excerpt',
       'ironglancer_viewer_state',

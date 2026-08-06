@@ -495,6 +495,8 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.match(html, /id="jsx-map-view"/);
   assert.match(html, /id="function-network-viewport"/);
   assert.match(html, /id="function-network-svg"/);
+  assert.match(html, /id="network-scope-switch"/);
+  assert.match(html, /id="network-depth-switch"/);
   assert.match(html, /id="selected-function"/);
   assert.match(html, />Function Details</);
   assert.match(html, />Project Snapshot</);

@@ -674,6 +674,13 @@ test('viewer bridge stores structured state and presentation command acknowledge
         revision: 1,
         reason: 'ready',
         snapshot: { buildId: discovery.body.data.snapshot.buildId },
+        primaryView: 'function-graphs',
+        graph: {
+          layout: 'network',
+          nodeVisibility: { files: false, functions: true },
+          scope: 'dependencies',
+          depth: '2',
+        },
         openSource: {
           functionStableId: 'fn_test',
           modulePath: 'src/app.jsx',
@@ -720,6 +727,9 @@ test('viewer bridge stores structured state and presentation command acknowledge
 
     const state = await fetchJson('/bridge/v1/state');
     assert.equal(state.body.data.latestState.clientId, 'viewer-test');
+    assert.equal(state.body.data.latestState.primaryView, 'function-graphs');
+    assert.equal(state.body.data.latestState.graph.scope, 'dependencies');
+    assert.equal(state.body.data.latestState.graph.depth, '2');
     assert.equal(state.body.data.acknowledgements.at(-1).commandId, queuedBody.data.command.commandId);
   } finally {
     activeHandler = null;

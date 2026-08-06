@@ -37,12 +37,14 @@ Standalone agent
 - run the packaged MCP server over that immutable saved analysis: `ironglancer-mcp --analysis-dir ./ironglancer-site`
 - Hermes example: `hermes mcp add ironglancer --command ironglancer-mcp --args --analysis-dir /absolute/path/to/ironglancer-site`
 - the MCP server does not need a browser or running viewer for analysis tools
-- MCP tools: `ironglancer_run_summary`, `ironglancer_search_functions`, `ironglancer_get_function`, `ironglancer_investigate_function_placement`, `ironglancer_source_excerpt`, `ironglancer_viewer_state`, `ironglancer_viewer_command`
+- MCP tools: `ironglancer_run_summary`, `ironglancer_search_functions`, `ironglancer_get_function`, `ironglancer_function_neighborhood`, `ironglancer_investigate_function_placement`, `ironglancer_source_excerpt`, `ironglancer_viewer_state`, `ironglancer_viewer_command`
 
 Connected Hermes + viewer
 - start the localhost viewer/API/bridge: `ironglancer ./my-app --entry src/app.jsx --out ./ironglancer-site --serve --host 127.0.0.1 --port 4173`
 - add Hermes with bridge access: `hermes mcp add ironglancer --command ironglancer-mcp --args --analysis-dir /absolute/path/to/ironglancer-site --bridge-url http://127.0.0.1:4173/bridge/v1`
-- MCP analysis tools read saved data directly; viewer tools only read structured viewer state or queue presentation commands such as `focusFunction`, `openFunction`, `highlightFunction`, `scrollToFunction`, and `clearHighlight`
+- MCP analysis tools read saved data directly; `ironglancer_function_neighborhood` supports multi-hop `dependencies`, `users`, or `both` reasoning without a viewer
+- viewer tools only read structured viewer state or queue presentation commands such as `focusFunction`, `openFunction`, `highlightFunction`, `scrollToFunction`, `clearHighlight`, and `setGraphView`
+- `/bridge/v1` viewer state includes the primary view, graph layout, node visibility, scope, depth, and selected function/file when a viewer is connected
 - `/bridge/v1` is localhost-first and unauthenticated by design; do not bind the server to an untrusted network if you use bridge commands
 
 Library usage
