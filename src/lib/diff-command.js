@@ -306,31 +306,90 @@ function assertNoOutputCollision(outPath, sarifPath, { baselinePath, suppression
   }
 }
 
-async function canonicalExistingPath(filePath) {
+async function canonicalFilesystemIdentity(filePath) {
   if (!filePath) return null;
-  try {
-    return await fs.realpath(filePath);
-  } catch (error) {
-    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return null;
-    throw new SnapshotDiffError(
-      'Unable to inspect a diff review input or report output path.',
-      'review_path_inspection_failed',
-    );
+  const absolutePath = path.resolve(filePath);
+  let probePath = absolutePath;
+  const missingSegments = [];
+
+  while (true) {
+    try {
+      const canonicalBase = await fs.realpath(probePath);
+      const canonicalPath = path.join(canonicalBase, ...missingSegments);
+      let stats = null;
+      try {
+        stats = await fs.stat(absolutePath);
+      } catch (error) {
+        if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
+      }
+      return {
+        canonicalPath,
+        device: stats?.dev ?? null,
+        inode: stats?.ino ?? null,
+      };
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') {
+        throw new SnapshotDiffError(
+          'Unable to inspect a diff review input or report output path.',
+          'review_path_inspection_failed',
+        );
+      }
+      const parentPath = path.dirname(probePath);
+      if (parentPath === probePath) {
+        throw new SnapshotDiffError(
+          'Unable to resolve a diff review input or report output path.',
+          'review_path_inspection_failed',
+        );
+      }
+      missingSegments.unshift(path.basename(probePath));
+      probePath = parentPath;
+    }
   }
 }
 
-async function assertNoFilesystemOutputCollision(outPath, sarifPath, { baselinePath, suppressionsPath } = {}) {
-  const [resolvedOutPath, resolvedSarifPath, resolvedBaselinePath, resolvedSuppressionsPath] = await Promise.all([
-    canonicalExistingPath(outPath),
-    canonicalExistingPath(sarifPath),
-    canonicalExistingPath(baselinePath),
-    canonicalExistingPath(suppressionsPath),
+function sameFilesystemIdentity(left, right) {
+  if (!left || !right) return false;
+  if (left.canonicalPath === right.canonicalPath) return true;
+  return left.device !== null
+    && right.device !== null
+    && left.device === right.device
+    && left.inode === right.inode;
+}
+
+async function assertNoFilesystemOutputCollision(outPath, sarifPath, {
+  baselinePath,
+  suppressionsPath,
+  snapshotPaths = [],
+} = {}) {
+  const [outIdentity, sarifIdentity, baselineIdentity, suppressionsIdentity, ...snapshotIdentities] = await Promise.all([
+    canonicalFilesystemIdentity(outPath),
+    canonicalFilesystemIdentity(sarifPath),
+    canonicalFilesystemIdentity(baselinePath),
+    canonicalFilesystemIdentity(suppressionsPath),
+    ...snapshotPaths.map((snapshotPath) => canonicalFilesystemIdentity(snapshotPath)),
   ]);
-  const reportPaths = new Set([resolvedOutPath, resolvedSarifPath].filter(Boolean));
-  if ([resolvedBaselinePath, resolvedSuppressionsPath].filter(Boolean).some((filePath) => reportPaths.has(filePath))) {
+  if (sameFilesystemIdentity(outIdentity, sarifIdentity)) {
+    throw new SnapshotDiffError(
+      'Diff --out and --sarif must not point to the same filesystem entry.',
+      'output_alias_collision',
+    );
+  }
+  const reportIdentities = [outIdentity, sarifIdentity].filter(Boolean);
+  const reviewInputIdentities = [baselineIdentity, suppressionsIdentity].filter(Boolean);
+  if (reviewInputIdentities.some((inputIdentity) => (
+    reportIdentities.some((reportIdentity) => sameFilesystemIdentity(inputIdentity, reportIdentity))
+  ))) {
     throw new SnapshotDiffError(
       'Diff review input and report output must not point to the same filesystem entry.',
       'review_input_output_alias',
+    );
+  }
+  if (snapshotIdentities.filter(Boolean).some((inputIdentity) => (
+    reportIdentities.some((reportIdentity) => sameFilesystemIdentity(inputIdentity, reportIdentity))
+  ))) {
+    throw new SnapshotDiffError(
+      'Diff snapshot input and report output must not point to the same filesystem entry.',
+      'snapshot_input_output_alias',
     );
   }
 }
@@ -447,6 +506,11 @@ export async function createArchitectureDiff({
     loadSnapshotInput({ folder, input: base, entry, routeAliases, generatedAt }),
     loadSnapshotInput({ folder, input: head, entry, routeAliases, generatedAt }),
   ]);
+  await assertNoFilesystemOutputCollision(effectiveOutPath, sarifPath, {
+    baselinePath,
+    suppressionsPath,
+    snapshotPaths: [baseInput.snapshotPath, headInput.snapshotPath].filter(Boolean),
+  });
   const diff = compareSnapshots(baseInput.snapshot, headInput.snapshot, {
     baseLabel: baseInput.label,
     headLabel: headInput.label,

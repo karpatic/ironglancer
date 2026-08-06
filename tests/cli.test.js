@@ -790,6 +790,100 @@ test('cli diff rejects unsupported formats and output path collisions', async ()
     /review input and report output must not point to the same filesystem entry/,
   );
   assert.equal(await fs.readFile(aliasedBaselineTarget, 'utf8'), aliasedBaselineBefore);
+
+  const realOutputDir = path.join(tempDir, 'real-output-dir');
+  const aliasOutputDir = path.join(tempDir, 'alias-output-dir');
+  await fs.mkdir(realOutputDir);
+  await fs.symlink(realOutputDir, aliasOutputDir);
+  await assert.rejects(
+    runCli([
+      'diff',
+      '--base',
+      basePath,
+      '--head',
+      headPath,
+      '--format',
+      'json',
+      '--out',
+      path.join(realOutputDir, 'same-report.json'),
+      '--sarif',
+      path.join(aliasOutputDir, 'same-report.json'),
+    ], { stdout: memoryStream() }),
+    /out and --sarif must not point to the same filesystem entry/,
+  );
+  assert.equal(await fs.stat(path.join(realOutputDir, 'same-report.json')).then(() => true, () => false), false);
+
+  const hardlinkOutPath = path.join(tempDir, 'hardlink-out.json');
+  const hardlinkSarifPath = path.join(tempDir, 'hardlink-sarif.json');
+  await writeText(hardlinkOutPath, 'original hardlink report\n');
+  await fs.link(hardlinkOutPath, hardlinkSarifPath);
+  await assert.rejects(
+    runCli([
+      'diff',
+      '--base',
+      basePath,
+      '--head',
+      headPath,
+      '--format',
+      'json',
+      '--out',
+      hardlinkOutPath,
+      '--sarif',
+      hardlinkSarifPath,
+    ], { stdout: memoryStream() }),
+    /out and --sarif must not point to the same filesystem entry/,
+  );
+  assert.equal(await fs.readFile(hardlinkOutPath, 'utf8'), 'original hardlink report\n');
+  assert.equal(await fs.readFile(hardlinkSarifPath, 'utf8'), 'original hardlink report\n');
+
+  const realSnapshotDir = path.join(tempDir, 'real-snapshot-dir');
+  const aliasSnapshotDir = path.join(tempDir, 'alias-snapshot-dir');
+  const protectedSnapshotPath = path.join(realSnapshotDir, 'protected-base.json');
+  await fs.mkdir(realSnapshotDir);
+  await fs.symlink(realSnapshotDir, aliasSnapshotDir);
+  await writeJson(protectedSnapshotPath, diffSnapshot({ label: 'protected', modules: [] }));
+  const protectedSnapshotBefore = await fs.readFile(protectedSnapshotPath, 'utf8');
+  const aliasedSnapshotOutput = path.join(aliasSnapshotDir, 'protected-base.json');
+  const snapshotCollisionCases = [
+    ['--format', 'json', '--out', aliasedSnapshotOutput],
+    ['--format', 'html', '--out', aliasedSnapshotOutput],
+    ['--format', 'json', '--sarif', aliasedSnapshotOutput],
+  ];
+  for (const outputArgs of snapshotCollisionCases) {
+    await assert.rejects(
+      runCli([
+        'diff',
+        '--base',
+        protectedSnapshotPath,
+        '--head',
+        headPath,
+        ...outputArgs,
+      ], { stdout: memoryStream() }),
+      /snapshot input and report output must not point to the same filesystem entry/,
+    );
+    assert.equal(await fs.readFile(protectedSnapshotPath, 'utf8'), protectedSnapshotBefore);
+  }
+
+  const hardlinkSnapshotInput = path.join(tempDir, 'hardlink-snapshot-input.json');
+  const hardlinkSnapshotOutput = path.join(tempDir, 'hardlink-snapshot-output.json');
+  await writeJson(hardlinkSnapshotInput, diffSnapshot({ label: 'hardlink-protected', modules: [] }));
+  await fs.link(hardlinkSnapshotInput, hardlinkSnapshotOutput);
+  const hardlinkSnapshotBefore = await fs.readFile(hardlinkSnapshotInput, 'utf8');
+  await assert.rejects(
+    runCli([
+      'diff',
+      '--base',
+      hardlinkSnapshotInput,
+      '--head',
+      headPath,
+      '--format',
+      'json',
+      '--out',
+      hardlinkSnapshotOutput,
+    ], { stdout: memoryStream() }),
+    /snapshot input and report output must not point to the same filesystem entry/,
+  );
+  assert.equal(await fs.readFile(hardlinkSnapshotInput, 'utf8'), hardlinkSnapshotBefore);
 });
 
 test('cli diff rejects non-JSON review config files without leaking absolute paths', async () => {

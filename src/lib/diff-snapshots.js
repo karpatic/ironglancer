@@ -443,6 +443,11 @@ function normalizeSnapshot(rawSnapshot, role) {
     throw new SnapshotDiffError(`${role} snapshot contains an import edge without sourcePath or targetPath.`, 'malformed_snapshot');
   }
 
+  const entry = normalizeString(rawSnapshot.entry || meta.entry).trim() || null;
+  if (entry && !isValidSnapshotPath(entry)) {
+    throw new SnapshotDiffError(`${role} snapshot contains a malformed snapshot entry path.`, 'invalid_snapshot');
+  }
+
   validateSnapshotIdentity({
     role,
     rawSnapshot,
@@ -453,7 +458,7 @@ function normalizeSnapshot(rawSnapshot, role) {
   });
 
   return {
-    entry: normalizeString(rawSnapshot.entry || meta.entry).trim() || null,
+    entry,
     meta: {
       schemaVersion,
       generatedAt: normalizeString(meta.generatedAt).trim() || null,
@@ -464,10 +469,7 @@ function normalizeSnapshot(rawSnapshot, role) {
     functions,
     functionEdges,
     importEdges,
-    limitations: uniqueSortedStrings([
-      ...STATIC_LIMITATIONS,
-      ...(Array.isArray(rawSnapshot.functionMap.limitations) ? rawSnapshot.functionMap.limitations : []),
-    ]),
+    limitations: uniqueSortedStrings(STATIC_LIMITATIONS),
   };
 }
 

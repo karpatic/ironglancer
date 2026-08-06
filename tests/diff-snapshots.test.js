@@ -781,6 +781,13 @@ test('compareSnapshots rejects invalid snapshot identities and SARIF-unsafe loca
       pattern: /malformed module path "\.\.\/escape\.js"/,
     },
     {
+      name: 'absolute snapshot entry path',
+      mutate: (candidate) => {
+        candidate.entry = '/home/alice/private/project/src/app.js';
+      },
+      pattern: /malformed snapshot entry path/,
+    },
+    {
       name: 'control character in path',
       mutate: (candidate) => {
         candidate.modules[0].path = 'src/control\u0000.js';
@@ -822,6 +829,21 @@ test('compareSnapshots rejects invalid snapshot identities and SARIF-unsafe loca
       name,
     );
   }
+});
+
+test('compareSnapshots does not propagate snapshot-provided free-form limitations', () => {
+  const privateText = '/home/alice/private/project SOURCE_EXCERPT_SENTINEL';
+  const base = snapshot({ modules: [module('src/app.js')] });
+  const head = snapshot({ modules: [module('src/app.js')] });
+  base.functionMap.limitations = [privateText];
+  head.functionMap.limitations = [`another ${privateText}`];
+
+  const diff = compareSnapshots(base, head);
+  const serialized = JSON.stringify(diff);
+
+  assert.equal(serialized.includes(privateText), false);
+  assert.ok(diff.limitations.length > 0);
+  assert.ok(diff.limitations.every((item) => !item.includes('/home/')));
 });
 
 test('compareSnapshots accepts valid snapshots with omitted optional function locations', () => {
