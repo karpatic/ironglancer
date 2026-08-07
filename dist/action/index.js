@@ -17005,6 +17005,1541 @@ function renderDiffSarif(diff = {}) {
   };
 }
 
+;// CONCATENATED MODULE: ./src/lib/options.js
+
+
+const DEFAULT_MODULE_LIMIT = 500;
+const MAX_MODULE_LIMIT = 100000;
+const DEFAULT_SOURCE_MODE = 'none';
+const SOURCE_MODES = new Set(['none', 'declarations', 'full']);
+const DEFAULT_FRAMEWORK = 'auto';
+const FRAMEWORKS = new Set(['auto', 'vanilla', 'react']);
+
+function normalizeSourceMode(value = DEFAULT_SOURCE_MODE) {
+  const mode = normalizeString(value || DEFAULT_SOURCE_MODE).trim().toLowerCase();
+  if (!SOURCE_MODES.has(mode)) {
+    throw new Error('--source-mode must be one of none, declarations, or full.');
+  }
+  return mode;
+}
+
+function normalizeModuleLimit(value = DEFAULT_MODULE_LIMIT) {
+  const raw = value == null || value === '' ? String(DEFAULT_MODULE_LIMIT) : utils_normalizeString(value).trim();
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`--module-limit must be an integer from 1 to ${MAX_MODULE_LIMIT}.`);
+  }
+  const limit = Number(raw);
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_MODULE_LIMIT) {
+    throw new Error(`--module-limit must be an integer from 1 to ${MAX_MODULE_LIMIT}.`);
+  }
+  return limit;
+}
+
+function normalizeFramework(value = DEFAULT_FRAMEWORK) {
+  const framework = utils_normalizeString(value || DEFAULT_FRAMEWORK).trim().toLowerCase();
+  if (!FRAMEWORKS.has(framework)) {
+    throw new Error('--framework must be one of auto, vanilla, or react.');
+  }
+  return framework;
+}
+
+function sourcePrivacyMetadata(sourceMode, {
+  declarationCount = 0,
+  moduleSourceCount = 0,
+} = {}) {
+  const mode = normalizeSourceMode(sourceMode);
+  const declarationSourceAvailable = mode === 'declarations' || mode === 'full';
+  const moduleSourceAvailable = mode === 'full';
+  return {
+    sourceMode: mode,
+    declarationSourceAvailable,
+    moduleSourceAvailable,
+    sourceArtifacts: {
+      sourceCodeJson: declarationSourceAvailable,
+      sourceModulesJson: moduleSourceAvailable,
+      functionMapJson: true,
+    },
+    capabilities: {
+      sourceDialogs: declarationSourceAvailable,
+      moduleSourceApi: moduleSourceAvailable,
+      occurrenceSearch: moduleSourceAvailable,
+      structuralFunctionMap: true,
+    },
+    counts: {
+      declarationSourceCount: declarationSourceAvailable ? declarationCount : 0,
+      moduleSourceCount: moduleSourceAvailable ? moduleSourceCount : 0,
+    },
+  };
+}
+
+// EXTERNAL MODULE: ./node_modules/@babel/parser/lib/index.js
+var lib = __nccwpck_require__(429);
+;// CONCATENATED MODULE: ./src/lib/javascript-ast-analysis.js
+
+
+
+
+
+
+const BROWSER_SCRIPT_EXTENSIONS = new Set(['.js', '.jsx', '.mjs']);
+const BROWSER_GLOBALS = new Map([
+  ['window', 'browser:window'],
+  ['document', 'browser:document'],
+  ['navigator', 'browser:navigator'],
+  ['location', 'browser:location'],
+  ['history', 'browser:history'],
+  ['localStorage', 'browser:localStorage'],
+  ['sessionStorage', 'browser:sessionStorage'],
+  ['indexedDB', 'browser:indexedDB'],
+  ['caches', 'browser:caches'],
+  ['fetch', 'browser:fetch'],
+  ['URL', 'browser:URL'],
+  ['URLSearchParams', 'browser:URLSearchParams'],
+  ['WebSocket', 'browser:WebSocket'],
+  ['Worker', 'browser:Worker'],
+  ['SharedWorker', 'browser:SharedWorker'],
+  ['BroadcastChannel', 'browser:BroadcastChannel'],
+  ['crypto', 'browser:crypto'],
+  ['performance', 'browser:performance'],
+  ['requestAnimationFrame', 'browser:animation-frame'],
+  ['cancelAnimationFrame', 'browser:animation-frame'],
+  ['addEventListener', 'browser:event-target'],
+  ['removeEventListener', 'browser:event-target'],
+  ['matchMedia', 'browser:media-query'],
+]);
+const IGNORED_TRAVERSE_KEYS = new Set([
+  'comments',
+  'end',
+  'errors',
+  'extra',
+  'innerComments',
+  'leadingComments',
+  'loc',
+  'start',
+  'trailingComments',
+  'tokens',
+]);
+
+function isBrowserScriptPath(modulePath) {
+  return BROWSER_SCRIPT_EXTENSIONS.has(external_node_path_namespaceObject.posix.extname(toPosixPath(modulePath)).toLowerCase());
+}
+
+function parseSourceFile(filePath, sourceText) {
+  try {
+    return (0,lib/* parse */.qg)(sourceText, {
+      sourceFilename: filePath,
+      sourceType: 'module',
+      errorRecovery: true,
+      plugins: ['jsx', 'importAttributes'],
+    });
+  } catch (error) {
+    throw new Error(`Unable to parse browser JavaScript/JSX module ${toPosixPath(filePath)}: ${error.message}`);
+  }
+}
+
+function childNodes(node) {
+  const children = [];
+  if (!node || typeof node !== 'object') return children;
+  for (const [key, value] of Object.entries(node)) {
+    if (IGNORED_TRAVERSE_KEYS.has(key)) continue;
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (item && typeof item.type === 'string') children.push(item);
+      }
+    } else if (value && typeof value.type === 'string') {
+      children.push(value);
+    }
+  }
+  return children;
+}
+
+function traverseAst(root, enter) {
+  const visit = (node, parent = null, grandparent = null) => {
+    if (!node || typeof node.type !== 'string') return;
+    enter(node, parent, grandparent);
+    for (const child of childNodes(node)) visit(child, node, parent);
+  };
+  visit(root);
+}
+
+function lineNumberAtSourcePosition(sourceFile, position) {
+  const loc = sourceFile.loc && Number.isInteger(position)
+    ? sourceFile.loc
+    : null;
+  return loc?.start?.line || 1;
+}
+
+function columnNumberAtSourcePosition(sourceFile, position) {
+  const loc = sourceFile.loc && Number.isInteger(position)
+    ? sourceFile.loc
+    : null;
+  return Number.isInteger(loc?.start?.column) ? loc.start.column + 1 : 1;
+}
+
+function nodeStart(node) {
+  return Number.isInteger(node?.start) ? node.start : 0;
+}
+
+function nodeInclusiveEnd(node) {
+  return Number.isInteger(node?.end) ? Math.max(nodeStart(node), node.end - 1) : nodeStart(node);
+}
+
+function declarationSpan({
+  name,
+  kind,
+  node,
+  nameNode,
+  startNode = node,
+  endNode = node,
+  declarationType,
+}) {
+  const startIndex = nodeStart(startNode);
+  const endIndex = nodeInclusiveEnd(endNode);
+  const startLine = startNode?.loc?.start?.line || 1;
+  const endLine = endNode?.loc?.end?.line || startLine;
+  const nameStartIndex = Number.isInteger(nameNode?.start) ? nameNode.start : null;
+  const span = {
+    name,
+    kind,
+    startLine,
+    endLine,
+    lineCount: endLine - startLine + 1,
+  };
+  Object.defineProperties(span, {
+    startIndex: { value: startIndex },
+    endIndex: { value: endIndex },
+    nameStartIndex: { value: nameStartIndex },
+    nameEndIndex: { value: Number.isInteger(nameStartIndex) ? nameStartIndex + name.length : null },
+    declarationType: { value: declarationType },
+  });
+  return span;
+}
+
+function identifierName(node) {
+  return node?.type === 'Identifier' ? node.name : '';
+}
+
+function variableStatementForDeclaration(parent, grandparent) {
+  return grandparent?.type === 'ExportNamedDeclaration' || grandparent?.type === 'ExportDefaultDeclaration'
+    ? grandparent
+    : parent;
+}
+
+function functionDeclarationType(node) {
+  if (node?.type === 'FunctionDeclaration') return 'function-declaration';
+  if (node?.type === 'FunctionExpression') return 'function-expression-name';
+  return 'arrow-variable';
+}
+
+function collectDeclarationSpans(sourceFile) {
+  const spans = [];
+  traverseAst(sourceFile.program, (node, parent, grandparent) => {
+    if ((node.type === 'FunctionDeclaration' || node.type === 'FunctionExpression') && node.id && node.body) {
+      const name = identifierName(node.id);
+      if (name) {
+        spans.push(declarationSpan({
+          name,
+          kind: 'function',
+          node,
+          nameNode: node.id,
+          declarationType: functionDeclarationType(node),
+        }));
+      }
+    }
+
+    if (node.type === 'VariableDeclarator' && node.id?.type === 'Identifier' && node.init) {
+      const initializer = node.init;
+      if (initializer.type === 'ArrowFunctionExpression' || initializer.type === 'FunctionExpression') {
+        const statement = variableStatementForDeclaration(parent, grandparent) || node;
+        spans.push(declarationSpan({
+          name: node.id.name,
+          kind: initializer.type === 'ArrowFunctionExpression' ? 'arrow' : 'function',
+          node,
+          nameNode: node.id,
+          startNode: statement,
+          endNode: initializer,
+          declarationType: initializer.type === 'ArrowFunctionExpression'
+            ? 'arrow-variable'
+            : 'function-expression-name',
+        }));
+      }
+    }
+  });
+  return spans.sort((a, b) => compareLocale(a.name, b.name)
+    || a.startLine - b.startLine
+    || a.endLine - b.endLine
+    || compareLocale(a.kind, b.kind));
+}
+
+function stringLiteralText(node) {
+  if (!node) return '';
+  if (node.type === 'StringLiteral') return node.value;
+  if (node.type === 'DirectiveLiteral') return node.value;
+  if (node.type === 'TemplateLiteral' && node.expressions.length === 0) {
+    return node.quasis[0]?.value?.cooked ?? node.quasis[0]?.value?.raw ?? '';
+  }
+  return '';
+}
+
+function collectStringConstants(sourceFile) {
+  const constants = new Map();
+  traverseAst(sourceFile.program, (node) => {
+    if (
+      node.type === 'VariableDeclarator'
+      && node.id?.type === 'Identifier'
+      && node.init
+    ) {
+      const value = stringLiteralText(node.init);
+      if (value) constants.set(node.id.name, value);
+    }
+  });
+  return constants;
+}
+
+function staticStringExpressionText(node, constants) {
+  const literal = stringLiteralText(node);
+  if (literal) return literal;
+  if (node?.type === 'Identifier') return constants.get(node.name) || '';
+  return '';
+}
+
+function bindingKind(imported) {
+  return imported === 'default' ? 'default' : 'named';
+}
+
+function importDeclarationRef(node) {
+  const specifier = stringLiteralText(node.source);
+  if (!specifier) return null;
+  const bindings = [];
+  for (const imported of Array.isArray(node.specifiers) ? node.specifiers : []) {
+    if (imported.type === 'ImportDefaultSpecifier') {
+      bindings.push({
+        imported: 'default',
+        local: imported.local.name,
+        kind: 'default',
+        inferred: false,
+      });
+    } else if (imported.type === 'ImportNamespaceSpecifier') {
+      bindings.push({
+        imported: '*',
+        local: imported.local.name,
+        kind: 'namespace',
+        inferred: false,
+      });
+    } else if (imported.type === 'ImportSpecifier') {
+      const importedName = identifierName(imported.imported) || stringLiteralText(imported.imported);
+      bindings.push({
+        imported: importedName,
+        local: imported.local.name,
+        kind: bindingKind(importedName),
+        inferred: false,
+      });
+    }
+  }
+  return {
+    specifier,
+    kind: bindings.length > 0 ? 'static' : 'side-effect',
+    bindings,
+  };
+}
+
+function exportDeclarationRef(node) {
+  const specifier = stringLiteralText(node.source);
+  if (!specifier) return null;
+  const bindings = [];
+  for (const exported of Array.isArray(node.specifiers) ? node.specifiers : []) {
+    if (exported.type !== 'ExportSpecifier') continue;
+    const imported = identifierName(exported.local) || stringLiteralText(exported.local);
+    const local = identifierName(exported.exported) || stringLiteralText(exported.exported);
+    if (imported && local) {
+      bindings.push({
+        imported,
+        local,
+        kind: 'named',
+        inferred: false,
+      });
+    }
+  }
+  return { specifier, kind: 'export', bindings };
+}
+
+function normalizeBinding(binding = {}) {
+  const kind = utils_normalizeString(binding.kind || 'named').trim() || 'named';
+  const imported = kind === 'namespace'
+    ? '*'
+    : kind === 'default'
+      ? 'default'
+      : utils_normalizeString(binding.imported).trim();
+  const local = utils_normalizeString(binding.local).trim();
+  if (!imported || !local) return null;
+  return {
+    imported,
+    local,
+    kind,
+    inferred: Boolean(binding.inferred),
+  };
+}
+
+function normalizeRef(ref = {}) {
+  const specifier = utils_normalizeString(ref?.specifier).trim();
+  if (!specifier) return null;
+  const bindings = (Array.isArray(ref.bindings) ? ref.bindings : [])
+    .map(normalizeBinding)
+    .filter(Boolean)
+    .sort((a, b) => compareLocale(a.kind, b.kind)
+      || compareLocale(a.imported, b.imported)
+      || compareLocale(a.local, b.local));
+  return {
+    specifier,
+    bindings,
+    kind: utils_normalizeString(ref.kind || 'static').trim() || 'static',
+  };
+}
+
+function calleeName(node) {
+  if (!node) return '';
+  if (node.type === 'Identifier') return node.name;
+  if (node.type === 'ThisExpression') return 'this';
+  if (node.type === 'Super') return 'super';
+  if (node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') {
+    if (node.computed) return '';
+    const property = identifierName(node.property);
+    const object = calleeName(node.object);
+    return object && property ? `${object}.${property}` : property;
+  }
+  return '';
+}
+
+function importedSpecifierFromImportExpression(node, constants) {
+  if (!node) return '';
+  if (node.type === 'AwaitExpression') return importedSpecifierFromImportExpression(node.argument, constants);
+  if (node.type === 'ImportExpression') return staticStringExpressionText(node.source, constants);
+  if (node.type !== 'CallExpression' && node.type !== 'OptionalCallExpression') return '';
+  const name = calleeName(node.callee);
+  if (node.callee?.type !== 'Import' && name !== 'window.import') return '';
+  return node.arguments[0] ? staticStringExpressionText(node.arguments[0], constants) : '';
+}
+
+function firstImportedSpecifierInExpression(node, constants) {
+  const direct = importedSpecifierFromImportExpression(node, constants);
+  if (direct) return direct;
+  let found = '';
+  const visit = (candidate) => {
+    if (!candidate || found) return;
+    const specifier = importedSpecifierFromImportExpression(candidate, constants);
+    if (specifier) {
+      found = specifier;
+      return;
+    }
+    for (const child of childNodes(candidate)) visit(child);
+  };
+  visit(node);
+  return found;
+}
+
+function importedSpecifierFromLazyInitializer(node, constants) {
+  if (node?.type === 'ArrowFunctionExpression' || node?.type === 'FunctionExpression') {
+    if (node.body?.type === 'BlockStatement') {
+      for (const statement of node.body.body || []) {
+        if (statement.type === 'ReturnStatement') {
+          const specifier = firstImportedSpecifierInExpression(statement.argument, constants);
+          if (specifier) return specifier;
+        }
+      }
+      return '';
+    }
+    return firstImportedSpecifierInExpression(node.body, constants);
+  }
+  return '';
+}
+
+function workerSpecifierFromExpression(node, constants) {
+  if (!node || !['CallExpression', 'NewExpression'].includes(node.type)) return '';
+  const name = calleeName(node.callee);
+  if (name !== 'Worker' && name !== 'SharedWorker') return '';
+  const first = node.arguments?.[0];
+  if (!first) return '';
+  const literal = staticStringExpressionText(first, constants);
+  if (literal) return literal;
+  if (
+    first.type === 'NewExpression'
+    && calleeName(first.callee) === 'URL'
+    && first.arguments?.[0]
+  ) {
+    return staticStringExpressionText(first.arguments[0], constants);
+  }
+  return '';
+}
+
+function bindingNameFromNameNode(node) {
+  return node?.type === 'Identifier' ? node.name : '';
+}
+
+function dynamicImportBindingsFromBindingName(node) {
+  if (!node) return [];
+  if (node.type === 'Identifier') {
+    return [{
+      imported: '*',
+      local: node.name,
+      kind: 'namespace',
+      inferred: false,
+    }];
+  }
+  if (node.type === 'ObjectPattern') {
+    return node.properties
+      .map((property) => {
+        if (property.type !== 'ObjectProperty') return null;
+        const imported = identifierName(property.key) || stringLiteralText(property.key);
+        const local = bindingNameFromNameNode(property.value);
+        if (!imported || !local) return null;
+        return {
+          imported,
+          local,
+          kind: imported === 'default' ? 'default' : 'named',
+          inferred: false,
+        };
+      })
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function lazyComponentBindingFromBindingName(node) {
+  if (!node || node.type !== 'Identifier') return [];
+  return [{
+    imported: 'default',
+    local: node.name,
+    kind: 'default',
+    inferred: false,
+  }];
+}
+
+function expressionFromMaybeAwait(node) {
+  if (node?.type === 'AwaitExpression') return node.argument;
+  return node;
+}
+
+function commonJsRefFromAssignment(node) {
+  if (node?.type !== 'AssignmentExpression' || node.operator !== '=') return null;
+  const leftName = calleeName(node.left);
+  if (leftName !== 'module.exports' && !leftName.startsWith('exports.')) return null;
+  return {
+    kind: 'commonjs-export',
+    specifier: '',
+    line: node.loc?.start?.line || 1,
+    column: Number.isInteger(node.loc?.start?.column) ? node.loc.start.column + 1 : 1,
+  };
+}
+
+function collectImportRefs(sourceFile) {
+  const refs = [];
+  const commonJsRefs = [];
+  const constants = collectStringConstants(sourceFile);
+
+  traverseAst(sourceFile.program, (node) => {
+    if (node.type === 'VariableDeclarator' && node.init) {
+      const expression = expressionFromMaybeAwait(node.init);
+      const specifier = importedSpecifierFromImportExpression(expression, constants);
+      const bindings = specifier ? dynamicImportBindingsFromBindingName(node.id) : [];
+      if (specifier && bindings.length > 0) refs.push({ specifier, kind: 'dynamic', bindings });
+
+      const lazySpecifier = ['React.lazy', 'lazy'].includes(calleeName(expression?.callee))
+        ? importedSpecifierFromLazyInitializer(expression.arguments?.[0], constants)
+        : '';
+      const lazyBindings = lazySpecifier ? lazyComponentBindingFromBindingName(node.id) : [];
+      if (lazySpecifier && lazyBindings.length > 0) {
+        refs.push({ specifier: lazySpecifier, kind: 'lazy', bindings: lazyBindings });
+      }
+    }
+
+    const declarationRef = node.type === 'ImportDeclaration'
+      ? importDeclarationRef(node)
+      : (node.type === 'ExportNamedDeclaration' || node.type === 'ExportAllDeclaration')
+        ? exportDeclarationRef(node)
+        : null;
+    const normalizedDeclarationRef = normalizeRef(declarationRef);
+    if (normalizedDeclarationRef) refs.push(normalizedDeclarationRef);
+
+    const dynamicSpecifier = importedSpecifierFromImportExpression(node, constants);
+    if (dynamicSpecifier) refs.push({ specifier: dynamicSpecifier, kind: 'dynamic', bindings: [] });
+
+    if (node.type === 'CallExpression' || node.type === 'NewExpression') {
+      const callName = calleeName(node.callee);
+      const lazySpecifier = ['React.lazy', 'lazy'].includes(callName)
+        ? importedSpecifierFromLazyInitializer(node.arguments?.[0], constants)
+        : '';
+      if (lazySpecifier) refs.push({ specifier: lazySpecifier, kind: 'lazy', bindings: [] });
+
+      const workerSpecifier = workerSpecifierFromExpression(node, constants);
+      if (workerSpecifier) refs.push({ specifier: workerSpecifier, kind: 'worker', bindings: [] });
+
+      if (callName === 'require') {
+        commonJsRefs.push({
+          kind: 'require-call',
+          specifier: stringLiteralText(node.arguments?.[0]) || '',
+          line: node.loc?.start?.line || 1,
+          column: Number.isInteger(node.loc?.start?.column) ? node.loc.start.column + 1 : 1,
+        });
+      }
+    }
+
+    const commonJsRef = commonJsRefFromAssignment(node);
+    if (commonJsRef) commonJsRefs.push(commonJsRef);
+  });
+
+  const seen = new Set();
+  const normalizedRefs = refs
+    .map(normalizeRef)
+    .filter(Boolean);
+  const refsWithBindings = new Set(normalizedRefs
+    .filter((ref) => ref.bindings.length > 0)
+    .map((ref) => `${ref.kind}\u0000${ref.specifier}`));
+  const imports = normalizedRefs
+    .filter((ref) => !(ref.bindings.length === 0 && refsWithBindings.has(`${ref.kind}\u0000${ref.specifier}`)))
+    .filter((ref) => {
+      const key = [ref.kind, ref.specifier, JSON.stringify(ref.bindings)].join('\u0000');
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => compareLocale(a.kind, b.kind)
+      || compareLocale(a.specifier, b.specifier)
+      || compareLocale(JSON.stringify(a.bindings), JSON.stringify(b.bindings)));
+  return { imports, commonJsRefs };
+}
+
+function jsxTagName(node) {
+  if (!node) return '';
+  if (node.type === 'JSXIdentifier') return node.name;
+  if (node.type === 'JSXMemberExpression') return `${jsxTagName(node.object)}.${jsxTagName(node.property)}`;
+  if (node.type === 'JSXNamespacedName') return `${jsxTagName(node.namespace)}:${jsxTagName(node.name)}`;
+  return '';
+}
+
+function isComponentName(name) {
+  return /^[A-Z]/.test(utils_normalizeString(name).split('.')[0] || '');
+}
+
+function jsxAttribute(attributes, name) {
+  return (attributes || []).find((candidate) => (
+    candidate.type === 'JSXAttribute' && candidate.name?.name === name
+  )) || null;
+}
+
+function jsxAttributeValue(attributes, name) {
+  const property = jsxAttribute(attributes, name);
+  if (!property || !property.value) return '';
+  if (property.value.type === 'StringLiteral') return property.value.value;
+  if (
+    property.value.type === 'JSXExpressionContainer'
+    && property.value.expression
+  ) {
+    return stringLiteralText(property.value.expression);
+  }
+  return '';
+}
+
+function jsxAttributeExpression(attributes, name) {
+  const property = jsxAttribute(attributes, name);
+  if (!property || property.value?.type !== 'JSXExpressionContainer') return null;
+  return property.value.expression || null;
+}
+
+function firstComponentNameInExpression(node) {
+  if (!node) return '';
+  if (node.type === 'Identifier' && isComponentName(node.name)) return node.name;
+  if (node.type === 'JSXElement') return jsxTagName(node.openingElement?.name);
+  if (node.type === 'JSXFragment') return 'Fragment';
+  let found = '';
+  for (const child of childNodes(node)) {
+    if (!found) found = firstComponentNameInExpression(child);
+  }
+  return found;
+}
+
+function objectPropertyName(node) {
+  return identifierName(node) || stringLiteralText(node);
+}
+
+function objectLiteralPropertyString(node, propertyName) {
+  if (node?.type !== 'ObjectExpression') return '';
+  const property = (node.properties || []).find((candidate) => (
+    candidate.type === 'ObjectProperty'
+    && objectPropertyName(candidate.key) === propertyName
+  ));
+  return property ? stringLiteralText(property.value) : '';
+}
+
+function objectLiteralPropertyComponent(node) {
+  if (node?.type !== 'ObjectExpression') return '';
+  const keys = new Set(['element', 'Component', 'component']);
+  for (const property of node.properties || []) {
+    if (property.type !== 'ObjectProperty' || !keys.has(objectPropertyName(property.key))) continue;
+    return firstComponentNameInExpression(property.value);
+  }
+  return '';
+}
+
+function routeObjectsFromExpression(node) {
+  if (!node || node.type !== 'ArrayExpression') return [];
+  const routes = [];
+  const visitRouteObject = (objectNode, parentPath = '') => {
+    if (objectNode?.type !== 'ObjectExpression') return;
+    const routePath = objectLiteralPropertyString(objectNode, 'path');
+    const component = objectLiteralPropertyComponent(objectNode);
+    const fullPath = routePath
+      ? routePath.startsWith('/') || !parentPath
+        ? routePath
+        : `${parentPath.replace(/\/+$/g, '')}/${routePath.replace(/^\/+/g, '')}`
+      : parentPath;
+    if (fullPath || component) {
+      routes.push({
+        path: fullPath || '',
+        component,
+        adapter: 'react-router',
+        sourceKind: 'createBrowserRouter',
+        line: objectNode.loc?.start?.line || 1,
+      });
+    }
+    const childrenProperty = (objectNode.properties || []).find((candidate) => (
+      candidate.type === 'ObjectProperty'
+      && objectPropertyName(candidate.key) === 'children'
+      && candidate.value?.type === 'ArrayExpression'
+    ));
+    if (childrenProperty) {
+      for (const child of childrenProperty.value.elements || []) visitRouteObject(child, fullPath);
+    }
+  };
+  for (const element of node.elements || []) visitRouteObject(element);
+  return routes;
+}
+
+function nearestDeclarationName(declarationSpans, index) {
+  const candidates = declarationSpans
+    .filter((span) => Number.isInteger(span.startIndex)
+      && Number.isInteger(span.endIndex)
+      && index >= span.startIndex
+      && index <= span.endIndex)
+    .sort((a, b) => (a.endIndex - a.startIndex) - (b.endIndex - b.startIndex));
+  return candidates[0]?.name || '';
+}
+
+function collectFrontEndFacts(sourceFile, declarationSpans) {
+  const components = new Map();
+  const componentRefs = [];
+  const routes = [];
+  const browserApis = new Map();
+
+  for (const span of declarationSpans) {
+    if (/^[A-Z]/.test(span.name) || /^use[A-Z0-9]/.test(span.name)) {
+      components.set(span.name, {
+        name: span.name,
+        kind: /^[A-Z]/.test(span.name) ? 'component' : 'hook',
+        modulePath: '',
+        startLine: span.startLine,
+        endLine: span.endLine,
+      });
+    }
+  }
+
+  const addBrowserApi = (name, node) => {
+    const api = BROWSER_GLOBALS.get(name);
+    if (!api) return;
+    const line = lineNumberAtSourcePosition(node, nodeStart(node));
+    const key = `${api}\u0000${line}`;
+    if (!browserApis.has(key)) {
+      browserApis.set(key, {
+        api,
+        name,
+        line,
+        column: columnNumberAtSourcePosition(node, nodeStart(node)),
+      });
+    }
+  };
+
+  traverseAst(sourceFile.program, (node) => {
+    if (node.type === 'JSXOpeningElement') {
+      const tag = jsxTagName(node.name);
+      const line = node.loc?.start?.line || 1;
+      const owner = nearestDeclarationName(declarationSpans, nodeStart(node));
+      if (isComponentName(tag)) {
+        componentRefs.push({
+          owner,
+          component: tag,
+          line,
+          sourceKind: 'jsx-element',
+        });
+      }
+      if (tag === 'Route' || tag.endsWith('.Route')) {
+        const routePath = jsxAttributeValue(node.attributes, 'path') || jsxAttributeValue(node.attributes, 'index');
+        const elementExpression = jsxAttributeExpression(node.attributes, 'element')
+          || jsxAttributeExpression(node.attributes, 'Component');
+        routes.push({
+          path: routePath === 'true' ? '' : routePath,
+          component: firstComponentNameInExpression(elementExpression),
+          adapter: 'react-router',
+          sourceKind: 'jsx-route',
+          line,
+        });
+      }
+    }
+
+    if (node.type === 'CallExpression' && calleeName(node.callee) === 'createBrowserRouter') {
+      routes.push(...routeObjectsFromExpression(node.arguments?.[0]));
+    }
+
+    if (node.type === 'Identifier') addBrowserApi(node.name, node);
+  });
+
+  return {
+    components: Array.from(components.values()).sort((a, b) => compareLocale(a.name, b.name)),
+    componentRefs: componentRefs.sort((a, b) => compareLocale(a.owner, b.owner)
+      || compareLocale(a.component, b.component)
+      || a.line - b.line),
+    routes: routes
+      .filter((route) => route.path || route.component)
+      .sort((a, b) => compareLocale(a.path, b.path)
+        || compareLocale(a.component, b.component)
+        || a.line - b.line),
+    browserApis: Array.from(browserApis.values())
+      .sort((a, b) => compareLocale(a.api, b.api) || a.line - b.line),
+  };
+}
+
+function createJavaScriptAstAnalysisContext() {
+  const sourceFiles = new Map();
+  const analyzer = {
+    name: 'javascript-ast',
+    parser: '@babel/parser',
+    language: 'browser-jsx',
+  };
+
+  const sourceFileFor = (filePath, sourceText) => {
+    const resolved = external_node_path_namespaceObject.resolve(filePath);
+    const cacheKey = `${resolved}\u0000${sourceText}`;
+    if (!sourceFiles.has(cacheKey)) sourceFiles.set(cacheKey, parseSourceFile(resolved, sourceText));
+    return sourceFiles.get(cacheKey);
+  };
+
+  return {
+    analyzer,
+    backend: analyzer,
+    analyzeFile(filePath, sourceText) {
+      if (!isBrowserScriptPath(filePath)) {
+        throw new Error(`IronGlancer only analyzes browser JavaScript modules (.js, .jsx, .mjs): ${toPosixPath(filePath)}`);
+      }
+      const sourceFile = sourceFileFor(filePath, sourceText);
+      const declarationSpans = collectDeclarationSpans(sourceFile);
+      const { imports, commonJsRefs } = collectImportRefs(sourceFile);
+      const facts = collectFrontEndFacts(sourceFile, declarationSpans);
+      return {
+        declarationSpans,
+        importRefs: imports,
+        commonJsRefs,
+        typeOnlyRanges: [],
+        ...facts,
+      };
+    },
+  };
+}
+
+;// CONCATENATED MODULE: ./src/lib/resolution/aliases.js
+
+
+
+
+function normalizeImportAliasTarget(value) {
+  return toPosixPath(utils_normalizeString(value).trim());
+}
+
+function parseAliasString(value) {
+  const raw = utils_normalizeString(value).trim();
+  const separatorIndex = raw.indexOf('=');
+  if (separatorIndex === -1) {
+    throw new Error(`Invalid alias "${raw}". Use specifier=path.`);
+  }
+  const from = raw.slice(0, separatorIndex).trim();
+  const to = raw.slice(separatorIndex + 1).trim();
+  if (!from || !to) throw new Error('Aliases must include both a specifier and target path.');
+  return [from, normalizeImportAliasTarget(to)];
+}
+
+function normalizeImportAliases(values = []) {
+  const aliases = new Map();
+  const entries = Array.isArray(values) ? values : [values].filter(Boolean);
+  for (const entry of entries) {
+    if (typeof entry === 'string') {
+      const [from, to] = parseAliasString(entry);
+      aliases.set(from, to);
+    } else if (Array.isArray(entry)) {
+      aliases.set(utils_normalizeString(entry[0]).trim(), normalizeImportAliasTarget(entry[1]));
+    } else if (entry && typeof entry === 'object') {
+      aliases.set(utils_normalizeString(entry.from ?? entry.alias ?? entry.specifier).trim(), normalizeImportAliasTarget(entry.to ?? entry.path));
+    }
+  }
+  for (const [key, value] of aliases) {
+    if (!key || !value) aliases.delete(key);
+  }
+  return aliases;
+}
+
+function mergeAliasMaps(...maps) {
+  const aliases = new Map();
+  for (const map of maps) {
+    for (const [key, value] of map instanceof Map ? map : []) {
+      if (key && value) aliases.set(key, value);
+    }
+  }
+  return aliases;
+}
+
+function parseRouteAliasString(value) {
+  const raw = utils_normalizeString(value).trim();
+  const separatorIndex = raw.indexOf('=');
+  if (separatorIndex === -1) {
+    throw new Error(`Invalid route alias "${raw}". Use route=path.`);
+  }
+  return {
+    from: raw.slice(0, separatorIndex),
+    to: raw.slice(separatorIndex + 1),
+  };
+}
+
+function routeAliasEntries(routeAliases) {
+  const entries = Array.isArray(routeAliases) ? routeAliases : [routeAliases].filter(Boolean);
+  return entries.map((entry) => (typeof entry === 'string' ? parseRouteAliasString(entry) : entry));
+}
+
+function normalizeRouteAliasFrom(value) {
+  const raw = toPosixPath(utils_normalizeString(value).trim());
+  if (!raw) return '';
+  const rooted = raw.startsWith('/') ? raw : `/${raw}`;
+  return rooted.replace(/\/+$/g, '') || '/';
+}
+
+function normalizeRouteAliasTarget(value) {
+  const raw = toPosixPath(utils_normalizeString(value).trim());
+  if (!raw) return '';
+  const normalized = raw.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/+$/g, '');
+  return normalized === '.' ? '' : normalized;
+}
+
+function normalizeRouteAliases(routeAliases = []) {
+  return routeAliasEntries(routeAliases)
+    .map((entry, index) => {
+      const from = normalizeRouteAliasFrom(Array.isArray(entry) ? entry[0] : entry?.from);
+      const targetSource = Array.isArray(entry) ? entry[1] : entry?.to;
+      const to = normalizeRouteAliasTarget(targetSource);
+      if (!from || targetSource == null) {
+        throw new Error('Route aliases must include a route and target path.');
+      }
+      return { from, to, index };
+    })
+    .sort((a, b) => b.from.length - a.from.length || a.index - b.index)
+    .map(({ from, to }) => ({ from, to }));
+}
+
+function expandImportAliasTarget(value) {
+  return toPosixPath(utils_normalizeString(value).trim())
+    .replace('__REVIEW_ORIGIN__/', 'public/');
+}
+
+function joinImportAliasPrefixTarget(target, rest) {
+  const normalizedTarget = toPosixPath(utils_normalizeString(target).trim());
+  const normalizedRest = toPosixPath(utils_normalizeString(rest).trim());
+  if (!normalizedRest) return normalizedTarget;
+  return normalizedTarget.endsWith('/')
+    ? `${normalizedTarget}${normalizedRest}`
+    : external_node_path_namespaceObject.posix.join(normalizedTarget, normalizedRest);
+}
+
+function importAliasTargetForSpecifier(specifier, aliases) {
+  const raw = utils_normalizeString(specifier).trim();
+  let best = null;
+  for (const [key, value] of aliases instanceof Map ? aliases : []) {
+    const alias = utils_normalizeString(key).trim();
+    if (!alias) continue;
+    if (raw === alias) {
+      const candidate = { key: alias, target: value, rest: '' };
+      if (!best || candidate.key.length > best.key.length) best = candidate;
+    } else if (alias.endsWith('/') && raw.startsWith(alias)) {
+      const candidate = { key: alias, target: value, rest: raw.slice(alias.length) };
+      if (!best || candidate.key.length > best.key.length) best = candidate;
+    }
+  }
+  return best ? joinImportAliasPrefixTarget(best.target, best.rest) : '';
+}
+
+;// CONCATENATED MODULE: ./src/lib/analysis/module-records.js
+
+
+
+
+function isJsxModule(rel) {
+  return /\.jsx$/i.test(rel);
+}
+
+function moduleRecords(graph, { reachableOnly = false } = {}) {
+  return Array.from(graph.modules.values())
+    .filter((record) => !reachableOnly || record.reachable)
+    .sort((a, b) => compareLocale(a.rel, b.rel));
+}
+
+function jsxModuleRecords(graph, options = {}) {
+  return moduleRecords(graph, options)
+    .filter((record) => isJsxModule(record.rel))
+    .sort((a, b) => compareLocale(a.rel, b.rel));
+}
+
+function buildClassIds(records) {
+  const baseCounts = new Map();
+  const ids = new Map();
+  for (const record of records) {
+    const base = utils_normalizeString(external_node_path_namespaceObject.posix.basename(record.rel, external_node_path_namespaceObject.posix.extname(record.rel)))
+      .replace(/[^A-Za-z0-9_$]/g, '_') || 'Module';
+    const count = (baseCounts.get(base) || 0) + 1;
+    baseCounts.set(base, count);
+    ids.set(record.rel, count === 1 ? base : `${base}_${count}`);
+  }
+  return ids;
+}
+
+function uniqueRecords(records, keyFor) {
+  const byKey = new Map();
+  for (const record of records) {
+    const key = keyFor(record);
+    if (!key || byKey.has(key)) continue;
+    byKey.set(key, record);
+  }
+  return Array.from(byKey.values());
+}
+
+;// CONCATENATED MODULE: ./src/lib/resolution/import-maps.js
+
+
+
+function aliasesFromImportMap(importMap = {}) {
+  const aliases = new Map();
+  const imports = importMap && typeof importMap.imports === 'object' && !Array.isArray(importMap.imports)
+    ? importMap.imports
+    : {};
+  for (const [key, value] of Object.entries(imports)) {
+    const rawValue = normalizeImportAliasTarget(value);
+    if (!rawValue) continue;
+    aliases.set(key, rawValue);
+  }
+  return aliases;
+}
+
+function parseHtmlAttributes(rawAttributes) {
+  const attrs = new Map();
+  const pattern = /([A-Za-z_:][-A-Za-z0-9_:.]*)\s*(?:=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+  let match;
+  while ((match = pattern.exec(utils_normalizeString(rawAttributes)))) {
+    attrs.set(match[1].toLowerCase(), match[2] ?? match[3] ?? match[4] ?? '');
+  }
+  return attrs;
+}
+
+function parseHtmlEntry(source) {
+  const html = utils_normalizeString(source);
+  const importMaps = [];
+  const moduleScriptSrcs = [];
+  const importMapPattern = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
+  let match;
+  while ((match = importMapPattern.exec(html))) {
+    const attrs = parseHtmlAttributes(match[1]);
+    const type = utils_normalizeString(attrs.get('type')).trim().toLowerCase();
+    const src = utils_normalizeString(attrs.get('src')).trim();
+    if (type === 'importmap') {
+      try {
+        importMaps.push(JSON.parse(match[2]));
+      } catch (error) {
+        throw new Error(`Invalid HTML import map JSON: ${error.message}`);
+      }
+    } else if (type === 'module' && src) {
+      moduleScriptSrcs.push(src);
+    }
+  }
+  return {
+    importAliases: mergeAliasMaps(...importMaps.map(aliasesFromImportMap)),
+    moduleScriptSrcs,
+  };
+}
+
+;// CONCATENATED MODULE: ./src/lib/resolution/module-resolver.js
+
+
+
+
+
+
+
+const DEFAULT_ENTRY_CANDIDATES = [
+  'index.html',
+  'src/index.html',
+  'src/main.jsx',
+  'src/main.js',
+  'src/index.jsx',
+  'src/index.js',
+  'src/app.jsx',
+  'src/app.js',
+];
+const DEFAULT_ROUTE_ALIASES = [
+  { from: '/', to: '' },
+  { from: '/', to: 'public' },
+];
+const HTML_ENTRY_EXTENSIONS = new Set(['.html', '.htm']);
+const ANALYZABLE_MODULE_EXTENSIONS = new Set(['.js', '.jsx', '.mjs']);
+const ASSET_EXTENSIONS = new Set([
+  '.css',
+  '.scss',
+  '.sass',
+  '.less',
+  '.json',
+  '.svg',
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.gif',
+  '.webp',
+  '.avif',
+  '.ico',
+  '.woff',
+  '.woff2',
+  '.ttf',
+  '.otf',
+  '.wasm',
+  '.worker.js',
+  '.worker.mjs',
+]);
+const EXCLUDED_DISCOVERY_DIRS = new Set([
+  '.git',
+  '.hg',
+  '.svn',
+  'node_modules',
+  'bower_components',
+  'dist',
+  'build',
+  'coverage',
+  'out',
+  'site',
+  'docs',
+  '.worktrees',
+  '.codex-worktrees',
+  '.next',
+  '.nuxt',
+  '.svelte-kit',
+  '.parcel-cache',
+  '.vite',
+]);
+const PLATFORM_IMPORT_SPECIFIERS = new Set([
+  'assert',
+  'buffer',
+  'child_process',
+  'cluster',
+  'console',
+  'constants',
+  'crypto',
+  'dgram',
+  'diagnostics_channel',
+  'dns',
+  'domain',
+  'events',
+  'fs',
+  'http',
+  'http2',
+  'https',
+  'inspector',
+  'module',
+  'net',
+  'os',
+  'path',
+  'perf_hooks',
+  'process',
+  'punycode',
+  'querystring',
+  'readline',
+  'repl',
+  'stream',
+  'string_decoder',
+  'timers',
+  'tls',
+  'trace_events',
+  'tty',
+  'url',
+  'util',
+  'v8',
+  'vm',
+  'worker_threads',
+  'zlib',
+]);
+const UNSUPPORTED_SOURCE_EXTENSIONS = new Set(['.cjs', '.cts', '.mts', '.ts', '.tsx']);
+
+async function loadImportAliases(rootDir, entryRel = '') {
+  const aliases = new Map();
+  const htmlCandidates = [
+    external_node_path_namespaceObject.join(rootDir, 'index.html'),
+    entryRel ? external_node_path_namespaceObject.join(rootDir, external_node_path_namespaceObject.posix.dirname(toPosixPath(entryRel)), 'index.html') : '',
+  ].filter(Boolean);
+
+  for (const htmlPath of htmlCandidates) {
+    try {
+      const html = await promises_namespaceObject.readFile(htmlPath, 'utf8');
+      for (const [key, value] of parseHtmlEntry(html).importAliases) aliases.set(key, value);
+    } catch {
+      // best effort only
+    }
+  }
+  return aliases;
+}
+
+async function resolveFromRoot(rootDir, relativePath) {
+  for (const candidate of extensionCandidates(relativePath)) {
+    const filePath = external_node_path_namespaceObject.resolve(rootDir, candidate);
+    if (!isWithinPath(rootDir, filePath)) continue;
+    if (await fileExists(filePath)) {
+      return {
+        rel: toPosixPath(external_node_path_namespaceObject.relative(rootDir, filePath)),
+        filePath,
+      };
+    }
+  }
+  return null;
+}
+
+async function resolveExactFromRoot(rootDir, relativePath) {
+  const normalized = toPosixPath(utils_normalizeString(relativePath).trim()).replace(/^\.\//, '').replace(/^\/+/, '');
+  if (!normalized) return null;
+  const filePath = external_node_path_namespaceObject.resolve(rootDir, normalized);
+  if (!isWithinPath(rootDir, filePath)) return null;
+  if (!await fileExists(filePath)) return null;
+  return {
+    rel: toPosixPath(external_node_path_namespaceObject.relative(rootDir, filePath)),
+    filePath,
+  };
+}
+
+async function resolveEntry(rootDir, entry, { allowHtml = true } = {}) {
+  const requested = utils_normalizeString(entry).trim();
+  const candidates = requested ? [requested] : DEFAULT_ENTRY_CANDIDATES;
+  for (const candidate of candidates) {
+    const normalized = candidate.replace(/^\.\//, '').replace(/^\//, '');
+    const ext = external_node_path_namespaceObject.posix.extname(toPosixPath(normalized)).toLowerCase();
+    if (!allowHtml && HTML_ENTRY_EXTENSIONS.has(ext)) continue;
+    const resolved = HTML_ENTRY_EXTENSIONS.has(ext)
+      ? await resolveExactFromRoot(rootDir, normalized)
+      : await resolveFromRoot(rootDir, normalized);
+    if (!resolved) continue;
+    return {
+      ...resolved,
+      kind: HTML_ENTRY_EXTENSIONS.has(external_node_path_namespaceObject.posix.extname(toPosixPath(resolved.rel)).toLowerCase())
+        ? 'html'
+        : 'module',
+    };
+  }
+  throw new Error(`Unable to resolve browser entry inside ${rootDir}`);
+}
+
+function isAnalyzableModulePath(relativePath) {
+  return ANALYZABLE_MODULE_EXTENSIONS.has(external_node_path_namespaceObject.posix.extname(toPosixPath(relativePath)).toLowerCase());
+}
+
+function localAssetKind(relativePath) {
+  const normalized = toPosixPath(relativePath).toLowerCase();
+  if (normalized.endsWith('.worker.js') || normalized.endsWith('.worker.mjs')) return 'worker';
+  const ext = external_node_path_namespaceObject.posix.extname(normalized);
+  if (!ASSET_EXTENSIONS.has(ext)) return '';
+  if (ext === '.css' || ext === '.scss' || ext === '.sass' || ext === '.less') return 'style';
+  if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.svg', '.ico'].includes(ext)) return 'image';
+  if (['.woff', '.woff2', '.ttf', '.otf'].includes(ext)) return 'font';
+  if (ext === '.json') return 'json';
+  if (ext === '.wasm') return 'wasm';
+  return 'unknown';
+}
+
+function isSupportedBrowserModulePath(relativePath) {
+  return isAnalyzableModulePath(relativePath);
+}
+
+function normalizeExclude(value) {
+  return toPosixPath(utils_normalizeString(value).trim())
+    .replace(/^\.\//, '')
+    .replace(/^\/+/, '')
+    .replace(/\/+$/g, '');
+}
+
+function normalizeExcludes(values = []) {
+  return (Array.isArray(values) ? values : [values].filter(Boolean))
+    .flatMap((value) => utils_normalizeString(value).split(','))
+    .map(normalizeExclude)
+    .filter(Boolean)
+    .sort(compareLocale);
+}
+
+function pathMatchesExclude(relativePath, excludes) {
+  const rel = normalizeExclude(relativePath);
+  return excludes.some((exclude) => rel === exclude || rel.startsWith(`${exclude}/`));
+}
+
+function isExcludedDiscoveryDir(name, relativePath, excludes) {
+  return EXCLUDED_DISCOVERY_DIRS.has(utils_normalizeString(name).trim())
+    || pathMatchesExclude(relativePath, excludes);
+}
+
+async function discoverAnalyzableModules(rootDir, moduleLimit, excludes = [], roots = ['']) {
+  const discovered = new Map();
+
+  const visit = async (dirPath) => {
+    const entries = (await promises_namespaceObject.readdir(dirPath, { withFileTypes: true }))
+      .sort((a, b) => compareLocale(a.name, b.name));
+    for (const entry of entries) {
+      const filePath = external_node_path_namespaceObject.join(dirPath, entry.name);
+      const rel = toPosixPath(external_node_path_namespaceObject.relative(rootDir, filePath));
+      if (entry.isDirectory()) {
+        if (isExcludedDiscoveryDir(entry.name, rel, excludes)) continue;
+        await visit(filePath);
+      } else if (entry.isFile() && !pathMatchesExclude(rel, excludes) && isAnalyzableModulePath(rel)) {
+        discovered.set(rel, { rel, filePath });
+        if (discovered.size > moduleLimit) {
+          throw new Error(`Module limit exceeded (${moduleLimit}).`);
+        }
+      }
+    }
+  };
+
+  const normalizedRoots = Array.from(new Set((Array.isArray(roots) ? roots : [roots])
+    .map(normalizeExclude))).sort(compareLocale);
+  for (const root of normalizedRoots.length > 0 ? normalizedRoots : ['']) {
+    const dirPath = external_node_path_namespaceObject.resolve(rootDir, root || '.');
+    if (!isWithinPath(rootDir, dirPath)) continue;
+    try {
+      const stat = await promises_namespaceObject.stat(dirPath);
+      if (!stat.isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    await visit(dirPath);
+  }
+  return Array.from(discovered.values()).sort((a, b) => compareLocale(a.rel, b.rel));
+}
+
+function localPathFromRouteAlias(specifier, alias) {
+  const raw = toPosixPath(utils_normalizeString(specifier).trim());
+  if (!raw.startsWith('/')) return null;
+
+  let rest = null;
+  if (alias.from === '/') {
+    rest = raw.replace(/^\/+/, '');
+  } else if (raw === alias.from) {
+    rest = '';
+  } else if (raw.startsWith(`${alias.from}/`)) {
+    rest = raw.slice(alias.from.length + 1);
+  }
+
+  if (rest == null) return null;
+  return external_node_path_namespaceObject.posix.normalize(external_node_path_namespaceObject.posix.join(alias.to, rest));
+}
+
+async function resolveRouteAlias({ rootDir, specifier, routeAliases }) {
+  for (const alias of routeAliases) {
+    const localPath = localPathFromRouteAlias(specifier, alias);
+    if (localPath == null) continue;
+    const resolved = await resolveBrowserPathFromRoot(rootDir, localPath);
+    if (resolved) return resolved;
+  }
+  return null;
+}
+
+function isRemoteSpecifier(specifier) {
+  return /^(?:https?:)?\/\//i.test(utils_normalizeString(specifier).trim());
+}
+
+function nodeBuiltinSpecifier(specifier) {
+  const raw = utils_normalizeString(specifier).trim();
+  const normalized = raw.startsWith('node:') ? raw.slice('node:'.length) : raw;
+  return PLATFORM_IMPORT_SPECIFIERS.has(normalized) ? normalized : '';
+}
+
+function unsupportedSourceExtension(relativePath) {
+  const ext = external_node_path_namespaceObject.posix.extname(toPosixPath(relativePath)).toLowerCase();
+  return UNSUPPORTED_SOURCE_EXTENSIONS.has(ext) ? ext : '';
+}
+
+async function resolveBrowserPathFromRoot(rootDir, relativePath) {
+  const exact = await resolveExactFromRoot(rootDir, relativePath);
+  if (exact) {
+    const unsupportedExtension = unsupportedSourceExtension(exact.rel);
+    if (unsupportedExtension) {
+      return {
+        ...exact,
+        kind: 'unsupported-module',
+        assetKind: null,
+        unsupportedExtension,
+      };
+    }
+    const assetKind = localAssetKind(exact.rel);
+    return {
+      ...exact,
+      kind: isSupportedBrowserModulePath(exact.rel) ? 'module' : 'asset',
+      assetKind: isSupportedBrowserModulePath(exact.rel) ? null : assetKind || 'unknown',
+    };
+  }
+  const module = await resolveFromRoot(rootDir, relativePath);
+  if (module) {
+    return {
+      ...module,
+      kind: 'module',
+      assetKind: null,
+    };
+  }
+  return null;
+}
+
+function remoteAliasTargetForSpecifier(specifier, aliases) {
+  const aliasTarget = importAliasTargetForSpecifier(specifier, aliases);
+  return isRemoteSpecifier(aliasTarget) ? aliasTarget : '';
+}
+
+async function resolveImport({ rootDir, specifier, importerRel, aliases, routeAliases }) {
+  const raw = utils_normalizeString(specifier).trim();
+  if (!raw || isRemoteSpecifier(raw) || nodeBuiltinSpecifier(raw)) return null;
+  const aliasTarget = importAliasTargetForSpecifier(raw, aliases);
+  if (aliasTarget) {
+    const expandedAlias = expandImportAliasTarget(aliasTarget);
+    if (isRemoteSpecifier(expandedAlias)) return null;
+    const routedAlias = await resolveRouteAlias({ rootDir, specifier: expandedAlias, routeAliases });
+    if (routedAlias) return routedAlias;
+    const normalizedAlias = normalizeRouteAliasTarget(expandedAlias);
+    return resolveBrowserPathFromRoot(rootDir, normalizedAlias);
+  }
+  if (raw.startsWith('/')) {
+    return resolveRouteAlias({ rootDir, specifier: raw, routeAliases });
+  }
+  if (raw.startsWith('./') || raw.startsWith('../')) {
+    const importerDir = external_node_path_namespaceObject.posix.dirname(toPosixPath(importerRel));
+    const relativePath = external_node_path_namespaceObject.posix.normalize(external_node_path_namespaceObject.posix.join(importerDir, raw));
+    return resolveBrowserPathFromRoot(rootDir, relativePath);
+  }
+  return null;
+}
+
+function importSpecifierLooksLocal(specifier, aliases, routeAliases) {
+  const raw = utils_normalizeString(specifier).trim();
+  if (!raw) return false;
+  if (raw.startsWith('.') || raw.startsWith('/')) return true;
+  for (const key of aliases.keys()) {
+    if (raw === key || (key.endsWith('/') && raw.startsWith(key))) return true;
+  }
+  return routeAliases.some((alias) => raw === alias.from.slice(0, -1) || raw.startsWith(alias.from));
+}
+
+function externalLabel(specifier) {
+  const raw = utils_normalizeString(specifier).trim();
+  if (!raw) return '';
+  if (/^https?:\/\//i.test(raw)) {
+    try {
+      return new URL(raw).hostname;
+    } catch {
+      return raw;
+    }
+  }
+  return raw;
+}
+
+function isIgnoredExternalLabel(label) {
+  return utils_normalizeString(label).trim().toLowerCase() === 'react';
+}
+
+function entryModuleDiscoveryRoot(moduleRel) {
+  const rel = normalizeExclude(moduleRel);
+  if (!rel) return '';
+  const parts = rel.split('/').filter(Boolean);
+  if (parts.length > 1 && ['src', 'app', 'client', 'frontend', 'web', 'public'].includes(parts[0])) return parts[0];
+  const dir = external_node_path_namespaceObject.posix.dirname(rel);
+  return dir === '.' ? '' : dir;
+}
+
+function includeUnreachableDiscoveryRoots({ sourceRoot, entryModules }) {
+  const normalizedSourceRoot = normalizeExclude(sourceRoot);
+  if (normalizedSourceRoot && normalizedSourceRoot !== '.') return [normalizedSourceRoot];
+  const roots = Array.from(new Set((Array.isArray(entryModules) ? entryModules : [])
+    .map((entryModule) => entryModuleDiscoveryRoot(entryModule.rel))
+    .filter((root) => root)));
+  return roots.length > 0 ? roots.sort(compareLocale) : [''];
+}
+
+;// CONCATENATED MODULE: ./src/lib/resolution/html-entry.js
+
+
+
+
+
+
+
+
+async function moduleEntriesForHtmlEntry({ rootDir, htmlEntry, routeAliases }) {
+  const html = await promises_namespaceObject.readFile(htmlEntry.filePath, 'utf8');
+  const parsed = parseHtmlEntry(html);
+  const entryDir = external_node_path_namespaceObject.posix.dirname(htmlEntry.rel);
+  const resolvedEntries = [];
+  for (const src of parsed.moduleScriptSrcs) {
+    const resolved = await resolveImport({
+      rootDir,
+      specifier: src,
+      importerRel: htmlEntry.rel,
+      aliases: parsed.importAliases,
+      routeAliases,
+    }) || await resolveBrowserPathFromRoot(rootDir, external_node_path_namespaceObject.posix.normalize(external_node_path_namespaceObject.posix.join(entryDir, src)));
+    if (resolved?.kind === 'module') resolvedEntries.push(resolved);
+  }
+  if (resolvedEntries.length === 0) {
+    throw new Error(`HTML entry ${htmlEntry.rel} does not contain a resolvable <script type="module" src="...">.`);
+  }
+  return {
+    aliases: parsed.importAliases,
+    entries: uniqueRecords(resolvedEntries, (item) => item.rel).sort((a, b) => compareLocale(a.rel, b.rel)),
+  };
+}
+
+;// CONCATENATED MODULE: ./src/lib/analysis/browser-api-analysis.js
+
+
+
+const BROWSER_PLATFORM_NAMESPACES = new Map([
+  ['window', 'browser:window'],
+  ['document', 'browser:document'],
+  ['navigator', 'browser:navigator'],
+  ['localStorage', 'browser:localStorage'],
+  ['sessionStorage', 'browser:sessionStorage'],
+  ['Intl', 'browser:Intl'],
+  ['URL', 'browser:URL'],
+  ['Math', 'browser:Math'],
+  ['console', 'browser:console'],
+]);
+const BROWSER_PLATFORM_IDENTIFIERS = new Map([
+  ['Date', 'browser:Date'],
+  ['fetch', 'browser:fetch'],
+  ['setTimeout', 'browser:timers'],
+  ['clearTimeout', 'browser:timers'],
+  ['setInterval', 'browser:timers'],
+  ['clearInterval', 'browser:timers'],
+  ['requestAnimationFrame', 'browser:animation-frame'],
+]);
+
+function buildBrowserApis(graph) {
+  return moduleRecords(graph)
+    .flatMap((record) => (Array.isArray(record.browserApis) ? record.browserApis : [])
+      .map((api) => ({
+        ...api,
+        modulePath: record.rel,
+        reachable: Boolean(record.reachable),
+      })))
+    .sort((a, b) => compareLocale(a.api, b.api)
+      || compareLocale(a.modulePath, b.modulePath)
+      || a.line - b.line);
+}
+
 ;// CONCATENATED MODULE: ./src/lib/import-parser.js
 
 
@@ -17088,7 +18623,7 @@ function startsInCode(maskedText, index) {
   return index >= 0 && /\S/.test(maskedText[index] || '');
 }
 
-function collectStringConstants(source, maskedSource = maskIgnorableSyntax(source)) {
+function import_parser_collectStringConstants(source, maskedSource = maskIgnorableSyntax(source)) {
   const text = normalizeString(source);
   const masked = normalizeString(maskedSource);
   const constants = new Map();
@@ -17151,7 +18686,7 @@ function extractImportRefs(source) {
   const imports = new Set();
   const text = normalizeString(source);
   const masked = maskIgnorableSyntax(text);
-  const constants = collectStringConstants(text, masked);
+  const constants = import_parser_collectStringConstants(text, masked);
   const refs = [];
   const specifierExpression = `(?:['"](?:\\\\.|[^'"])*['"]|[A-Za-z_$][A-Za-z0-9_$]*)`;
   const staticImportPattern = /\bimport\s+(?!['"])([\s\S]*?)\s+from\s+['"]([^'"]+)['"]/g;
@@ -17627,7 +19162,7 @@ function findRegexLiteralEnd(text, start) {
   return -1;
 }
 
-function declarationSpan({ name, kind, startIndex, endIndex, nameStartIndex, lineStarts, declarationType }) {
+function import_parser_declarationSpan({ name, kind, startIndex, endIndex, nameStartIndex, lineStarts, declarationType }) {
   const startLine = lineNumberAt(startIndex, lineStarts);
   const endLine = lineNumberAt(endIndex, lineStarts);
   const span = {
@@ -17687,7 +19222,7 @@ function extractDeclarationSpans(source) {
     if (masked[bodyStart] !== '{') continue;
     const bodyEnd = findMatchingDelimiter(masked, bodyStart, '{', '}');
     if (bodyEnd === -1) continue;
-    spans.push(declarationSpan({
+    spans.push(import_parser_declarationSpan({
       name: match[1],
       kind: 'function',
       startIndex: match.index,
@@ -17719,7 +19254,7 @@ function extractDeclarationSpans(source) {
       bodyEnd = findExpressionEnd(masked, bodyStart);
     }
     if (bodyEnd === -1) continue;
-    spans.push(declarationSpan({
+    spans.push(import_parser_declarationSpan({
       name: match[1],
       kind: 'arrow',
       startIndex: match.index,
@@ -17733,1407 +19268,25 @@ function extractDeclarationSpans(source) {
   return spans.sort(compareDeclarationSpan);
 }
 
-;// CONCATENATED MODULE: ./src/lib/options.js
+;// CONCATENATED MODULE: ./src/lib/analysis/stable-id.js
 
 
-const DEFAULT_MODULE_LIMIT = 500;
-const MAX_MODULE_LIMIT = 100000;
-const DEFAULT_SOURCE_MODE = 'none';
-const SOURCE_MODES = new Set(['none', 'declarations', 'full']);
-const DEFAULT_FRAMEWORK = 'auto';
-const FRAMEWORKS = new Set(['auto', 'vanilla', 'react']);
 
-function normalizeSourceMode(value = DEFAULT_SOURCE_MODE) {
-  const mode = normalizeString(value || DEFAULT_SOURCE_MODE).trim().toLowerCase();
-  if (!SOURCE_MODES.has(mode)) {
-    throw new Error('--source-mode must be one of none, declarations, or full.');
-  }
-  return mode;
-}
-
-function normalizeModuleLimit(value = DEFAULT_MODULE_LIMIT) {
-  const raw = value == null || value === '' ? String(DEFAULT_MODULE_LIMIT) : utils_normalizeString(value).trim();
-  if (!/^\d+$/.test(raw)) {
-    throw new Error(`--module-limit must be an integer from 1 to ${MAX_MODULE_LIMIT}.`);
-  }
-  const limit = Number(raw);
-  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_MODULE_LIMIT) {
-    throw new Error(`--module-limit must be an integer from 1 to ${MAX_MODULE_LIMIT}.`);
-  }
-  return limit;
-}
-
-function normalizeFramework(value = DEFAULT_FRAMEWORK) {
-  const framework = utils_normalizeString(value || DEFAULT_FRAMEWORK).trim().toLowerCase();
-  if (!FRAMEWORKS.has(framework)) {
-    throw new Error('--framework must be one of auto, vanilla, or react.');
-  }
-  return framework;
-}
-
-function sourcePrivacyMetadata(sourceMode, {
-  declarationCount = 0,
-  moduleSourceCount = 0,
-} = {}) {
-  const mode = normalizeSourceMode(sourceMode);
-  const declarationSourceAvailable = mode === 'declarations' || mode === 'full';
-  const moduleSourceAvailable = mode === 'full';
-  return {
-    sourceMode: mode,
-    declarationSourceAvailable,
-    moduleSourceAvailable,
-    sourceArtifacts: {
-      sourceCodeJson: declarationSourceAvailable,
-      sourceModulesJson: moduleSourceAvailable,
-      functionMapJson: true,
-    },
-    capabilities: {
-      sourceDialogs: declarationSourceAvailable,
-      moduleSourceApi: moduleSourceAvailable,
-      occurrenceSearch: moduleSourceAvailable,
-      structuralFunctionMap: true,
-    },
-    counts: {
-      declarationSourceCount: declarationSourceAvailable ? declarationCount : 0,
-      moduleSourceCount: moduleSourceAvailable ? moduleSourceCount : 0,
-    },
-  };
-}
-
-// EXTERNAL MODULE: ./node_modules/@babel/parser/lib/index.js
-var lib = __nccwpck_require__(429);
-;// CONCATENATED MODULE: ./src/lib/javascript-ast-analysis.js
-
-
-
-
-
-
-const BROWSER_SCRIPT_EXTENSIONS = new Set(['.js', '.jsx', '.mjs']);
-const BROWSER_GLOBALS = new Map([
-  ['window', 'browser:window'],
-  ['document', 'browser:document'],
-  ['navigator', 'browser:navigator'],
-  ['location', 'browser:location'],
-  ['history', 'browser:history'],
-  ['localStorage', 'browser:localStorage'],
-  ['sessionStorage', 'browser:sessionStorage'],
-  ['indexedDB', 'browser:indexedDB'],
-  ['caches', 'browser:caches'],
-  ['fetch', 'browser:fetch'],
-  ['URL', 'browser:URL'],
-  ['URLSearchParams', 'browser:URLSearchParams'],
-  ['WebSocket', 'browser:WebSocket'],
-  ['Worker', 'browser:Worker'],
-  ['SharedWorker', 'browser:SharedWorker'],
-  ['BroadcastChannel', 'browser:BroadcastChannel'],
-  ['crypto', 'browser:crypto'],
-  ['performance', 'browser:performance'],
-  ['requestAnimationFrame', 'browser:animation-frame'],
-  ['cancelAnimationFrame', 'browser:animation-frame'],
-  ['addEventListener', 'browser:event-target'],
-  ['removeEventListener', 'browser:event-target'],
-  ['matchMedia', 'browser:media-query'],
-]);
-const IGNORED_TRAVERSE_KEYS = new Set([
-  'comments',
-  'end',
-  'errors',
-  'extra',
-  'innerComments',
-  'leadingComments',
-  'loc',
-  'start',
-  'trailingComments',
-  'tokens',
-]);
-
-function isBrowserScriptPath(modulePath) {
-  return BROWSER_SCRIPT_EXTENSIONS.has(external_node_path_namespaceObject.posix.extname(toPosixPath(modulePath)).toLowerCase());
-}
-
-function parseSourceFile(filePath, sourceText) {
-  try {
-    return (0,lib/* parse */.qg)(sourceText, {
-      sourceFilename: filePath,
-      sourceType: 'module',
-      errorRecovery: true,
-      plugins: ['jsx', 'importAttributes'],
-    });
-  } catch (error) {
-    throw new Error(`Unable to parse browser JavaScript/JSX module ${toPosixPath(filePath)}: ${error.message}`);
-  }
-}
-
-function childNodes(node) {
-  const children = [];
-  if (!node || typeof node !== 'object') return children;
-  for (const [key, value] of Object.entries(node)) {
-    if (IGNORED_TRAVERSE_KEYS.has(key)) continue;
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        if (item && typeof item.type === 'string') children.push(item);
-      }
-    } else if (value && typeof value.type === 'string') {
-      children.push(value);
-    }
-  }
-  return children;
-}
-
-function traverseAst(root, enter) {
-  const visit = (node, parent = null, grandparent = null) => {
-    if (!node || typeof node.type !== 'string') return;
-    enter(node, parent, grandparent);
-    for (const child of childNodes(node)) visit(child, node, parent);
-  };
-  visit(root);
-}
-
-function lineNumberAtSourcePosition(sourceFile, position) {
-  const loc = sourceFile.loc && Number.isInteger(position)
-    ? sourceFile.loc
-    : null;
-  return loc?.start?.line || 1;
-}
-
-function columnNumberAtSourcePosition(sourceFile, position) {
-  const loc = sourceFile.loc && Number.isInteger(position)
-    ? sourceFile.loc
-    : null;
-  return Number.isInteger(loc?.start?.column) ? loc.start.column + 1 : 1;
-}
-
-function nodeStart(node) {
-  return Number.isInteger(node?.start) ? node.start : 0;
-}
-
-function nodeInclusiveEnd(node) {
-  return Number.isInteger(node?.end) ? Math.max(nodeStart(node), node.end - 1) : nodeStart(node);
-}
-
-function javascript_ast_analysis_declarationSpan({
-  name,
-  kind,
-  node,
-  nameNode,
-  startNode = node,
-  endNode = node,
-  declarationType,
-}) {
-  const startIndex = nodeStart(startNode);
-  const endIndex = nodeInclusiveEnd(endNode);
-  const startLine = startNode?.loc?.start?.line || 1;
-  const endLine = endNode?.loc?.end?.line || startLine;
-  const nameStartIndex = Number.isInteger(nameNode?.start) ? nameNode.start : null;
-  const span = {
-    name,
-    kind,
-    startLine,
-    endLine,
-    lineCount: endLine - startLine + 1,
-  };
-  Object.defineProperties(span, {
-    startIndex: { value: startIndex },
-    endIndex: { value: endIndex },
-    nameStartIndex: { value: nameStartIndex },
-    nameEndIndex: { value: Number.isInteger(nameStartIndex) ? nameStartIndex + name.length : null },
-    declarationType: { value: declarationType },
-  });
-  return span;
-}
-
-function identifierName(node) {
-  return node?.type === 'Identifier' ? node.name : '';
-}
-
-function variableStatementForDeclaration(parent, grandparent) {
-  return grandparent?.type === 'ExportNamedDeclaration' || grandparent?.type === 'ExportDefaultDeclaration'
-    ? grandparent
-    : parent;
-}
-
-function functionDeclarationType(node) {
-  if (node?.type === 'FunctionDeclaration') return 'function-declaration';
-  if (node?.type === 'FunctionExpression') return 'function-expression-name';
-  return 'arrow-variable';
-}
-
-function collectDeclarationSpans(sourceFile) {
-  const spans = [];
-  traverseAst(sourceFile.program, (node, parent, grandparent) => {
-    if ((node.type === 'FunctionDeclaration' || node.type === 'FunctionExpression') && node.id && node.body) {
-      const name = identifierName(node.id);
-      if (name) {
-        spans.push(javascript_ast_analysis_declarationSpan({
-          name,
-          kind: 'function',
-          node,
-          nameNode: node.id,
-          declarationType: functionDeclarationType(node),
-        }));
-      }
-    }
-
-    if (node.type === 'VariableDeclarator' && node.id?.type === 'Identifier' && node.init) {
-      const initializer = node.init;
-      if (initializer.type === 'ArrowFunctionExpression' || initializer.type === 'FunctionExpression') {
-        const statement = variableStatementForDeclaration(parent, grandparent) || node;
-        spans.push(javascript_ast_analysis_declarationSpan({
-          name: node.id.name,
-          kind: initializer.type === 'ArrowFunctionExpression' ? 'arrow' : 'function',
-          node,
-          nameNode: node.id,
-          startNode: statement,
-          endNode: initializer,
-          declarationType: initializer.type === 'ArrowFunctionExpression'
-            ? 'arrow-variable'
-            : 'function-expression-name',
-        }));
-      }
-    }
-  });
-  return spans.sort((a, b) => compareLocale(a.name, b.name)
-    || a.startLine - b.startLine
-    || a.endLine - b.endLine
-    || compareLocale(a.kind, b.kind));
-}
-
-function stringLiteralText(node) {
-  if (!node) return '';
-  if (node.type === 'StringLiteral') return node.value;
-  if (node.type === 'DirectiveLiteral') return node.value;
-  if (node.type === 'TemplateLiteral' && node.expressions.length === 0) {
-    return node.quasis[0]?.value?.cooked ?? node.quasis[0]?.value?.raw ?? '';
-  }
-  return '';
-}
-
-function javascript_ast_analysis_collectStringConstants(sourceFile) {
-  const constants = new Map();
-  traverseAst(sourceFile.program, (node) => {
-    if (
-      node.type === 'VariableDeclarator'
-      && node.id?.type === 'Identifier'
-      && node.init
-    ) {
-      const value = stringLiteralText(node.init);
-      if (value) constants.set(node.id.name, value);
-    }
-  });
-  return constants;
-}
-
-function staticStringExpressionText(node, constants) {
-  const literal = stringLiteralText(node);
-  if (literal) return literal;
-  if (node?.type === 'Identifier') return constants.get(node.name) || '';
-  return '';
-}
-
-function bindingKind(imported) {
-  return imported === 'default' ? 'default' : 'named';
-}
-
-function importDeclarationRef(node) {
-  const specifier = stringLiteralText(node.source);
-  if (!specifier) return null;
-  const bindings = [];
-  for (const imported of Array.isArray(node.specifiers) ? node.specifiers : []) {
-    if (imported.type === 'ImportDefaultSpecifier') {
-      bindings.push({
-        imported: 'default',
-        local: imported.local.name,
-        kind: 'default',
-        inferred: false,
-      });
-    } else if (imported.type === 'ImportNamespaceSpecifier') {
-      bindings.push({
-        imported: '*',
-        local: imported.local.name,
-        kind: 'namespace',
-        inferred: false,
-      });
-    } else if (imported.type === 'ImportSpecifier') {
-      const importedName = identifierName(imported.imported) || stringLiteralText(imported.imported);
-      bindings.push({
-        imported: importedName,
-        local: imported.local.name,
-        kind: bindingKind(importedName),
-        inferred: false,
-      });
-    }
-  }
-  return {
-    specifier,
-    kind: bindings.length > 0 ? 'static' : 'side-effect',
-    bindings,
-  };
-}
-
-function exportDeclarationRef(node) {
-  const specifier = stringLiteralText(node.source);
-  if (!specifier) return null;
-  const bindings = [];
-  for (const exported of Array.isArray(node.specifiers) ? node.specifiers : []) {
-    if (exported.type !== 'ExportSpecifier') continue;
-    const imported = identifierName(exported.local) || stringLiteralText(exported.local);
-    const local = identifierName(exported.exported) || stringLiteralText(exported.exported);
-    if (imported && local) {
-      bindings.push({
-        imported,
-        local,
-        kind: 'named',
-        inferred: false,
-      });
-    }
-  }
-  return { specifier, kind: 'export', bindings };
-}
-
-function normalizeBinding(binding = {}) {
-  const kind = utils_normalizeString(binding.kind || 'named').trim() || 'named';
-  const imported = kind === 'namespace'
-    ? '*'
-    : kind === 'default'
-      ? 'default'
-      : utils_normalizeString(binding.imported).trim();
-  const local = utils_normalizeString(binding.local).trim();
-  if (!imported || !local) return null;
-  return {
-    imported,
-    local,
-    kind,
-    inferred: Boolean(binding.inferred),
-  };
-}
-
-function normalizeRef(ref = {}) {
-  const specifier = utils_normalizeString(ref?.specifier).trim();
-  if (!specifier) return null;
-  const bindings = (Array.isArray(ref.bindings) ? ref.bindings : [])
-    .map(normalizeBinding)
-    .filter(Boolean)
-    .sort((a, b) => compareLocale(a.kind, b.kind)
-      || compareLocale(a.imported, b.imported)
-      || compareLocale(a.local, b.local));
-  return {
-    specifier,
-    bindings,
-    kind: utils_normalizeString(ref.kind || 'static').trim() || 'static',
-  };
-}
-
-function calleeName(node) {
-  if (!node) return '';
-  if (node.type === 'Identifier') return node.name;
-  if (node.type === 'ThisExpression') return 'this';
-  if (node.type === 'Super') return 'super';
-  if (node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') {
-    if (node.computed) return '';
-    const property = identifierName(node.property);
-    const object = calleeName(node.object);
-    return object && property ? `${object}.${property}` : property;
-  }
-  return '';
-}
-
-function importedSpecifierFromImportExpression(node, constants) {
-  if (!node) return '';
-  if (node.type === 'AwaitExpression') return importedSpecifierFromImportExpression(node.argument, constants);
-  if (node.type === 'ImportExpression') return staticStringExpressionText(node.source, constants);
-  if (node.type !== 'CallExpression' && node.type !== 'OptionalCallExpression') return '';
-  const name = calleeName(node.callee);
-  if (node.callee?.type !== 'Import' && name !== 'window.import') return '';
-  return node.arguments[0] ? staticStringExpressionText(node.arguments[0], constants) : '';
-}
-
-function firstImportedSpecifierInExpression(node, constants) {
-  const direct = importedSpecifierFromImportExpression(node, constants);
-  if (direct) return direct;
-  let found = '';
-  const visit = (candidate) => {
-    if (!candidate || found) return;
-    const specifier = importedSpecifierFromImportExpression(candidate, constants);
-    if (specifier) {
-      found = specifier;
-      return;
-    }
-    for (const child of childNodes(candidate)) visit(child);
-  };
-  visit(node);
-  return found;
-}
-
-function importedSpecifierFromLazyInitializer(node, constants) {
-  if (node?.type === 'ArrowFunctionExpression' || node?.type === 'FunctionExpression') {
-    if (node.body?.type === 'BlockStatement') {
-      for (const statement of node.body.body || []) {
-        if (statement.type === 'ReturnStatement') {
-          const specifier = firstImportedSpecifierInExpression(statement.argument, constants);
-          if (specifier) return specifier;
-        }
-      }
-      return '';
-    }
-    return firstImportedSpecifierInExpression(node.body, constants);
-  }
-  return '';
-}
-
-function workerSpecifierFromExpression(node, constants) {
-  if (!node || !['CallExpression', 'NewExpression'].includes(node.type)) return '';
-  const name = calleeName(node.callee);
-  if (name !== 'Worker' && name !== 'SharedWorker') return '';
-  const first = node.arguments?.[0];
-  if (!first) return '';
-  const literal = staticStringExpressionText(first, constants);
-  if (literal) return literal;
-  if (
-    first.type === 'NewExpression'
-    && calleeName(first.callee) === 'URL'
-    && first.arguments?.[0]
-  ) {
-    return staticStringExpressionText(first.arguments[0], constants);
-  }
-  return '';
-}
-
-function bindingNameFromNameNode(node) {
-  return node?.type === 'Identifier' ? node.name : '';
-}
-
-function dynamicImportBindingsFromBindingName(node) {
-  if (!node) return [];
-  if (node.type === 'Identifier') {
-    return [{
-      imported: '*',
-      local: node.name,
-      kind: 'namespace',
-      inferred: false,
-    }];
-  }
-  if (node.type === 'ObjectPattern') {
-    return node.properties
-      .map((property) => {
-        if (property.type !== 'ObjectProperty') return null;
-        const imported = identifierName(property.key) || stringLiteralText(property.key);
-        const local = bindingNameFromNameNode(property.value);
-        if (!imported || !local) return null;
-        return {
-          imported,
-          local,
-          kind: imported === 'default' ? 'default' : 'named',
-          inferred: false,
-        };
-      })
-      .filter(Boolean);
-  }
-  return [];
-}
-
-function lazyComponentBindingFromBindingName(node) {
-  if (!node || node.type !== 'Identifier') return [];
-  return [{
-    imported: 'default',
-    local: node.name,
-    kind: 'default',
-    inferred: false,
-  }];
-}
-
-function expressionFromMaybeAwait(node) {
-  if (node?.type === 'AwaitExpression') return node.argument;
-  return node;
-}
-
-function commonJsRefFromAssignment(node) {
-  if (node?.type !== 'AssignmentExpression' || node.operator !== '=') return null;
-  const leftName = calleeName(node.left);
-  if (leftName !== 'module.exports' && !leftName.startsWith('exports.')) return null;
-  return {
-    kind: 'commonjs-export',
-    specifier: '',
-    line: node.loc?.start?.line || 1,
-    column: Number.isInteger(node.loc?.start?.column) ? node.loc.start.column + 1 : 1,
-  };
-}
-
-function collectImportRefs(sourceFile) {
-  const refs = [];
-  const commonJsRefs = [];
-  const constants = javascript_ast_analysis_collectStringConstants(sourceFile);
-
-  traverseAst(sourceFile.program, (node) => {
-    if (node.type === 'VariableDeclarator' && node.init) {
-      const expression = expressionFromMaybeAwait(node.init);
-      const specifier = importedSpecifierFromImportExpression(expression, constants);
-      const bindings = specifier ? dynamicImportBindingsFromBindingName(node.id) : [];
-      if (specifier && bindings.length > 0) refs.push({ specifier, kind: 'dynamic', bindings });
-
-      const lazySpecifier = ['React.lazy', 'lazy'].includes(calleeName(expression?.callee))
-        ? importedSpecifierFromLazyInitializer(expression.arguments?.[0], constants)
-        : '';
-      const lazyBindings = lazySpecifier ? lazyComponentBindingFromBindingName(node.id) : [];
-      if (lazySpecifier && lazyBindings.length > 0) {
-        refs.push({ specifier: lazySpecifier, kind: 'lazy', bindings: lazyBindings });
-      }
-    }
-
-    const declarationRef = node.type === 'ImportDeclaration'
-      ? importDeclarationRef(node)
-      : (node.type === 'ExportNamedDeclaration' || node.type === 'ExportAllDeclaration')
-        ? exportDeclarationRef(node)
-        : null;
-    const normalizedDeclarationRef = normalizeRef(declarationRef);
-    if (normalizedDeclarationRef) refs.push(normalizedDeclarationRef);
-
-    const dynamicSpecifier = importedSpecifierFromImportExpression(node, constants);
-    if (dynamicSpecifier) refs.push({ specifier: dynamicSpecifier, kind: 'dynamic', bindings: [] });
-
-    if (node.type === 'CallExpression' || node.type === 'NewExpression') {
-      const callName = calleeName(node.callee);
-      const lazySpecifier = ['React.lazy', 'lazy'].includes(callName)
-        ? importedSpecifierFromLazyInitializer(node.arguments?.[0], constants)
-        : '';
-      if (lazySpecifier) refs.push({ specifier: lazySpecifier, kind: 'lazy', bindings: [] });
-
-      const workerSpecifier = workerSpecifierFromExpression(node, constants);
-      if (workerSpecifier) refs.push({ specifier: workerSpecifier, kind: 'worker', bindings: [] });
-
-      if (callName === 'require') {
-        commonJsRefs.push({
-          kind: 'require-call',
-          specifier: stringLiteralText(node.arguments?.[0]) || '',
-          line: node.loc?.start?.line || 1,
-          column: Number.isInteger(node.loc?.start?.column) ? node.loc.start.column + 1 : 1,
-        });
-      }
-    }
-
-    const commonJsRef = commonJsRefFromAssignment(node);
-    if (commonJsRef) commonJsRefs.push(commonJsRef);
-  });
-
-  const seen = new Set();
-  const normalizedRefs = refs
-    .map(normalizeRef)
-    .filter(Boolean);
-  const refsWithBindings = new Set(normalizedRefs
-    .filter((ref) => ref.bindings.length > 0)
-    .map((ref) => `${ref.kind}\u0000${ref.specifier}`));
-  const imports = normalizedRefs
-    .filter((ref) => !(ref.bindings.length === 0 && refsWithBindings.has(`${ref.kind}\u0000${ref.specifier}`)))
-    .filter((ref) => {
-      const key = [ref.kind, ref.specifier, JSON.stringify(ref.bindings)].join('\u0000');
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
-    .sort((a, b) => compareLocale(a.kind, b.kind)
-      || compareLocale(a.specifier, b.specifier)
-      || compareLocale(JSON.stringify(a.bindings), JSON.stringify(b.bindings)));
-  return { imports, commonJsRefs };
-}
-
-function jsxTagName(node) {
-  if (!node) return '';
-  if (node.type === 'JSXIdentifier') return node.name;
-  if (node.type === 'JSXMemberExpression') return `${jsxTagName(node.object)}.${jsxTagName(node.property)}`;
-  if (node.type === 'JSXNamespacedName') return `${jsxTagName(node.namespace)}:${jsxTagName(node.name)}`;
-  return '';
-}
-
-function isComponentName(name) {
-  return /^[A-Z]/.test(utils_normalizeString(name).split('.')[0] || '');
-}
-
-function jsxAttribute(attributes, name) {
-  return (attributes || []).find((candidate) => (
-    candidate.type === 'JSXAttribute' && candidate.name?.name === name
-  )) || null;
-}
-
-function jsxAttributeValue(attributes, name) {
-  const property = jsxAttribute(attributes, name);
-  if (!property || !property.value) return '';
-  if (property.value.type === 'StringLiteral') return property.value.value;
-  if (
-    property.value.type === 'JSXExpressionContainer'
-    && property.value.expression
-  ) {
-    return stringLiteralText(property.value.expression);
-  }
-  return '';
-}
-
-function jsxAttributeExpression(attributes, name) {
-  const property = jsxAttribute(attributes, name);
-  if (!property || property.value?.type !== 'JSXExpressionContainer') return null;
-  return property.value.expression || null;
-}
-
-function firstComponentNameInExpression(node) {
-  if (!node) return '';
-  if (node.type === 'Identifier' && isComponentName(node.name)) return node.name;
-  if (node.type === 'JSXElement') return jsxTagName(node.openingElement?.name);
-  if (node.type === 'JSXFragment') return 'Fragment';
-  let found = '';
-  for (const child of childNodes(node)) {
-    if (!found) found = firstComponentNameInExpression(child);
-  }
-  return found;
-}
-
-function objectPropertyName(node) {
-  return identifierName(node) || stringLiteralText(node);
-}
-
-function objectLiteralPropertyString(node, propertyName) {
-  if (node?.type !== 'ObjectExpression') return '';
-  const property = (node.properties || []).find((candidate) => (
-    candidate.type === 'ObjectProperty'
-    && objectPropertyName(candidate.key) === propertyName
-  ));
-  return property ? stringLiteralText(property.value) : '';
-}
-
-function objectLiteralPropertyComponent(node) {
-  if (node?.type !== 'ObjectExpression') return '';
-  const keys = new Set(['element', 'Component', 'component']);
-  for (const property of node.properties || []) {
-    if (property.type !== 'ObjectProperty' || !keys.has(objectPropertyName(property.key))) continue;
-    return firstComponentNameInExpression(property.value);
-  }
-  return '';
-}
-
-function routeObjectsFromExpression(node) {
-  if (!node || node.type !== 'ArrayExpression') return [];
-  const routes = [];
-  const visitRouteObject = (objectNode, parentPath = '') => {
-    if (objectNode?.type !== 'ObjectExpression') return;
-    const routePath = objectLiteralPropertyString(objectNode, 'path');
-    const component = objectLiteralPropertyComponent(objectNode);
-    const fullPath = routePath
-      ? routePath.startsWith('/') || !parentPath
-        ? routePath
-        : `${parentPath.replace(/\/+$/g, '')}/${routePath.replace(/^\/+/g, '')}`
-      : parentPath;
-    if (fullPath || component) {
-      routes.push({
-        path: fullPath || '',
-        component,
-        adapter: 'react-router',
-        sourceKind: 'createBrowserRouter',
-        line: objectNode.loc?.start?.line || 1,
-      });
-    }
-    const childrenProperty = (objectNode.properties || []).find((candidate) => (
-      candidate.type === 'ObjectProperty'
-      && objectPropertyName(candidate.key) === 'children'
-      && candidate.value?.type === 'ArrayExpression'
-    ));
-    if (childrenProperty) {
-      for (const child of childrenProperty.value.elements || []) visitRouteObject(child, fullPath);
-    }
-  };
-  for (const element of node.elements || []) visitRouteObject(element);
-  return routes;
-}
-
-function nearestDeclarationName(declarationSpans, index) {
-  const candidates = declarationSpans
-    .filter((span) => Number.isInteger(span.startIndex)
-      && Number.isInteger(span.endIndex)
-      && index >= span.startIndex
-      && index <= span.endIndex)
-    .sort((a, b) => (a.endIndex - a.startIndex) - (b.endIndex - b.startIndex));
-  return candidates[0]?.name || '';
-}
-
-function collectFrontEndFacts(sourceFile, declarationSpans) {
-  const components = new Map();
-  const componentRefs = [];
-  const routes = [];
-  const browserApis = new Map();
-
-  for (const span of declarationSpans) {
-    if (/^[A-Z]/.test(span.name) || /^use[A-Z0-9]/.test(span.name)) {
-      components.set(span.name, {
-        name: span.name,
-        kind: /^[A-Z]/.test(span.name) ? 'component' : 'hook',
-        modulePath: '',
-        startLine: span.startLine,
-        endLine: span.endLine,
-      });
-    }
-  }
-
-  const addBrowserApi = (name, node) => {
-    const api = BROWSER_GLOBALS.get(name);
-    if (!api) return;
-    const line = lineNumberAtSourcePosition(node, nodeStart(node));
-    const key = `${api}\u0000${line}`;
-    if (!browserApis.has(key)) {
-      browserApis.set(key, {
-        api,
-        name,
-        line,
-        column: columnNumberAtSourcePosition(node, nodeStart(node)),
-      });
-    }
-  };
-
-  traverseAst(sourceFile.program, (node) => {
-    if (node.type === 'JSXOpeningElement') {
-      const tag = jsxTagName(node.name);
-      const line = node.loc?.start?.line || 1;
-      const owner = nearestDeclarationName(declarationSpans, nodeStart(node));
-      if (isComponentName(tag)) {
-        componentRefs.push({
-          owner,
-          component: tag,
-          line,
-          sourceKind: 'jsx-element',
-        });
-      }
-      if (tag === 'Route' || tag.endsWith('.Route')) {
-        const routePath = jsxAttributeValue(node.attributes, 'path') || jsxAttributeValue(node.attributes, 'index');
-        const elementExpression = jsxAttributeExpression(node.attributes, 'element')
-          || jsxAttributeExpression(node.attributes, 'Component');
-        routes.push({
-          path: routePath === 'true' ? '' : routePath,
-          component: firstComponentNameInExpression(elementExpression),
-          adapter: 'react-router',
-          sourceKind: 'jsx-route',
-          line,
-        });
-      }
-    }
-
-    if (node.type === 'CallExpression' && calleeName(node.callee) === 'createBrowserRouter') {
-      routes.push(...routeObjectsFromExpression(node.arguments?.[0]));
-    }
-
-    if (node.type === 'Identifier') addBrowserApi(node.name, node);
-  });
-
-  return {
-    components: Array.from(components.values()).sort((a, b) => compareLocale(a.name, b.name)),
-    componentRefs: componentRefs.sort((a, b) => compareLocale(a.owner, b.owner)
-      || compareLocale(a.component, b.component)
-      || a.line - b.line),
-    routes: routes
-      .filter((route) => route.path || route.component)
-      .sort((a, b) => compareLocale(a.path, b.path)
-        || compareLocale(a.component, b.component)
-        || a.line - b.line),
-    browserApis: Array.from(browserApis.values())
-      .sort((a, b) => compareLocale(a.api, b.api) || a.line - b.line),
-  };
-}
-
-function createJavaScriptAstAnalysisContext() {
-  const sourceFiles = new Map();
-  const analyzer = {
-    name: 'javascript-ast',
-    parser: '@babel/parser',
-    language: 'browser-jsx',
-  };
-
-  const sourceFileFor = (filePath, sourceText) => {
-    const resolved = external_node_path_namespaceObject.resolve(filePath);
-    const cacheKey = `${resolved}\u0000${sourceText}`;
-    if (!sourceFiles.has(cacheKey)) sourceFiles.set(cacheKey, parseSourceFile(resolved, sourceText));
-    return sourceFiles.get(cacheKey);
-  };
-
-  return {
-    analyzer,
-    backend: analyzer,
-    analyzeFile(filePath, sourceText) {
-      if (!isBrowserScriptPath(filePath)) {
-        throw new Error(`IronGlancer only analyzes browser JavaScript modules (.js, .jsx, .mjs): ${toPosixPath(filePath)}`);
-      }
-      const sourceFile = sourceFileFor(filePath, sourceText);
-      const declarationSpans = collectDeclarationSpans(sourceFile);
-      const { imports, commonJsRefs } = collectImportRefs(sourceFile);
-      const facts = collectFrontEndFacts(sourceFile, declarationSpans);
-      return {
-        declarationSpans,
-        importRefs: imports,
-        commonJsRefs,
-        typeOnlyRanges: [],
-        ...facts,
-      };
-    },
-  };
-}
-
-;// CONCATENATED MODULE: ./src/lib/analyze-project.js
-
-
-
-
-
-
-
-
-
-const DEFAULT_ENTRY_CANDIDATES = [
-  'index.html',
-  'src/index.html',
-  'src/main.jsx',
-  'src/main.js',
-  'src/index.jsx',
-  'src/index.js',
-  'src/app.jsx',
-  'src/app.js',
-];
-
-const DEFAULT_ROUTE_ALIASES = [
-  { from: '/', to: '' },
-  { from: '/', to: 'public' },
-];
-
-const HTML_ENTRY_EXTENSIONS = new Set(['.html', '.htm']);
-const ANALYZABLE_MODULE_EXTENSIONS = new Set(['.js', '.jsx', '.mjs']);
-const ASSET_EXTENSIONS = new Set([
-  '.css',
-  '.scss',
-  '.sass',
-  '.less',
-  '.json',
-  '.svg',
-  '.png',
-  '.jpg',
-  '.jpeg',
-  '.gif',
-  '.webp',
-  '.avif',
-  '.ico',
-  '.woff',
-  '.woff2',
-  '.ttf',
-  '.otf',
-  '.wasm',
-  '.worker.js',
-  '.worker.mjs',
-]);
-const EXCLUDED_DISCOVERY_DIRS = new Set([
-  '.git',
-  '.hg',
-  '.svn',
-  'node_modules',
-  'bower_components',
-  'dist',
-  'build',
-  'coverage',
-  'out',
-  'site',
-  'docs',
-  '.worktrees',
-  '.codex-worktrees',
-  '.next',
-  '.nuxt',
-  '.svelte-kit',
-  '.parcel-cache',
-  '.vite',
-]);
-const lexicalBlockRangeCache = new WeakMap();
-const loopScopeRangeCache = new WeakMap();
-const stringConstantValueCache = new WeakMap();
-const identifierReferenceLocationCache = new WeakMap();
-const visibleLocalBindingLocationCache = new WeakMap();
-const FUNCTION_DEPENDENCY_LIMITATIONS = [
-  'Static function dependencies are based on identifier references inside saved declaration spans; IronGlancer does not execute code or prove runtime control flow.',
-  'Usage syntax is labeled as call, optional-call, tagged-template, jsx-element, or reference from nearby source syntax; reference entries are not claimed to be definite runtime calls.',
-  'Imported targets are limited to browser ESM imports, dynamic imports, React.lazy boundaries, and module worker entries with statically resolvable bindings.',
-  'Same-module targets are limited to named function declarations and named arrow-function variable declarations discovered in the same file; dynamic property dispatch, aliasing through arbitrary values, and unresolved re-exports are outside this map.',
-  'Placement review is deterministic static affinity evidence; it is a review aid, not a runtime ownership proof or definitive dead-code detector.',
-];
-const PLATFORM_IMPORT_SPECIFIERS = new Set([
-  'assert',
-  'buffer',
-  'child_process',
-  'cluster',
-  'console',
-  'constants',
-  'crypto',
-  'dgram',
-  'diagnostics_channel',
-  'dns',
-  'domain',
-  'events',
-  'fs',
-  'http',
-  'http2',
-  'https',
-  'inspector',
-  'module',
-  'net',
-  'os',
-  'path',
-  'perf_hooks',
-  'process',
-  'punycode',
-  'querystring',
-  'readline',
-  'repl',
-  'stream',
-  'string_decoder',
-  'timers',
-  'tls',
-  'trace_events',
-  'tty',
-  'url',
-  'util',
-  'v8',
-  'vm',
-  'worker_threads',
-  'zlib',
-]);
-const UNSUPPORTED_SOURCE_EXTENSIONS = new Set(['.cjs', '.cts', '.mts', '.ts', '.tsx']);
-const BROWSER_PLATFORM_NAMESPACES = new Map([
-  ['window', 'browser:window'],
-  ['document', 'browser:document'],
-  ['navigator', 'browser:navigator'],
-  ['localStorage', 'browser:localStorage'],
-  ['sessionStorage', 'browser:sessionStorage'],
-  ['Intl', 'browser:Intl'],
-  ['URL', 'browser:URL'],
-  ['Math', 'browser:Math'],
-  ['console', 'browser:console'],
-]);
-const BROWSER_PLATFORM_IDENTIFIERS = new Map([
-  ['Date', 'browser:Date'],
-  ['fetch', 'browser:fetch'],
-  ['setTimeout', 'browser:timers'],
-  ['clearTimeout', 'browser:timers'],
-  ['setInterval', 'browser:timers'],
-  ['clearInterval', 'browser:timers'],
-  ['requestAnimationFrame', 'browser:animation-frame'],
-]);
-
-function normalizeImportAliasTarget(value) {
-  return toPosixPath(utils_normalizeString(value).trim());
-}
-
-function parseAliasString(value) {
-  const raw = utils_normalizeString(value).trim();
-  const separatorIndex = raw.indexOf('=');
-  if (separatorIndex === -1) {
-    throw new Error(`Invalid alias "${raw}". Use specifier=path.`);
-  }
-  const from = raw.slice(0, separatorIndex).trim();
-  const to = raw.slice(separatorIndex + 1).trim();
-  if (!from || !to) throw new Error('Aliases must include both a specifier and target path.');
-  return [from, normalizeImportAliasTarget(to)];
-}
-
-function normalizeImportAliases(values = []) {
-  const aliases = new Map();
-  const entries = Array.isArray(values) ? values : [values].filter(Boolean);
-  for (const entry of entries) {
-    if (typeof entry === 'string') {
-      const [from, to] = parseAliasString(entry);
-      aliases.set(from, to);
-    } else if (Array.isArray(entry)) {
-      aliases.set(utils_normalizeString(entry[0]).trim(), normalizeImportAliasTarget(entry[1]));
-    } else if (entry && typeof entry === 'object') {
-      aliases.set(utils_normalizeString(entry.from ?? entry.alias ?? entry.specifier).trim(), normalizeImportAliasTarget(entry.to ?? entry.path));
-    }
-  }
-  for (const [key, value] of aliases) {
-    if (!key || !value) aliases.delete(key);
-  }
-  return aliases;
-}
-
-function aliasesFromImportMap(importMap = {}) {
-  const aliases = new Map();
-  const imports = importMap && typeof importMap.imports === 'object' && !Array.isArray(importMap.imports)
-    ? importMap.imports
-    : {};
-  for (const [key, value] of Object.entries(imports)) {
-    const rawValue = normalizeImportAliasTarget(value);
-    if (!rawValue) continue;
-    aliases.set(key, rawValue);
-  }
-  return aliases;
-}
-
-function mergeAliasMaps(...maps) {
-  const aliases = new Map();
-  for (const map of maps) {
-    for (const [key, value] of map instanceof Map ? map : []) {
-      if (key && value) aliases.set(key, value);
-    }
-  }
-  return aliases;
-}
-
-function parseHtmlAttributes(rawAttributes) {
-  const attrs = new Map();
-  const pattern = /([A-Za-z_:][-A-Za-z0-9_:.]*)\s*(?:=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
-  let match;
-  while ((match = pattern.exec(utils_normalizeString(rawAttributes)))) {
-    attrs.set(match[1].toLowerCase(), match[2] ?? match[3] ?? match[4] ?? '');
-  }
-  return attrs;
-}
-
-function parseHtmlEntry(source) {
-  const html = utils_normalizeString(source);
-  const importMaps = [];
-  const moduleScriptSrcs = [];
-  const importMapPattern = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
-  let match;
-  while ((match = importMapPattern.exec(html))) {
-    const attrs = parseHtmlAttributes(match[1]);
-    const type = utils_normalizeString(attrs.get('type')).trim().toLowerCase();
-    const src = utils_normalizeString(attrs.get('src')).trim();
-    if (type === 'importmap') {
-      try {
-        importMaps.push(JSON.parse(match[2]));
-      } catch (error) {
-        throw new Error(`Invalid HTML import map JSON: ${error.message}`);
-      }
-    } else if (type === 'module' && src) {
-      moduleScriptSrcs.push(src);
-    }
-  }
-  return {
-    importAliases: mergeAliasMaps(...importMaps.map(aliasesFromImportMap)),
-    moduleScriptSrcs,
-  };
-}
-
-async function loadImportAliases(rootDir, entryRel = '') {
-  const aliases = new Map();
-  const htmlCandidates = [
-    external_node_path_namespaceObject.join(rootDir, 'index.html'),
-    entryRel ? external_node_path_namespaceObject.join(rootDir, external_node_path_namespaceObject.posix.dirname(toPosixPath(entryRel)), 'index.html') : '',
-  ].filter(Boolean);
-
-  for (const htmlPath of htmlCandidates) {
-    try {
-      const html = await promises_namespaceObject.readFile(htmlPath, 'utf8');
-      for (const [key, value] of parseHtmlEntry(html).importAliases) aliases.set(key, value);
-    } catch {
-      // best effort only
-    }
-  }
-  return aliases;
-}
-
-function parseRouteAliasString(value) {
-  const raw = utils_normalizeString(value).trim();
-  const separatorIndex = raw.indexOf('=');
-  if (separatorIndex === -1) {
-    throw new Error(`Invalid route alias "${raw}". Use route=path.`);
-  }
-  return {
-    from: raw.slice(0, separatorIndex),
-    to: raw.slice(separatorIndex + 1),
-  };
-}
-
-function routeAliasEntries(routeAliases) {
-  const entries = Array.isArray(routeAliases) ? routeAliases : [routeAliases].filter(Boolean);
-  return entries.map((entry) => (typeof entry === 'string' ? parseRouteAliasString(entry) : entry));
-}
-
-function normalizeRouteAliasFrom(value) {
-  const raw = toPosixPath(utils_normalizeString(value).trim());
-  if (!raw) return '';
-  const rooted = raw.startsWith('/') ? raw : `/${raw}`;
-  return rooted.replace(/\/+$/g, '') || '/';
-}
-
-function normalizeRouteAliasTarget(value) {
-  const raw = toPosixPath(utils_normalizeString(value).trim());
-  if (!raw) return '';
-  const normalized = raw.replace(/^\.\//, '').replace(/^\/+/, '').replace(/\/+$/g, '');
-  return normalized === '.' ? '' : normalized;
-}
-
-function normalizeRouteAliases(routeAliases = []) {
-  return routeAliasEntries(routeAliases)
-    .map((entry, index) => {
-      const from = normalizeRouteAliasFrom(Array.isArray(entry) ? entry[0] : entry?.from);
-      const targetSource = Array.isArray(entry) ? entry[1] : entry?.to;
-      const to = normalizeRouteAliasTarget(targetSource);
-      if (!from || targetSource == null) {
-        throw new Error('Route aliases must include a route and target path.');
-      }
-      return { from, to, index };
-    })
-    .sort((a, b) => b.from.length - a.from.length || a.index - b.index)
-    .map(({ from, to }) => ({ from, to }));
-}
-
-function expandImportAliasTarget(value) {
-  return toPosixPath(utils_normalizeString(value).trim())
-    .replace('__REVIEW_ORIGIN__/', 'public/');
-}
-
-function joinImportAliasPrefixTarget(target, rest) {
-  const normalizedTarget = toPosixPath(utils_normalizeString(target).trim());
-  const normalizedRest = toPosixPath(utils_normalizeString(rest).trim());
-  if (!normalizedRest) return normalizedTarget;
-  return normalizedTarget.endsWith('/')
-    ? `${normalizedTarget}${normalizedRest}`
-    : external_node_path_namespaceObject.posix.join(normalizedTarget, normalizedRest);
-}
-
-function importAliasTargetForSpecifier(specifier, aliases) {
-  const raw = utils_normalizeString(specifier).trim();
-  let best = null;
-  for (const [key, value] of aliases instanceof Map ? aliases : []) {
-    const alias = utils_normalizeString(key).trim();
-    if (!alias) continue;
-    if (raw === alias) {
-      const candidate = { key: alias, target: value, rest: '' };
-      if (!best || candidate.key.length > best.key.length) best = candidate;
-    } else if (alias.endsWith('/') && raw.startsWith(alias)) {
-      const candidate = { key: alias, target: value, rest: raw.slice(alias.length) };
-      if (!best || candidate.key.length > best.key.length) best = candidate;
-    }
-  }
-  return best ? joinImportAliasPrefixTarget(best.target, best.rest) : '';
-}
-
-function remoteAliasTargetForSpecifier(specifier, aliases) {
-  const aliasTarget = importAliasTargetForSpecifier(specifier, aliases);
-  return isRemoteSpecifier(aliasTarget) ? aliasTarget : '';
-}
-
-async function resolveFromRoot(rootDir, relativePath) {
-  for (const candidate of extensionCandidates(relativePath)) {
-    const filePath = external_node_path_namespaceObject.resolve(rootDir, candidate);
-    if (!isWithinPath(rootDir, filePath)) continue;
-    if (await fileExists(filePath)) {
-      return {
-        rel: toPosixPath(external_node_path_namespaceObject.relative(rootDir, filePath)),
-        filePath,
-      };
-    }
-  }
-  return null;
-}
-
-async function resolveExactFromRoot(rootDir, relativePath) {
-  const normalized = toPosixPath(utils_normalizeString(relativePath).trim()).replace(/^\.\//, '').replace(/^\/+/, '');
-  if (!normalized) return null;
-  const filePath = external_node_path_namespaceObject.resolve(rootDir, normalized);
-  if (!isWithinPath(rootDir, filePath)) return null;
-  if (!await fileExists(filePath)) return null;
-  return {
-    rel: toPosixPath(external_node_path_namespaceObject.relative(rootDir, filePath)),
-    filePath,
-  };
-}
-
-async function resolveEntry(rootDir, entry, { allowHtml = true } = {}) {
-  const requested = utils_normalizeString(entry).trim();
-  const candidates = requested ? [requested] : DEFAULT_ENTRY_CANDIDATES;
-  for (const candidate of candidates) {
-    const normalized = candidate.replace(/^\.\//, '').replace(/^\//, '');
-    const ext = external_node_path_namespaceObject.posix.extname(toPosixPath(normalized)).toLowerCase();
-    if (!allowHtml && HTML_ENTRY_EXTENSIONS.has(ext)) continue;
-    const resolved = HTML_ENTRY_EXTENSIONS.has(ext)
-      ? await resolveExactFromRoot(rootDir, normalized)
-      : await resolveFromRoot(rootDir, normalized);
-    if (!resolved) continue;
-    return {
-      ...resolved,
-      kind: HTML_ENTRY_EXTENSIONS.has(external_node_path_namespaceObject.posix.extname(toPosixPath(resolved.rel)).toLowerCase())
-        ? 'html'
-        : 'module',
-    };
-  }
-  throw new Error(`Unable to resolve browser entry inside ${rootDir}`);
-}
-
-function isAnalyzableModulePath(relativePath) {
-  return ANALYZABLE_MODULE_EXTENSIONS.has(external_node_path_namespaceObject.posix.extname(toPosixPath(relativePath)).toLowerCase());
-}
 
-function localAssetKind(relativePath) {
-  const normalized = toPosixPath(relativePath).toLowerCase();
-  if (normalized.endsWith('.worker.js') || normalized.endsWith('.worker.mjs')) return 'worker';
-  const ext = external_node_path_namespaceObject.posix.extname(normalized);
-  if (!ASSET_EXTENSIONS.has(ext)) return '';
-  if (ext === '.css' || ext === '.scss' || ext === '.sass' || ext === '.less') return 'style';
-  if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.svg', '.ico'].includes(ext)) return 'image';
-  if (['.woff', '.woff2', '.ttf', '.otf'].includes(ext)) return 'font';
-  if (ext === '.json') return 'json';
-  if (ext === '.wasm') return 'wasm';
-  return 'unknown';
+function encodedStaticId(value) {
+  return Buffer.from(utils_normalizeString(value), 'utf8').toString('base64url');
 }
 
-function isSupportedBrowserModulePath(relativePath) {
-  return isAnalyzableModulePath(relativePath);
+function compactStableId(prefix, parts) {
+  const digest = (0,external_node_crypto_namespaceObject.createHash)('sha256')
+    .update(parts.map((part) => utils_normalizeString(part)).join('\u0000'))
+    .digest('hex')
+    .slice(0, 16);
+  return `${prefix}_${digest}`;
 }
 
-function normalizeExclude(value) {
-  return toPosixPath(utils_normalizeString(value).trim())
-    .replace(/^\.\//, '')
-    .replace(/^\/+/, '')
-    .replace(/\/+$/g, '');
-}
-
-function normalizeExcludes(values = []) {
-  return (Array.isArray(values) ? values : [values].filter(Boolean))
-    .flatMap((value) => utils_normalizeString(value).split(','))
-    .map(normalizeExclude)
-    .filter(Boolean)
-    .sort(compareLocale);
-}
-
-function pathMatchesExclude(relativePath, excludes) {
-  const rel = normalizeExclude(relativePath);
-  return excludes.some((exclude) => rel === exclude || rel.startsWith(`${exclude}/`));
-}
-
-function isExcludedDiscoveryDir(name, relativePath, excludes) {
-  return EXCLUDED_DISCOVERY_DIRS.has(utils_normalizeString(name).trim())
-    || pathMatchesExclude(relativePath, excludes);
-}
-
-async function discoverAnalyzableModules(rootDir, moduleLimit, excludes = [], roots = ['']) {
-  const discovered = new Map();
-
-  const visit = async (dirPath) => {
-    const entries = (await promises_namespaceObject.readdir(dirPath, { withFileTypes: true }))
-      .sort((a, b) => compareLocale(a.name, b.name));
-    for (const entry of entries) {
-      const filePath = external_node_path_namespaceObject.join(dirPath, entry.name);
-      const rel = toPosixPath(external_node_path_namespaceObject.relative(rootDir, filePath));
-      if (entry.isDirectory()) {
-        if (isExcludedDiscoveryDir(entry.name, rel, excludes)) continue;
-        await visit(filePath);
-      } else if (entry.isFile() && !pathMatchesExclude(rel, excludes) && isAnalyzableModulePath(rel)) {
-        discovered.set(rel, { rel, filePath });
-        if (discovered.size > moduleLimit) {
-          throw new Error(`Module limit exceeded (${moduleLimit}).`);
-        }
-      }
-    }
-  };
-
-  const normalizedRoots = Array.from(new Set((Array.isArray(roots) ? roots : [roots])
-    .map(normalizeExclude))).sort(compareLocale);
-  for (const root of normalizedRoots.length > 0 ? normalizedRoots : ['']) {
-    const dirPath = external_node_path_namespaceObject.resolve(rootDir, root || '.');
-    if (!isWithinPath(rootDir, dirPath)) continue;
-    try {
-      const stat = await promises_namespaceObject.stat(dirPath);
-      if (!stat.isDirectory()) continue;
-    } catch {
-      continue;
-    }
-    await visit(dirPath);
-  }
-  return Array.from(discovered.values()).sort((a, b) => compareLocale(a.rel, b.rel));
-}
-
-function localPathFromRouteAlias(specifier, alias) {
-  const raw = toPosixPath(utils_normalizeString(specifier).trim());
-  if (!raw.startsWith('/')) return null;
-
-  let rest = null;
-  if (alias.from === '/') {
-    rest = raw.replace(/^\/+/, '');
-  } else if (raw === alias.from) {
-    rest = '';
-  } else if (raw.startsWith(`${alias.from}/`)) {
-    rest = raw.slice(alias.from.length + 1);
-  }
+;// CONCATENATED MODULE: ./src/lib/analysis/source-metrics.js
 
-  if (rest == null) return null;
-  return external_node_path_namespaceObject.posix.normalize(external_node_path_namespaceObject.posix.join(alias.to, rest));
-}
-
-async function resolveRouteAlias({ rootDir, specifier, routeAliases }) {
-  for (const alias of routeAliases) {
-    const localPath = localPathFromRouteAlias(specifier, alias);
-    if (localPath == null) continue;
-    const resolved = await resolveBrowserPathFromRoot(rootDir, localPath);
-    if (resolved) return resolved;
-  }
-  return null;
-}
-
-function isRemoteSpecifier(specifier) {
-  return /^(?:https?:)?\/\//i.test(utils_normalizeString(specifier).trim());
-}
-
-function nodeBuiltinSpecifier(specifier) {
-  const raw = utils_normalizeString(specifier).trim();
-  const normalized = raw.startsWith('node:') ? raw.slice('node:'.length) : raw;
-  return PLATFORM_IMPORT_SPECIFIERS.has(normalized) ? normalized : '';
-}
-
-function unsupportedSourceExtension(relativePath) {
-  const ext = external_node_path_namespaceObject.posix.extname(toPosixPath(relativePath)).toLowerCase();
-  return UNSUPPORTED_SOURCE_EXTENSIONS.has(ext) ? ext : '';
-}
-
-async function resolveBrowserPathFromRoot(rootDir, relativePath) {
-  const exact = await resolveExactFromRoot(rootDir, relativePath);
-  if (exact) {
-    const unsupportedExtension = unsupportedSourceExtension(exact.rel);
-    if (unsupportedExtension) {
-      return {
-        ...exact,
-        kind: 'unsupported-module',
-        assetKind: null,
-        unsupportedExtension,
-      };
-    }
-    const assetKind = localAssetKind(exact.rel);
-    return {
-      ...exact,
-      kind: isSupportedBrowserModulePath(exact.rel) ? 'module' : 'asset',
-      assetKind: isSupportedBrowserModulePath(exact.rel) ? null : assetKind || 'unknown',
-    };
-  }
-  const module = await resolveFromRoot(rootDir, relativePath);
-  if (module) {
-    return {
-      ...module,
-      kind: 'module',
-      assetKind: null,
-    };
-  }
-  return null;
-}
-
-async function resolveImport({ rootDir, specifier, importerRel, aliases, routeAliases }) {
-  const raw = utils_normalizeString(specifier).trim();
-  if (!raw || isRemoteSpecifier(raw) || nodeBuiltinSpecifier(raw)) return null;
-  const aliasTarget = importAliasTargetForSpecifier(raw, aliases);
-  if (aliasTarget) {
-    const expandedAlias = expandImportAliasTarget(aliasTarget);
-    if (isRemoteSpecifier(expandedAlias)) return null;
-    const routedAlias = await resolveRouteAlias({ rootDir, specifier: expandedAlias, routeAliases });
-    if (routedAlias) return routedAlias;
-    const normalizedAlias = normalizeRouteAliasTarget(expandedAlias);
-    return resolveBrowserPathFromRoot(rootDir, normalizedAlias);
-  }
-  if (raw.startsWith('/')) {
-    return resolveRouteAlias({ rootDir, specifier: raw, routeAliases });
-  }
-  if (raw.startsWith('./') || raw.startsWith('../')) {
-    const importerDir = external_node_path_namespaceObject.posix.dirname(toPosixPath(importerRel));
-    const relativePath = external_node_path_namespaceObject.posix.normalize(external_node_path_namespaceObject.posix.join(importerDir, raw));
-    return resolveBrowserPathFromRoot(rootDir, relativePath);
-  }
-  return null;
-}
 
 function sourceLines(source) {
   const normalized = utils_normalizeString(source);
@@ -19155,6 +19308,28 @@ function scriptStats(rel, source) {
     maxLineLength: lines.reduce((max, line) => Math.max(max, line.length), 0),
   };
 }
+
+;// CONCATENATED MODULE: ./src/lib/analysis/function-analysis.js
+
+
+
+
+
+
+
+
+const lexicalBlockRangeCache = new WeakMap();
+const loopScopeRangeCache = new WeakMap();
+const stringConstantValueCache = new WeakMap();
+const identifierReferenceLocationCache = new WeakMap();
+const visibleLocalBindingLocationCache = new WeakMap();
+const FUNCTION_DEPENDENCY_LIMITATIONS = [
+  'Static function dependencies are based on identifier references inside saved declaration spans; IronGlancer does not execute code or prove runtime control flow.',
+  'Usage syntax is labeled as call, optional-call, tagged-template, jsx-element, or reference from nearby source syntax; reference entries are not claimed to be definite runtime calls.',
+  'Imported targets are limited to browser ESM imports, dynamic imports, React.lazy boundaries, and module worker entries with statically resolvable bindings.',
+  'Same-module targets are limited to named function declarations and named arrow-function variable declarations discovered in the same file; dynamic property dispatch, aliasing through arbitrary values, and unresolved re-exports are outside this map.',
+  'Placement review is deterministic static affinity evidence; it is a review aid, not a runtime ownership proof or definitive dead-code detector.',
+];
 
 function declarationSpansByName(record) {
   const spans = new Map();
@@ -19245,7 +19420,7 @@ function findMatchingBrace(text, startIndex) {
   return -1;
 }
 
-function analyze_project_findMatchingDelimiter(text, startIndex, openChar, closeChar) {
+function function_analysis_findMatchingDelimiter(text, startIndex, openChar, closeChar) {
   let depth = 0;
   for (let index = startIndex; index < text.length; index += 1) {
     if (text[index] === openChar) {
@@ -19639,7 +19814,7 @@ function declarationParameterRange(record, span) {
   if (span?.kind === 'function') {
     const parametersStart = masked.indexOf('(', span.nameEndIndex);
     if (parametersStart === -1) return null;
-    const parametersEnd = analyze_project_findMatchingDelimiter(masked, parametersStart, '(', ')');
+    const parametersEnd = function_analysis_findMatchingDelimiter(masked, parametersStart, '(', ')');
     return parametersEnd === -1 ? null : {
       startIndex: parametersStart + 1,
       endIndex: parametersEnd,
@@ -19656,7 +19831,7 @@ function declarationParameterRange(record, span) {
     parametersStart = findNextNonWhitespaceIndex(masked, parametersStart + 'async'.length);
   }
   if (masked[parametersStart] === '(') {
-    const parametersEnd = analyze_project_findMatchingDelimiter(masked, parametersStart, '(', ')');
+    const parametersEnd = function_analysis_findMatchingDelimiter(masked, parametersStart, '(', ')');
     if (parametersEnd !== -1 && parametersEnd <= arrowIndex) {
       return {
         startIndex: parametersStart + 1,
@@ -19756,7 +19931,7 @@ function statementContinuationStarts(text, index) {
   return '`([{.,?:+-*/%&|^<>=!~'.includes(char);
 }
 
-function analyze_project_hasLineTerminatorBetween(text, start, end) {
+function function_analysis_hasLineTerminatorBetween(text, start, end) {
   for (let index = start; index < end; index += 1) {
     if (text[index] === '\n' || text[index] === '\r') return true;
   }
@@ -19833,7 +20008,7 @@ function expressionStatementEndIndex(masked, start, limit) {
 function conditionEndAfterKeyword(masked, keywordEnd, limit) {
   const conditionStart = findNextNonWhitespaceIndex(masked, keywordEnd);
   if (conditionStart >= limit || masked[conditionStart] !== '(') return -1;
-  return analyze_project_findMatchingDelimiter(masked, conditionStart, '(', ')');
+  return function_analysis_findMatchingDelimiter(masked, conditionStart, '(', ')');
 }
 
 function bracedBlockEndIndex(masked, blockStart, limit) {
@@ -19894,7 +20069,7 @@ function doStatementEndIndex(masked, start, limit) {
 function restrictedExpressionStatementEndIndex(masked, start, keyword, limit) {
   const keywordEnd = start + keyword.length;
   const nextIndex = findNextNonWhitespaceIndex(masked, keywordEnd);
-  if (analyze_project_hasLineTerminatorBetween(masked, keywordEnd, nextIndex)) return keywordEnd;
+  if (function_analysis_hasLineTerminatorBetween(masked, keywordEnd, nextIndex)) return keywordEnd;
   const semicolonIndex = findNextNonWhitespaceIndex(masked, keywordEnd);
   if (masked[semicolonIndex] === ';') return semicolonIndex + 1;
   return expressionStatementEndIndex(masked, start, limit);
@@ -19903,7 +20078,7 @@ function restrictedExpressionStatementEndIndex(masked, start, keyword, limit) {
 function restrictedJumpStatementEndIndex(masked, start, keyword, limit) {
   const keywordEnd = start + keyword.length;
   const nextIndex = findNextNonWhitespaceIndex(masked, keywordEnd);
-  if (analyze_project_hasLineTerminatorBetween(masked, keywordEnd, nextIndex)) return keywordEnd;
+  if (function_analysis_hasLineTerminatorBetween(masked, keywordEnd, nextIndex)) return keywordEnd;
   if (masked[nextIndex] === ';') return nextIndex + 1;
   const labelEnd = identifierEndIndex(masked, nextIndex);
   if (labelEnd > nextIndex) {
@@ -19920,7 +20095,7 @@ function loopHeaderBoundsAt(masked, forIndex, limit) {
     headerStart = findNextNonWhitespaceIndex(masked, headerStart + 'await'.length);
   }
   if (headerStart >= limit || masked[headerStart] !== '(') return null;
-  const headerEnd = analyze_project_findMatchingDelimiter(masked, headerStart, '(', ')');
+  const headerEnd = function_analysis_findMatchingDelimiter(masked, headerStart, '(', ')');
   if (headerEnd === -1) return null;
   return {
     headerStartIndex: headerStart,
@@ -20346,13 +20521,13 @@ function lineNumberAtSourceIndex(source, index) {
   return found + 1;
 }
 
-function analyze_project_unescapeStringLiteralValue(value) {
+function function_analysis_unescapeStringLiteralValue(value) {
   return utils_normalizeString(value).replace(/\\(['"\\])/g, '$1');
 }
 
 function stringLiteralExpressionValue(expression) {
   const match = utils_normalizeString(expression).trim().match(/^(['"])((?:\\.|(?!\1)[\s\S])*?)\1$/);
-  return match ? analyze_project_unescapeStringLiteralValue(match[2]) : '';
+  return match ? function_analysis_unescapeStringLiteralValue(match[2]) : '';
 }
 
 function stringConstantValues(record) {
@@ -20365,7 +20540,7 @@ function stringConstantValues(record) {
   let match;
   while ((match = pattern.exec(source))) {
     if (!/\S/.test(masked[match.index] || '')) continue;
-    constants.set(match[1], analyze_project_unescapeStringLiteralValue(match[3]));
+    constants.set(match[1], function_analysis_unescapeStringLiteralValue(match[3]));
   }
   stringConstantValueCache.set(record, constants);
   return constants;
@@ -20619,6 +20794,15 @@ function importBindingDeclarationTarget(targetRecord, binding) {
   }
   if (kind === 'default') return defaultExportDeclarationTarget(targetRecord);
   return null;
+}
+
+function importBindingIsTypeOnly(binding = {}) {
+  return Boolean(binding?.typeOnly);
+}
+
+function importRefIsTypeOnly(ref = {}) {
+  const bindings = Array.isArray(ref.bindings) ? ref.bindings : [];
+  return Boolean(ref.typeOnly) || (bindings.length > 0 && bindings.every(importBindingIsTypeOnly));
 }
 
 function declarationImportMetricsFor(metrics, record, declarationName) {
@@ -21206,94 +21390,6 @@ function buildDeclarationImportMetrics(graph) {
   }]));
 }
 
-function memberMetricLabel(label, lineCount, metrics = emptyDeclarationImportMetrics()) {
-  if (!Number.isInteger(lineCount) || lineCount <= 0) return label;
-  const referenceCount = Number.isInteger(metrics.referenceCount) && metrics.referenceCount >= 0
-    ? metrics.referenceCount
-    : 0;
-  const importerFileCount = Number.isInteger(metrics.importerFileCount) && metrics.importerFileCount >= 0
-    ? metrics.importerFileCount
-    : 0;
-  return `${label} [lines: ${lineCount} | refs: ${referenceCount} | importers: ${importerFileCount}]`;
-}
-
-function mermaidClassLabel(record) {
-  return `${record.stats.lineCount} ${external_node_path_namespaceObject.posix.basename(record.rel)}`;
-}
-
-function escapeMermaidLabel(label) {
-  return utils_normalizeString(label).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-}
-
-function mermaidClassHeader(record, classId) {
-  return `class ${classId}["${escapeMermaidLabel(mermaidClassLabel(record))}"]`;
-}
-
-function importSpecifierLooksLocal(specifier, aliases, routeAliases) {
-  const raw = utils_normalizeString(specifier).trim();
-  if (!raw) return false;
-  if (raw.startsWith('.') || raw.startsWith('/')) return true;
-  for (const key of aliases.keys()) {
-    if (raw === key || (key.endsWith('/') && raw.startsWith(key))) return true;
-  }
-  return routeAliases.some((alias) => raw === alias.from.slice(0, -1) || raw.startsWith(alias.from));
-}
-
-function importBindingIsTypeOnly(binding = {}) {
-  return Boolean(binding?.typeOnly);
-}
-
-function importRefIsTypeOnly(ref = {}) {
-  const bindings = Array.isArray(ref.bindings) ? ref.bindings : [];
-  return Boolean(ref.typeOnly) || (bindings.length > 0 && bindings.every(importBindingIsTypeOnly));
-}
-
-function externalLabel(specifier) {
-  const raw = utils_normalizeString(specifier).trim();
-  if (!raw) return '';
-  if (/^https?:\/\//i.test(raw)) {
-    try {
-      return new URL(raw).hostname;
-    } catch {
-      return raw;
-    }
-  }
-  return raw;
-}
-
-function isIgnoredExternalLabel(label) {
-  return utils_normalizeString(label).trim().toLowerCase() === 'react';
-}
-
-function isJsxModule(rel) {
-  return /\.jsx$/i.test(rel);
-}
-
-function moduleRecords(graph, { reachableOnly = false } = {}) {
-  return Array.from(graph.modules.values())
-    .filter((record) => !reachableOnly || record.reachable)
-    .sort((a, b) => compareLocale(a.rel, b.rel));
-}
-
-function jsxModuleRecords(graph, options = {}) {
-  return moduleRecords(graph, options)
-    .filter((record) => isJsxModule(record.rel))
-    .sort((a, b) => compareLocale(a.rel, b.rel));
-}
-
-function buildClassIds(records) {
-  const baseCounts = new Map();
-  const ids = new Map();
-  for (const record of records) {
-    const base = utils_normalizeString(external_node_path_namespaceObject.posix.basename(record.rel, external_node_path_namespaceObject.posix.extname(record.rel)))
-      .replace(/[^A-Za-z0-9_$]/g, '_') || 'Module';
-    const count = (baseCounts.get(base) || 0) + 1;
-    baseCounts.set(base, count);
-    ids.set(record.rel, count === 1 ? base : `${base}_${count}`);
-  }
-  return ids;
-}
-
 function importedScriptVariableName(ref) {
   const bindings = Array.isArray(ref?.bindings) ? ref.bindings : [];
   const binding = bindings.find((candidate) => candidate.kind === 'named')
@@ -21423,98 +21519,6 @@ function importedScriptSourceDeclarationsForJsx(
   }
   return Array.from(declarations.values())
     .sort((a, b) => compareLocale(a.name, b.name));
-}
-
-function importKindRank(kind) {
-  if (kind === 'default') return 0;
-  if (kind === 'namespace') return 1;
-  return 2;
-}
-
-function compareImportEdgeBinding(a, b) {
-  return importKindRank(a.kind) - importKindRank(b.kind)
-    || compareLocale(a.imported, b.imported)
-    || compareLocale(a.local, b.local)
-    || Number(a.inferred) - Number(b.inferred);
-}
-
-function importBindingLineCount(graph, targetRel, binding) {
-  if (binding.kind !== 'named') return null;
-  const targetRecord = graph.modules.get(targetRel);
-  const target = importBindingDeclarationTarget(targetRecord, binding);
-  return target?.span?.lineCount || declarationLineCount(targetRecord, target?.declarationName);
-}
-
-function edgeRestingLabel(loadKinds) {
-  const kinds = Array.isArray(loadKinds) ? loadKinds : Array.from(loadKinds || []);
-  const isLazyOnly = kinds.length > 0
-    && kinds.every((kind) => kind === 'lazy' || kind === 'dynamic');
-  return isLazyOnly ? 'lazy' : 'import';
-}
-
-function buildImportEdges(graph, { reachableOnly = false } = {}) {
-  const jsxModules = jsxModuleRecords(graph, { reachableOnly });
-  const classIds = buildClassIds(jsxModules);
-  const edgeMap = new Map();
-
-  for (const record of jsxModules) {
-    const source = classIds.get(record.rel);
-    for (const ref of Array.isArray(record.importRefs) ? record.importRefs : []) {
-      if (importRefIsTypeOnly(ref)) continue;
-      if (!ref?.localRel || !classIds.has(ref.localRel)) continue;
-      const key = `${record.rel}\u0000${ref.localRel}`;
-      if (!edgeMap.has(key)) {
-        const targetRecord = graph.modules.get(ref.localRel);
-        edgeMap.set(key, {
-          source,
-          target: classIds.get(ref.localRel),
-          sourcePath: record.rel,
-          targetPath: ref.localRel,
-          targetLineCount: targetRecord?.stats?.lineCount || null,
-          loadKinds: new Set(),
-          imports: new Map(),
-        });
-      }
-
-      const edge = edgeMap.get(key);
-      const loadKind = utils_normalizeString(ref.kind).trim();
-      if (loadKind) edge.loadKinds.add(loadKind);
-      for (const binding of Array.isArray(ref.bindings) ? ref.bindings : []) {
-        if (!binding?.imported || !binding?.local) continue;
-        const lineCount = importBindingLineCount(graph, ref.localRel, binding);
-        const enriched = lineCount ? { ...binding, lineCount } : binding;
-        const bindingKey = `${binding.kind}\u0000${binding.imported}\u0000${binding.local}\u0000${binding.inferred}`;
-        edge.imports.set(bindingKey, enriched);
-      }
-    }
-  }
-
-  return Array.from(edgeMap.values())
-    .map((edge) => ({
-      source: edge.source,
-      target: edge.target,
-      sourcePath: edge.sourcePath,
-      targetPath: edge.targetPath,
-      targetLineCount: edge.targetLineCount,
-      loadKinds: Array.from(edge.loadKinds).sort(compareLocale),
-      imports: Array.from(edge.imports.values()).sort(compareImportEdgeBinding),
-    }))
-    .sort((a, b) => compareLocale(a.sourcePath, b.sourcePath)
-      || compareLocale(a.targetPath, b.targetPath)
-      || compareLocale(a.source, b.source)
-      || compareLocale(a.target, b.target));
-}
-
-function encodedStaticId(value) {
-  return Buffer.from(utils_normalizeString(value), 'utf8').toString('base64url');
-}
-
-function compactStableId(prefix, parts) {
-  const digest = (0,external_node_crypto_namespaceObject.createHash)('sha256')
-    .update(parts.map((part) => utils_normalizeString(part)).join('\u0000'))
-    .digest('hex')
-    .slice(0, 16);
-  return `${prefix}_${digest}`;
 }
 
 function functionStableIdForNode(node = {}) {
@@ -22352,43 +22356,6 @@ function buildFunctionDependencyMap(graph) {
   };
 }
 
-function buildMermaid(graph, importEdges, declarationImportMetrics, { reachableOnly = false } = {}) {
-  const jsxModules = jsxModuleRecords(graph, { reachableOnly });
-  const classIds = buildClassIds(jsxModules);
-  const lines = ['classDiagram'];
-  if (jsxModules.length === 0) {
-    lines.push('  %% No JSX modules found.');
-    return lines.join('\n');
-  }
-  for (const record of jsxModules) {
-    const classId = classIds.get(record.rel);
-    const variables = importedScriptMembersForJsx(record, graph, declarationImportMetrics);
-    const components = componentSpans(record);
-    if (variables.length === 0 && components.length === 0) {
-      lines.push(`  ${mermaidClassHeader(record, classId)}`);
-      continue;
-    }
-    lines.push(`  ${mermaidClassHeader(record, classId)} {`);
-    for (const variable of variables) {
-      lines.push(`    +${memberMetricLabel(variable.name, variable.lineCount, variable.metrics)}`);
-    }
-    for (const [component] of components) {
-      const lineCount = declarationLineCount(record, component);
-      lines.push(`    +${memberMetricLabel(
-        `${component}()`,
-        lineCount,
-        declarationImportMetricsFor(declarationImportMetrics, record, component),
-      )}`);
-    }
-    lines.push('  }');
-  }
-  for (const edge of importEdges) {
-    if (!classIds.has(edge.sourcePath) || !classIds.has(edge.targetPath)) continue;
-    lines.push(`  ${edge.source} --> ${edge.target} : ${edgeRestingLabel(edge.loadKinds)}`);
-  }
-  return lines.join('\n');
-}
-
 function declarationSpanForFunctionNode(record, functionNode = {}) {
   return declarationSpans(record)
     .find((span) => (
@@ -22502,6 +22469,155 @@ function buildSourceCode(graph, declarationImportMetrics, declarationRelationshi
   return { modules, declarations };
 }
 
+;// CONCATENATED MODULE: ./src/lib/analysis/module-graph.js
+
+
+
+
+
+
+
+
+function memberMetricLabel(label, lineCount, metrics = emptyDeclarationImportMetrics()) {
+  if (!Number.isInteger(lineCount) || lineCount <= 0) return label;
+  const referenceCount = Number.isInteger(metrics.referenceCount) && metrics.referenceCount >= 0
+    ? metrics.referenceCount
+    : 0;
+  const importerFileCount = Number.isInteger(metrics.importerFileCount) && metrics.importerFileCount >= 0
+    ? metrics.importerFileCount
+    : 0;
+  return `${label} [lines: ${lineCount} | refs: ${referenceCount} | importers: ${importerFileCount}]`;
+}
+
+function mermaidClassLabel(record) {
+  return `${record.stats.lineCount} ${external_node_path_namespaceObject.posix.basename(record.rel)}`;
+}
+
+function escapeMermaidLabel(label) {
+  return utils_normalizeString(label).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+function mermaidClassHeader(record, classId) {
+  return `class ${classId}["${escapeMermaidLabel(mermaidClassLabel(record))}"]`;
+}
+
+function importKindRank(kind) {
+  if (kind === 'default') return 0;
+  if (kind === 'namespace') return 1;
+  return 2;
+}
+
+function compareImportEdgeBinding(a, b) {
+  return importKindRank(a.kind) - importKindRank(b.kind)
+    || compareLocale(a.imported, b.imported)
+    || compareLocale(a.local, b.local)
+    || Number(a.inferred) - Number(b.inferred);
+}
+
+function importBindingLineCount(graph, targetRel, binding) {
+  if (binding.kind !== 'named') return null;
+  const targetRecord = graph.modules.get(targetRel);
+  const target = importBindingDeclarationTarget(targetRecord, binding);
+  return target?.span?.lineCount || declarationLineCount(targetRecord, target?.declarationName);
+}
+
+function edgeRestingLabel(loadKinds) {
+  const kinds = Array.isArray(loadKinds) ? loadKinds : Array.from(loadKinds || []);
+  const isLazyOnly = kinds.length > 0
+    && kinds.every((kind) => kind === 'lazy' || kind === 'dynamic');
+  return isLazyOnly ? 'lazy' : 'import';
+}
+
+function buildImportEdges(graph, { reachableOnly = false } = {}) {
+  const jsxModules = jsxModuleRecords(graph, { reachableOnly });
+  const classIds = buildClassIds(jsxModules);
+  const edgeMap = new Map();
+
+  for (const record of jsxModules) {
+    const source = classIds.get(record.rel);
+    for (const ref of Array.isArray(record.importRefs) ? record.importRefs : []) {
+      if (importRefIsTypeOnly(ref)) continue;
+      if (!ref?.localRel || !classIds.has(ref.localRel)) continue;
+      const key = `${record.rel}\u0000${ref.localRel}`;
+      if (!edgeMap.has(key)) {
+        const targetRecord = graph.modules.get(ref.localRel);
+        edgeMap.set(key, {
+          source,
+          target: classIds.get(ref.localRel),
+          sourcePath: record.rel,
+          targetPath: ref.localRel,
+          targetLineCount: targetRecord?.stats?.lineCount || null,
+          loadKinds: new Set(),
+          imports: new Map(),
+        });
+      }
+
+      const edge = edgeMap.get(key);
+      const loadKind = utils_normalizeString(ref.kind).trim();
+      if (loadKind) edge.loadKinds.add(loadKind);
+      for (const binding of Array.isArray(ref.bindings) ? ref.bindings : []) {
+        if (!binding?.imported || !binding?.local) continue;
+        const lineCount = importBindingLineCount(graph, ref.localRel, binding);
+        const enriched = lineCount ? { ...binding, lineCount } : binding;
+        const bindingKey = `${binding.kind}\u0000${binding.imported}\u0000${binding.local}\u0000${binding.inferred}`;
+        edge.imports.set(bindingKey, enriched);
+      }
+    }
+  }
+
+  return Array.from(edgeMap.values())
+    .map((edge) => ({
+      source: edge.source,
+      target: edge.target,
+      sourcePath: edge.sourcePath,
+      targetPath: edge.targetPath,
+      targetLineCount: edge.targetLineCount,
+      loadKinds: Array.from(edge.loadKinds).sort(compareLocale),
+      imports: Array.from(edge.imports.values()).sort(compareImportEdgeBinding),
+    }))
+    .sort((a, b) => compareLocale(a.sourcePath, b.sourcePath)
+      || compareLocale(a.targetPath, b.targetPath)
+      || compareLocale(a.source, b.source)
+      || compareLocale(a.target, b.target));
+}
+
+function buildMermaid(graph, importEdges, declarationImportMetrics, { reachableOnly = false } = {}) {
+  const jsxModules = jsxModuleRecords(graph, { reachableOnly });
+  const classIds = buildClassIds(jsxModules);
+  const lines = ['classDiagram'];
+  if (jsxModules.length === 0) {
+    lines.push('  %% No JSX modules found.');
+    return lines.join('\n');
+  }
+  for (const record of jsxModules) {
+    const classId = classIds.get(record.rel);
+    const variables = importedScriptMembersForJsx(record, graph, declarationImportMetrics);
+    const components = componentSpans(record);
+    if (variables.length === 0 && components.length === 0) {
+      lines.push(`  ${mermaidClassHeader(record, classId)}`);
+      continue;
+    }
+    lines.push(`  ${mermaidClassHeader(record, classId)} {`);
+    for (const variable of variables) {
+      lines.push(`    +${memberMetricLabel(variable.name, variable.lineCount, variable.metrics)}`);
+    }
+    for (const [component] of components) {
+      const lineCount = declarationLineCount(record, component);
+      lines.push(`    +${memberMetricLabel(
+        `${component}()`,
+        lineCount,
+        declarationImportMetricsFor(declarationImportMetrics, record, component),
+      )}`);
+    }
+    lines.push('  }');
+  }
+  for (const edge of importEdges) {
+    if (!classIds.has(edge.sourcePath) || !classIds.has(edge.targetPath)) continue;
+    lines.push(`  ${edge.source} --> ${edge.target} : ${edgeRestingLabel(edge.loadKinds)}`);
+  }
+  return lines.join('\n');
+}
+
 function buildTreeText(graph) {
   const entry = graph.modules.get(graph.entryRel);
   if (!entry) return '';
@@ -22597,16 +22713,6 @@ function reachableGraphView(graph) {
   };
 }
 
-function uniqueRecords(records, keyFor) {
-  const byKey = new Map();
-  for (const record of records) {
-    const key = keyFor(record);
-    if (!key || byKey.has(key)) continue;
-    byKey.set(key, record);
-  }
-  return Array.from(byKey.values());
-}
-
 function componentKey(modulePath, name) {
   return `${modulePath}\u0000${name}`;
 }
@@ -22684,19 +22790,6 @@ function buildRoutes(graph) {
     .sort((a, b) => compareLocale(a.path, b.path)
       || compareLocale(a.modulePath, b.modulePath)
       || compareLocale(a.component, b.component)
-      || a.line - b.line);
-}
-
-function buildBrowserApis(graph) {
-  return moduleRecords(graph)
-    .flatMap((record) => (Array.isArray(record.browserApis) ? record.browserApis : [])
-      .map((api) => ({
-        ...api,
-        modulePath: record.rel,
-        reachable: Boolean(record.reachable),
-      })))
-    .sort((a, b) => compareLocale(a.api, b.api)
-      || compareLocale(a.modulePath, b.modulePath)
       || a.line - b.line);
 }
 
@@ -22801,6 +22894,22 @@ function buildBrowserIncompatibleImports(graph) {
       || compareLocale(a.specifier, b.specifier));
 }
 
+function filterGraphToReachable(graph) {
+  const reachableModules = new Map(moduleRecords(graph, { reachableOnly: true }).map((record) => [record.rel, record]));
+  const externals = new Set();
+  for (const record of reachableModules.values()) {
+    record.localDeps = record.localDeps.filter((dep) => reachableModules.has(dep));
+    for (const external of record.externalDeps) externals.add(external);
+  }
+  graph.modules = reachableModules;
+  graph.externals = externals;
+  graph.reachableModules = new Set(reachableModules.keys());
+}
+
+;// CONCATENATED MODULE: ./src/lib/findings/findings.js
+
+
+
 function frontEndFindings({ unresolvedImports, browserIncompatibleImports, remoteImports, commonJsSyntax }) {
   return [
     ...browserIncompatibleImports.map((item) => ({
@@ -22841,59 +22950,22 @@ function frontEndFindings({ unresolvedImports, browserIncompatibleImports, remot
     || compareLocale(a.id, b.id));
 }
 
-function filterGraphToReachable(graph) {
-  const reachableModules = new Map(moduleRecords(graph, { reachableOnly: true }).map((record) => [record.rel, record]));
-  const externals = new Set();
-  for (const record of reachableModules.values()) {
-    record.localDeps = record.localDeps.filter((dep) => reachableModules.has(dep));
-    for (const external of record.externalDeps) externals.add(external);
-  }
-  graph.modules = reachableModules;
-  graph.externals = externals;
-  graph.reachableModules = new Set(reachableModules.keys());
-}
+;// CONCATENATED MODULE: ./src/lib/analysis/project-analyzer.js
 
-function entryModuleDiscoveryRoot(moduleRel) {
-  const rel = normalizeExclude(moduleRel);
-  if (!rel) return '';
-  const parts = rel.split('/').filter(Boolean);
-  if (parts.length > 1 && ['src', 'app', 'client', 'frontend', 'web', 'public'].includes(parts[0])) return parts[0];
-  const dir = external_node_path_namespaceObject.posix.dirname(rel);
-  return dir === '.' ? '' : dir;
-}
 
-function includeUnreachableDiscoveryRoots({ sourceRoot, entryModules }) {
-  const normalizedSourceRoot = normalizeExclude(sourceRoot);
-  if (normalizedSourceRoot && normalizedSourceRoot !== '.') return [normalizedSourceRoot];
-  const roots = Array.from(new Set((Array.isArray(entryModules) ? entryModules : [])
-    .map((entryModule) => entryModuleDiscoveryRoot(entryModule.rel))
-    .filter((root) => root)));
-  return roots.length > 0 ? roots.sort(compareLocale) : [''];
-}
 
-async function moduleEntriesForHtmlEntry({ rootDir, htmlEntry, routeAliases }) {
-  const html = await promises_namespaceObject.readFile(htmlEntry.filePath, 'utf8');
-  const parsed = parseHtmlEntry(html);
-  const entryDir = external_node_path_namespaceObject.posix.dirname(htmlEntry.rel);
-  const resolvedEntries = [];
-  for (const src of parsed.moduleScriptSrcs) {
-    const resolved = await resolveImport({
-      rootDir,
-      specifier: src,
-      importerRel: htmlEntry.rel,
-      aliases: parsed.importAliases,
-      routeAliases,
-    }) || await resolveBrowserPathFromRoot(rootDir, external_node_path_namespaceObject.posix.normalize(external_node_path_namespaceObject.posix.join(entryDir, src)));
-    if (resolved?.kind === 'module') resolvedEntries.push(resolved);
-  }
-  if (resolvedEntries.length === 0) {
-    throw new Error(`HTML entry ${htmlEntry.rel} does not contain a resolvable <script type="module" src="...">.`);
-  }
-  return {
-    aliases: parsed.importAliases,
-    entries: uniqueRecords(resolvedEntries, (item) => item.rel).sort((a, b) => compareLocale(a.rel, b.rel)),
-  };
-}
+
+
+
+
+
+
+
+
+
+
+
+
 
 async function analyzeProject({
   rootDir,
@@ -23238,6 +23310,10 @@ async function analyzeProject({
     },
   };
 }
+
+;// CONCATENATED MODULE: ./src/lib/analyze-project.js
+
+
 
 ;// CONCATENATED MODULE: ./src/lib/diff-command.js
 

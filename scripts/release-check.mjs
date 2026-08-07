@@ -2,7 +2,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 const rootDir = path.resolve(new URL('..', import.meta.url).pathname);
-const expectedVersion = '0.2.2';
 
 async function readJson(relativePath) {
   return JSON.parse(await fs.readFile(path.join(rootDir, relativePath), 'utf8'));
@@ -27,17 +26,21 @@ function assert(condition, message) {
 
 const packageJson = await readJson('package.json');
 const packageLock = await readJson('package-lock.json');
+const expectedVersion = packageJson.version;
 
 assert(packageJson.name === 'ironglancer', 'package.json name must remain ironglancer.');
-assert(packageJson.version === expectedVersion, `package.json version must be ${expectedVersion}.`);
+assert(typeof expectedVersion === 'string' && expectedVersion.length > 0, 'package.json version is required.');
 assert(packageLock.name === 'ironglancer', 'package-lock.json name must remain ironglancer.');
 assert(packageLock.version === expectedVersion, `package-lock.json version must be ${expectedVersion}.`);
 assert(packageLock.packages?.['']?.version === expectedVersion, `package-lock root package version must be ${expectedVersion}.`);
 assert(packageJson.dependencies?.['@babel/parser'], '@babel/parser must be a runtime dependency.');
 assert(!packageJson.dependencies?.typescript, 'typescript must not be a runtime dependency.');
+assert(packageJson.peerDependencies?.webpack, 'webpack must remain a peer dependency for ironglancer/webpack.');
+assert(packageJson.peerDependenciesMeta?.webpack?.optional === true, 'webpack peer dependency must be optional.');
 
 const requiredFiles = [
   'README.md',
+  'RELEASING.md',
   'CHANGELOG.md',
   'MIGRATION.md',
   'action.yml',

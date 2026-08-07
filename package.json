@@ -77,6 +77,11 @@
   "peerDependencies": {
     "webpack": "^5.0.0"
   },
+  "peerDependenciesMeta": {
+    "webpack": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@vercel/ncc": "^0.38.4",
     "bundlessdev": "1.0.10",

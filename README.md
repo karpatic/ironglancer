@@ -101,7 +101,7 @@ GitHub Action
 - outputs: `report-path`, `sarif-path`, `gate-triggered`, `finding-count`, and `exit-code`
 
 ```yaml
-- uses: karpatic/ironglancer@v0.2.1
+- uses: karpatic/ironglancer@v0.2.4
   with:
     folder: .
     base: ${{ github.event.pull_request.base.sha }}
@@ -185,7 +185,4 @@ Development
 - `npm run build:action`
 - `npm run check:action-bundle`
 - `npm run release:check`
-
-Release notes
-- 0.2.1 is the replacement registry release for the public v0.2.0 GitHub Release and is complete only after Carlos explicitly publishes both npmjs `ironglancer` and GitHub Packages `@karpatic/ironglancer`
-- do not call a version release complete unless both registries are updated and verified
+- Release process notes live in `RELEASING.md`
