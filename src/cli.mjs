@@ -64,6 +64,9 @@ function parsePort(value) {
 }
 
 function resultPayload(result, service) {
+  const viewerUrl = service?.viewerUrl || service?.url;
+  const apiUrl = service?.apiUrl || service?.apiBaseUrl;
+  const bridgeUrl = service?.bridgeUrl || (viewerUrl ? new URL('bridge/v1/', viewerUrl).href : undefined);
   return {
     ok: true,
     rootDir: null,
@@ -74,10 +77,27 @@ function resultPayload(result, service) {
     summary: result.summary,
     ...(service ? {
       serving: true,
+      ready: Boolean(service.ready ?? true),
+      status: service.status || 'ready',
       host: service.host,
       port: service.port,
-      url: service.url,
-      apiBaseUrl: service.apiBaseUrl,
+      url: viewerUrl,
+      viewerUrl,
+      apiUrl,
+      apiBaseUrl: apiUrl,
+      bridgeUrl,
+      snapshot: service.snapshot || null,
+      build: service.build || null,
+      agent: {
+        transport: 'loopback-http-json',
+        apiUrl,
+        bridgeUrl,
+        boundaries: {
+          analysisApi: 'read-only',
+          viewerBridge: 'presentation-only',
+          execution: 'no shell execution endpoint, source mutation, arbitrary file reads, or natural-language job execution',
+        },
+      },
     } : {}),
   };
 }
@@ -203,7 +223,10 @@ export async function runCli(args = process.argv.slice(2), {
   });
   try {
     await writeStream(stdout, JSON.stringify(resultPayload(result, service), null, 2) + '\n');
-    await writeStream(stderr, `IronGlancer serving ${service.url} with API at ${service.apiBaseUrl}\n`);
+    await writeStream(
+      stderr,
+      `IronGlancer ready: viewer ${service.viewerUrl || service.url} api ${service.apiUrl || service.apiBaseUrl} bridge ${service.bridgeUrl}\n`,
+    );
     if (waitForClose) await waitForShutdown(service);
     return 0;
   } catch (error) {

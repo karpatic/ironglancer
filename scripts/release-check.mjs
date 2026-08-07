@@ -27,6 +27,8 @@ function assert(condition, message) {
 const packageJson = await readJson('package.json');
 const packageLock = await readJson('package-lock.json');
 const expectedVersion = packageJson.version;
+const retiredAgentBin = `ironglancer-${String.fromCharCode(109, 99, 112)}`;
+const retiredProtocolName = String.fromCharCode(77, 67, 80);
 
 assert(packageJson.name === 'ironglancer', 'package.json name must remain ironglancer.');
 assert(typeof expectedVersion === 'string' && expectedVersion.length > 0, 'package.json version is required.');
@@ -37,6 +39,10 @@ assert(packageJson.dependencies?.['@babel/parser'], '@babel/parser must be a run
 assert(!packageJson.dependencies?.typescript, 'typescript must not be a runtime dependency.');
 assert(packageJson.peerDependencies?.webpack, 'webpack must remain a peer dependency for ironglancer/webpack.');
 assert(packageJson.peerDependenciesMeta?.webpack?.optional === true, 'webpack peer dependency must be optional.');
+assert(packageJson.bin?.['ironglancer-agent'] === 'src/agent-cli.mjs', 'package.json must expose ironglancer-agent.');
+assert(!packageJson.bin?.[retiredAgentBin], 'package.json must not expose the retired agent binary.');
+assert(packageLock.packages?.['']?.bin?.['ironglancer-agent'] === 'src/agent-cli.mjs', 'package-lock must expose ironglancer-agent.');
+assert(!packageLock.packages?.['']?.bin?.[retiredAgentBin], 'package-lock must not expose the retired agent binary.');
 
 const requiredFiles = [
   'README.md',
@@ -64,10 +70,14 @@ for (const phrase of [
   'no TypeScript or TSX analysis',
   'Semantic finding IDs',
   'GitHub Action',
-  'MCP caveat',
+  'Standalone agent',
+  'ironglancer-agent',
+  'loopback HTTP JSON',
 ]) {
   assert(readme.includes(phrase), `README.md must document ${phrase}.`);
 }
+assert(!readme.includes(retiredAgentBin), 'README.md must not document the retired agent binary.');
+assert(!readme.includes(`${retiredProtocolName} caveat`), 'README.md must not keep stale agent caveats.');
 
 const migration = await readText('MIGRATION.md');
 assert(migration.includes('0.1 baseline migration'), 'MIGRATION.md must document the 0.1 baseline migration.');

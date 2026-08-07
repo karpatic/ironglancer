@@ -6,7 +6,7 @@ What it does
 - starts from a browser entry: an HTML file with module scripts, or a `.js`, `.jsx`, or `.mjs` module
 - follows browser-reachable ESM imports/exports, dynamic `import()`, `React.lazy`, module workers, import maps, root-relative URLs, and configured import aliases
 - records modules, JSX component-shaped declarations, JSX render edges, lazy boundaries, browser API references, remote imports, assets, unresolved imports, and browser-incompatible Node builtin imports
-- emits a static viewer plus immutable JSON artifacts for local review, CI, and MCP tools
+- emits a static viewer plus immutable JSON artifacts for local review, CI, and local agent tools
 - keeps function dependency evidence as an advanced static view, not as a runtime call graph
 
 What it does not do
@@ -43,7 +43,7 @@ Webpack plugin
 - failed Webpack compilations are skipped, rebuild-triggered analyses are serialized/coalesced, and the previous successful report/service remains active if analysis fails
 - the plugin keeps one managed localhost HTTP service for the existing viewer, read-only `/api/v1`, and viewer bridge `/bridge/v1`
 - `enabled: false` disables the HTTP service only; generation still runs
-- the plugin does not consume Webpack's module graph and does not host MCP
+- the plugin does not consume Webpack's module graph
 
 ```js
 import path from 'node:path';
@@ -120,10 +120,31 @@ Standalone viewer
 - the main view leads with modules/components/lazy boundaries/assets/findings; functions are available as an advanced static-evidence view
 
 Standalone agent
-- generate once: `ironglancer ./my-app --entry index.html --out ./ironglancer-site`
-- run the packaged MCP server over that immutable saved analysis: `ironglancer-mcp --analysis-dir ./ironglancer-site`
-- MCP tools include module/component summary tools plus advanced function tools for static dependency evidence
-- MCP caveat: when source mode is `none` or `declarations`, source excerpt tools return explicit unavailable metadata for missing module source while structural tools continue to work
+- start the loopback service: `ironglancer ./my-app --entry index.html --out ./ironglancer-site --source-mode full --serve --port 0`
+- the serve JSON includes `ready`, `viewerUrl`, `apiUrl`, `bridgeUrl`, and the immutable `snapshot.buildId`
+- use the agent CLI against the already-running service:
+  `ironglancer-agent --url http://127.0.0.1:4173 status`
+- search saved evidence:
+  `ironglancer-agent --url http://127.0.0.1:4173 search App --types module,function,symbol --limit 10`
+- aggregate folder cleanup evidence without semantic conclusions:
+  `ironglancer-agent --url http://127.0.0.1:4173 cleanup-evidence src/features/cart --limit 25`
+- read viewer state:
+  `ironglancer-agent --url http://127.0.0.1:4173 viewer-state`
+- drive the live viewer presentation:
+  `ironglancer-agent --url http://127.0.0.1:4173 graph-view --primary-view function-graphs --layout radial --scope both --depth 2 --wait`
+- focus, open, highlight, or clear presentation state:
+  `ironglancer-agent --url http://127.0.0.1:4173 focus-function --stable-id fn_0123456789abcdef --wait`
+  `ironglancer-agent --url http://127.0.0.1:4173 open-source --module-path src/App.jsx --name App --wait`
+  `ironglancer-agent --url http://127.0.0.1:4173 clear-focus --wait`
+- `--wait` returns the queued command, viewer acknowledgement, and latest viewer state; it exits nonzero on timeout, viewer error, or verification mismatch
+- service URLs are loopback-only. The CLI rejects non-loopback URLs.
+
+Agent HTTP boundaries
+- transport is loopback HTTP JSON, not a remote protocol or job runner
+- `/api/v1` is read-only and serves bounded static evidence from the generated snapshot
+- `/bridge/v1` is presentation-only: graph filters, layout, focus, opening saved source, highlight, and clearing focus
+- there is no shell execution endpoint, arbitrary file read endpoint, source mutation endpoint, remote bind, natural-language job execution, or authentication claim
+- viewer, API, bridge, commands, and acknowledgements expose the same immutable snapshot identity so automation can correlate applied UI state with the analyzed build
 
 Library usage
 ```js
@@ -163,6 +184,7 @@ Viewer bridge
 - `/bridge/v1` is a localhost, presentation-only channel for viewer state and commands
 - agents and surrounding tooling can read viewer state, queue viewer commands, and acknowledge applied commands while keeping architecture queries under read-only `/api/v1`
 - the bridge is part of the same IronGlancer HTTP service as the viewer and API
+- the generated page shows a restrained Agent strip only when the bridge is connected and the snapshot identity matches
 
 Routes
 - `GET /api/v1`

@@ -74,6 +74,10 @@ const networkDepthModes = [
 
 const subtitleEl = document.getElementById('subtitle');
 const buildMetaEl = document.getElementById('build-meta');
+const agentPanelEl = document.getElementById('agent-panel');
+const agentConnectionEl = document.getElementById('agent-connection');
+const agentContextEl = document.getElementById('agent-context');
+const agentLastResultEl = document.getElementById('agent-last-result');
 const statsEl = document.getElementById('stats');
 const jsxTreeEl = document.getElementById('jsx-tree');
 const treeEl = document.getElementById('tree');
@@ -201,6 +205,8 @@ function emptyViewerBridge() {
     stateRevision: 0,
     commandRevision: 0,
     snapshot: null,
+    lastCommand: null,
+    lastResult: null,
   };
 }
 
@@ -5230,6 +5236,50 @@ function currentGraphPresentationState() {
   };
 }
 
+function bridgeSnapshotMatches(localSnapshot = {}, bridgeSnapshot = {}) {
+  return ['buildId', 'sourceCodeHash'].every((key) => (
+    !localSnapshot[key] || !bridgeSnapshot[key] || localSnapshot[key] === bridgeSnapshot[key]
+  ));
+}
+
+function agentFocusLabel() {
+  const selectedFunction = declarationSnapshotForFunctionId(selectedFunctionId);
+  if (selectedFunction) return callableLabel(selectedFunction.name) + ' in ' + selectedFunction.modulePath;
+  if (sourceDialogState.modulePath) return sourceDialogState.modulePath;
+  if (selectedFilePath) return selectedFilePath;
+  return 'None';
+}
+
+function agentViewLabel() {
+  if (activePrimaryView === 'function-graphs') {
+    return 'Functions ' + activeNetworkLayoutMode + ' ' + activeNetworkScope + ' depth ' + activeNetworkDepth;
+  }
+  return 'Components';
+}
+
+function updateAgentPanel() {
+  if (!agentPanelEl) return;
+  if (!viewerBridge.enabled) {
+    agentPanelEl.hidden = true;
+    agentPanelEl.classList.remove('is-connected');
+    return;
+  }
+  agentPanelEl.hidden = false;
+  agentPanelEl.classList.add('is-connected');
+  if (agentConnectionEl) {
+    const build = viewerBridge.snapshot?.buildId ? shortLabel(viewerBridge.snapshot.buildId, 10) : 'unknown build';
+    agentConnectionEl.textContent = 'Connected ' + build;
+  }
+  if (agentContextEl) {
+    agentContextEl.textContent = 'Focus ' + agentFocusLabel() + ' | ' + agentViewLabel();
+  }
+  if (agentLastResultEl) {
+    const command = viewerBridge.lastCommand?.command?.type || viewerBridge.lastCommand?.type || 'Agent';
+    const result = viewerBridge.lastResult?.message || 'Ready';
+    agentLastResultEl.textContent = command + ': ' + result + ' | Presentation only';
+  }
+}
+
 function currentViewerState(reason) {
   return {
     clientId: viewerBridge.clientId,
@@ -5268,6 +5318,7 @@ async function postViewerBridgeJson(pathname, payload) {
 
 function sendViewerBridgeState(reason) {
   if (!viewerBridge.enabled) return;
+  updateAgentPanel();
   postViewerBridgeJson('state', currentViewerState(reason)).catch(() => {});
 }
 
@@ -5485,7 +5536,10 @@ async function pollViewerBridgeCommands() {
       const records = safeArray(payload?.data?.commands);
       for (const record of records) {
         viewerBridge.commandRevision = Math.max(viewerBridge.commandRevision, record.revision || 0);
+        viewerBridge.lastCommand = record;
         const result = applyViewerBridgeCommand(record.command || {});
+        viewerBridge.lastResult = result;
+        updateAgentPanel();
         await acknowledgeViewerBridgeCommand(record, result).catch(() => {});
       }
     }
@@ -5528,6 +5582,7 @@ function canUseViewerBridge() {
 }
 
 async function initViewerBridge(payload = {}) {
+  updateAgentPanel();
   if (!canUseViewerBridge()) return;
   const bridgeUrl = new URL('/bridge/v1/', window.location.href);
   const snapshot = {
@@ -5539,18 +5594,25 @@ async function initViewerBridge(payload = {}) {
   try {
     const response = await fetch(bridgeUrl);
     if (!response.ok) return;
+    const discovery = await response.json();
+    const bridgeSnapshot = discovery?.data?.snapshot || null;
+    if (!bridgeSnapshot || !bridgeSnapshotMatches(snapshot, bridgeSnapshot)) return;
     viewerBridge = {
       enabled: true,
       url: bridgeUrl.href,
       clientId: randomClientId(),
       stateRevision: 0,
       commandRevision: 0,
-      snapshot,
+      snapshot: bridgeSnapshot,
+      lastCommand: null,
+      lastResult: { applied: true, message: 'Ready' },
     };
+    updateAgentPanel();
     sendViewerBridgeState('ready');
     pollViewerBridgeCommands();
   } catch {
     viewerBridge = emptyViewerBridge();
+    updateAgentPanel();
   }
 }
 

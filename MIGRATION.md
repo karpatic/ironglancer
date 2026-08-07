@@ -39,7 +39,7 @@ The default source mode is now `none`.
 - `declarations` writes declaration snippets in `source-code.json` and omits module source.
 - `full` writes both declaration snippets and module source.
 
-Viewer, API, and MCP source workflows report explicit unavailable-source metadata when the selected mode does not include the requested source artifact. Structural module/function metadata remains available.
+Viewer, API, and local agent source workflows report explicit unavailable-source metadata when the selected mode does not include the requested source artifact. Structural module/function metadata remains available.
 
 ### Module limit
 

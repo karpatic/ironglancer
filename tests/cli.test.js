@@ -1030,7 +1030,7 @@ test('cli serve mode generates once and starts the localhost API', async () => {
     '/tmp/ironglancer-cli-serve',
     '--serve',
     '--host',
-    '0.0.0.0',
+    '127.0.0.1',
     '--port',
     '0',
   ], {
@@ -1051,8 +1051,20 @@ test('cli serve mode generates once and starts the localhost API', async () => {
       return {
         host: options.host,
         port: 49152,
-        url: 'http://0.0.0.0:49152/',
-        apiBaseUrl: 'http://0.0.0.0:49152/api/v1',
+        url: 'http://127.0.0.1:49152/',
+        apiBaseUrl: 'http://127.0.0.1:49152/api/v1',
+        bridgeUrl: 'http://127.0.0.1:49152/bridge/v1/',
+        snapshot: {
+          buildId: 'a'.repeat(64),
+          sourceCodeHash: 'b'.repeat(64),
+          generatedAt: '2026-08-07T12:00:00.000Z',
+          entry: 'src/app.jsx',
+        },
+        build: {
+          apiVersion: 'v1',
+          schemaVersion: '0.2.0',
+          package: { name: 'ironglancer', version: '0.2.4' },
+        },
         close: async () => {},
       };
     },
@@ -1081,17 +1093,24 @@ test('cli serve mode generates once and starts the localhost API', async () => {
       name: 'startStaticAnalysisServer',
       options: {
         outDir: '/tmp/ironglancer-cli-serve',
-        host: '0.0.0.0',
+        host: '127.0.0.1',
         port: 0,
       },
     },
   ]);
   const output = JSON.parse(stdout.text());
   assert.equal(output.serving, true);
-  assert.equal(output.host, '0.0.0.0');
+  assert.equal(output.ready, true);
+  assert.equal(output.status, 'ready');
+  assert.equal(output.host, '127.0.0.1');
   assert.equal(output.port, 49152);
-  assert.equal(output.apiBaseUrl, 'http://0.0.0.0:49152/api/v1');
-  assert.match(stderr.text(), /IronGlancer serving/);
+  assert.equal(output.viewerUrl, 'http://127.0.0.1:49152/');
+  assert.equal(output.apiUrl, 'http://127.0.0.1:49152/api/v1');
+  assert.equal(output.apiBaseUrl, 'http://127.0.0.1:49152/api/v1');
+  assert.equal(output.bridgeUrl, 'http://127.0.0.1:49152/bridge/v1/');
+  assert.equal(output.snapshot.buildId, 'a'.repeat(64));
+  assert.equal(output.agent.transport, 'loopback-http-json');
+  assert.match(stderr.text(), /IronGlancer ready/);
 });
 
 test('cli serve mode closes the server when status output fails', async () => {

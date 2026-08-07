@@ -30,7 +30,7 @@
   ],
   "bin": {
     "ironglancer": "src/cli.mjs",
-    "ironglancer-mcp": "src/mcp-server.mjs"
+    "ironglancer-agent": "src/agent-cli.mjs"
   },
   "exports": {
     ".": "./src/index.js",

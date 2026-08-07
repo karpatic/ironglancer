@@ -1098,14 +1098,30 @@ export async function loadStaticAnalysisRun({ outDir } = {}) {
   };
 }
 
+function immutableSnapshot(index) {
+  return {
+    buildId: index.output?.meta?.buildId || null,
+    sourceCodeHash: index.output?.meta?.sourceCodeHash || null,
+    generatedAt: index.output?.meta?.generatedAt || null,
+    entry: index.output?.entry || index.output?.meta?.entry || null,
+  };
+}
+
+function immutableBuild(index) {
+  const meta = index.output?.meta || {};
+  return {
+    apiVersion: API_VERSION,
+    schemaVersion: meta.schemaVersion || DEFAULT_SCHEMA_VERSION,
+    package: {
+      name: meta.packageName || 'ironglancer',
+      version: meta.version || 'unknown',
+    },
+  };
+}
+
 function createViewerBridge(index) {
   return {
-    snapshot: {
-      buildId: index.output?.meta?.buildId || null,
-      sourceCodeHash: index.output?.meta?.sourceCodeHash || null,
-      generatedAt: index.output?.meta?.generatedAt || null,
-      entry: index.output?.entry || index.output?.meta?.entry || null,
-    },
+    snapshot: immutableSnapshot(index),
     stateByClientId: new Map(),
     latestState: null,
     commands: [],
@@ -1113,6 +1129,25 @@ function createViewerBridge(index) {
     commandRevision: 0,
     commandOrdinal: 0,
   };
+}
+
+function assertBridgeSnapshotMatches(bridge, payload = {}) {
+  const candidate = payload.snapshot && typeof payload.snapshot === 'object' ? payload.snapshot : {};
+  const buildId = normalizeString(payload.buildId || candidate.buildId).trim();
+  const sourceCodeHash = normalizeString(payload.sourceCodeHash || candidate.sourceCodeHash).trim();
+  const mismatches = [];
+  if (buildId && bridge.snapshot.buildId && buildId !== bridge.snapshot.buildId) mismatches.push('buildId');
+  if (sourceCodeHash && bridge.snapshot.sourceCodeHash && sourceCodeHash !== bridge.snapshot.sourceCodeHash) {
+    mismatches.push('sourceCodeHash');
+  }
+  if (mismatches.length > 0) {
+    throw apiError(
+      409,
+      'snapshot_mismatch',
+      'Bridge payload snapshot does not match the immutable IronGlancer analysis snapshot.',
+      { mismatches, expected: bridge.snapshot },
+    );
+  }
 }
 
 async function readRequestJson(request) {
@@ -1172,6 +1207,7 @@ function normalizeBridgeClientId(value) {
 }
 
 function updateBridgeViewerState(bridge, payload = {}) {
+  assertBridgeSnapshotMatches(bridge, payload);
   const clientId = normalizeBridgeClientId(payload.clientId);
   const revision = Number(payload.revision);
   if (!Number.isInteger(revision) || revision < 0) {
@@ -1185,7 +1221,7 @@ function updateBridgeViewerState(bridge, payload = {}) {
       revision,
       receivedAt: new Date().toISOString(),
       reason: normalizeString(payload.reason).trim() || null,
-      snapshot: payload.snapshot && typeof payload.snapshot === 'object' ? payload.snapshot : null,
+      snapshot: bridge.snapshot,
       primaryView: normalizeString(payload.primaryView).trim() || null,
       graph: payload.graph && typeof payload.graph === 'object' ? payload.graph : null,
       selectedFunction: payload.selectedFunction && typeof payload.selectedFunction === 'object' ? payload.selectedFunction : null,
@@ -1305,7 +1341,9 @@ function validateSetGraphViewCommand(command) {
 }
 
 function queueBridgeCommand(bridge, payload = {}) {
+  assertBridgeSnapshotMatches(bridge, payload);
   const rawCommand = payload.command && typeof payload.command === 'object' ? payload.command : payload;
+  assertBridgeSnapshotMatches(bridge, rawCommand);
   const type = normalizeString(rawCommand.type || rawCommand.command).trim();
   if (!VIEWER_COMMAND_TYPES.has(type)) {
     throw apiError(400, 'invalid_bridge_command', `Bridge command type must be one of: ${Array.from(VIEWER_COMMAND_TYPES).sort(compareLocale).join(', ')}.`);
@@ -1315,11 +1353,15 @@ function queueBridgeCommand(bridge, payload = {}) {
     type,
   };
   delete command.command;
+  delete command.snapshot;
+  delete command.buildId;
+  delete command.sourceCodeHash;
   if (type === 'setGraphView') validateSetGraphViewCommand(command);
   const record = {
     commandId: normalizeString(payload.commandId).trim() || `vcmd_${++bridge.commandOrdinal}`,
     revision: ++bridge.commandRevision,
     createdAt: new Date().toISOString(),
+    snapshot: bridge.snapshot,
     command,
   };
   bridge.commands.push(record);
@@ -1345,15 +1387,22 @@ function bridgeCommandsSince(bridge, url) {
 }
 
 function acknowledgeBridgeCommand(bridge, payload = {}) {
+  assertBridgeSnapshotMatches(bridge, payload);
   const clientId = normalizeBridgeClientId(payload.clientId);
   const commandId = normalizeString(payload.commandId).trim();
   if (!commandId) throw apiError(400, 'missing_command_id', 'Bridge commandId is required.');
+  const commandRecord = bridge.commands.find((record) => record.commandId === commandId);
+  if (!commandRecord) throw apiError(404, 'command_not_found', 'No queued bridge command exists for that commandId.');
+  if (Number.isInteger(payload.commandRevision) && payload.commandRevision !== commandRecord.revision) {
+    throw apiError(409, 'command_revision_mismatch', 'Bridge acknowledgement commandRevision does not match the queued command.');
+  }
   const status = normalizeString(payload.status).trim() || 'applied';
   const ack = {
     clientId,
     commandId,
-    commandRevision: Number.isInteger(payload.commandRevision) ? payload.commandRevision : null,
+    commandRevision: commandRecord.revision,
     stateRevision: Number.isInteger(payload.stateRevision) ? payload.stateRevision : null,
+    snapshot: bridge.snapshot,
     status,
     message: normalizeString(payload.message).trim() || null,
     receivedAt: new Date().toISOString(),
@@ -1702,6 +1751,18 @@ function discovery(index) {
   return {
     apiVersion: API_VERSION,
     schemaVersion: index.output?.meta?.schemaVersion || DEFAULT_SCHEMA_VERSION,
+    snapshot: immutableSnapshot(index),
+    agentInterop: {
+      transport: 'loopback-http-json',
+      apiUrl: '/api/v1',
+      bridgeUrl: '/bridge/v1/',
+      boundaries: {
+        analysisApi: 'read-only',
+        viewerBridge: 'presentation-only',
+        source: 'bounded saved analysis artifacts only',
+        execution: 'no shell execution endpoint, source mutation, arbitrary file reads, or natural-language job execution',
+      },
+    },
     schema: {
       href: '/api/v1/schema',
       mediaType: 'application/json',
@@ -1770,6 +1831,7 @@ function runMetadata(index, outDir) {
     gitCommit: meta.gitCommit || null,
     buildId: meta.buildId || null,
     sourceCodeHash: meta.sourceCodeHash || null,
+    snapshot: immutableSnapshot(index),
     outDir: path.basename(outDir),
     summary: index.output.summary || {},
     source: {
@@ -3142,7 +3204,14 @@ export async function startStaticAnalysisServer({
     host: resolvedHost,
     port: resolvedPort,
     url,
+    viewerUrl: url,
     apiBaseUrl: `${url}api/v1`,
+    apiUrl: `${url}api/v1`,
+    bridgeUrl: `${url}bridge/v1/`,
+    ready: true,
+    status: 'ready',
+    snapshot: immutableSnapshot(handler.index),
+    build: immutableBuild(handler.index),
     close: () => new Promise((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
     }),

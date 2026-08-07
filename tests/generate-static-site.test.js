@@ -310,22 +310,50 @@ async function runGeneratedViewerApp({
   sourcePayload,
   sourceResponseOk = true,
   sourceFetchReject = false,
+  windowLocation = '',
+  bridgeDiscoveryPayload = null,
+  bridgeFetchLog = [],
   clipboardWriteText,
   execCommand,
   renderedSvgFactory,
   renderedSvgMarkup = '<svg viewBox="0 0 640 320"></svg>',
 }) {
   const document = new FakeDocument(execCommand, renderedSvgFactory);
+  const locationUrl = windowLocation ? new URL(windowLocation) : null;
+  const NativeURL = globalThis.URL;
+  function TestURL(...urlArgs) {
+    return new NativeURL(...urlArgs);
+  }
+  TestURL.createObjectURL = () => 'blob:test';
+  TestURL.revokeObjectURL = () => {};
   const context = {
     Blob,
-    URL: {
-      createObjectURL: () => 'blob:test',
-      revokeObjectURL() {},
-    },
+    URL: TestURL,
+    URLSearchParams: globalThis.URLSearchParams,
     document,
     navigator: clipboardWriteText ? { clipboard: { writeText: clipboardWriteText } } : {},
-    fetch: async (url) => {
-      if (!String(url).includes('source-code.json')) {
+    fetch: async (url, init = {}) => {
+      const href = String(url);
+      if (bridgeDiscoveryPayload && href.includes('/bridge/v1')) {
+        bridgeFetchLog.push({ href, method: init.method || 'GET', body: init.body || '' });
+        if (href.includes('/state')) {
+          return {
+            ok: true,
+            json: async () => ({ ok: true, data: { accepted: true } }),
+          };
+        }
+        if (href.includes('/commands')) {
+          return {
+            ok: true,
+            json: async () => ({ ok: true, data: { commands: [] } }),
+          };
+        }
+        return {
+          ok: true,
+          json: async () => ({ ok: true, data: bridgeDiscoveryPayload }),
+        };
+      }
+      if (!href.includes('source-code.json')) {
         return {
           ok: true,
           json: async () => payload,
@@ -348,6 +376,12 @@ async function runGeneratedViewerApp({
       render: async () => ({ svg: renderedSvgMarkup }),
     },
   };
+  if (locationUrl) {
+    context.window = { location: locationUrl };
+    context.crypto = {
+      randomUUID: () => 'viewer-test-client',
+    };
+  }
   context.globalThis = context;
 
   const source = appJs.replace(
@@ -544,6 +578,8 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.match(html, /id="download-svg-btn"/);
   assert.match(html, /id="source-dialog-neighborhood"/);
   assert.match(html, /id="source-dialog-relationships"/);
+  assert.match(html, /id="agent-panel"[^>]*hidden/);
+  assert.match(html, /id="agent-connection"/);
   assert.doesNotMatch(html, /id="jsx-line-counts-panel"/);
   assert.doesNotMatch(html, />JSX line counts</);
   assert.doesNotMatch(html, />Open JSON</);
@@ -1632,6 +1668,56 @@ test('generated viewer disables source popups for mismatched or unavailable sour
   const unavailable = await renderSourceMember({ sourceFetchReject: true });
   assert.equal(unavailable.document.getElementById('mermaid').textContent, payload.mermaid);
   assert.equal(unavailable.rendered.member.getAttribute('role'), null);
+});
+
+test('generated viewer shows Agent surface only after matching bridge negotiation', async () => {
+  const { appJs, payload, sourcePayload } = await generateTestSite({
+    prefix: 'ironglancer-static-agent-panel-',
+  });
+  const snapshot = {
+    buildId: payload.meta.buildId,
+    sourceCodeHash: payload.meta.sourceCodeHash,
+    generatedAt: payload.meta.generatedAt,
+    entry: payload.entry,
+  };
+  const bridgeFetchLog = [];
+
+  const connected = await runGeneratedViewerApp({
+    appJs,
+    payload,
+    sourcePayload,
+    windowLocation: 'http://127.0.0.1:4173/?bridge=1',
+    bridgeDiscoveryPayload: {
+      bridgeVersion: 'v1',
+      snapshot,
+      commands: ['setGraphView'],
+    },
+    bridgeFetchLog,
+  });
+  for (let attempt = 0; attempt < 10 && connected.document.getElementById('agent-panel').hidden !== false; attempt += 1) {
+    await flushAsyncWork();
+  }
+
+  assert.equal(connected.document.getElementById('agent-panel').hidden, false);
+  assert.match(connected.document.getElementById('agent-connection').textContent, /Connected/);
+  assert.match(connected.document.getElementById('agent-context').textContent, /Components|Functions/);
+  assert.match(connected.document.getElementById('agent-last-result').textContent, /Ready/);
+  assert.ok(bridgeFetchLog.some((entry) => entry.href.includes('/bridge/v1/state') && entry.method === 'POST'));
+
+  const mismatch = await runGeneratedViewerApp({
+    appJs,
+    payload,
+    sourcePayload,
+    windowLocation: 'http://127.0.0.1:4173/?bridge=1',
+    bridgeDiscoveryPayload: {
+      bridgeVersion: 'v1',
+      snapshot: {
+        ...snapshot,
+        buildId: '0'.repeat(64),
+      },
+    },
+  });
+  assert.equal(mismatch.document.getElementById('agent-panel').hidden, true);
 });
 
 test('generated viewer copy controls copy raw output values and report success', async () => {

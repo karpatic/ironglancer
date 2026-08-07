@@ -68,6 +68,11 @@ test('static analysis server exposes viewer files and a versioned cached API', a
     assert.equal(discovery.body.ok, true);
     assert.equal(discovery.body.data.apiVersion, 'v1');
     assert.equal(discovery.body.data.schema.href, '/api/v1/schema');
+    assert.equal(discovery.body.data.agentInterop.apiUrl, '/api/v1');
+    assert.equal(discovery.body.data.agentInterop.bridgeUrl, '/bridge/v1/');
+    assert.equal(discovery.body.data.agentInterop.transport, 'loopback-http-json');
+    assert.equal(discovery.body.data.agentInterop.boundaries.analysisApi, 'read-only');
+    assert.equal(discovery.body.data.agentInterop.boundaries.viewerBridge, 'presentation-only');
     assert.ok(discovery.body.data.routes.some((route) => route.path === '/api/v1/schema'));
     assert.ok(discovery.body.data.routes.some((route) => route.path === '/api/v1/modules'));
     assert.ok(discovery.body.data.routes.some((route) => route.path === '/api/v1/symbols/:id/references'));
@@ -698,6 +703,20 @@ test('viewer bridge stores structured state and presentation command acknowledge
     assert.equal(discovery.response.status, 200);
     assert.equal(discovery.body.data.bridgeVersion, 'v1');
     assert.match(discovery.body.data.semantics.trustBoundary, /localhost/);
+    const run = await fetchJson('/api/v1/run');
+    assert.equal(discovery.body.data.snapshot.buildId, run.body.data.buildId);
+    assert.equal(discovery.body.data.snapshot.sourceCodeHash, run.body.data.sourceCodeHash);
+
+    const staleState = await requestUrl('/bridge/v1/state', {
+      method: 'POST',
+      body: JSON.stringify({
+        clientId: 'viewer-test',
+        revision: 1,
+        snapshot: { buildId: 'stale-build', sourceCodeHash: discovery.body.data.snapshot.sourceCodeHash },
+      }),
+    });
+    assert.equal(staleState.status, 409);
+    assert.equal((await staleState.json()).error.code, 'snapshot_mismatch');
 
     const stateResponse = await requestUrl('/bridge/v1/state', {
       method: 'POST',
@@ -705,7 +724,7 @@ test('viewer bridge stores structured state and presentation command acknowledge
         clientId: 'viewer-test',
         revision: 1,
         reason: 'ready',
-        snapshot: { buildId: discovery.body.data.snapshot.buildId },
+        snapshot: discovery.body.data.snapshot,
         primaryView: 'function-graphs',
         graph: {
           layout: 'network',
@@ -725,9 +744,20 @@ test('viewer bridge stores structured state and presentation command acknowledge
     assert.equal(stateResponse.status, 200);
     assert.equal((await stateResponse.json()).data.accepted, true);
 
+    const staleCommand = await requestUrl('/bridge/v1/commands', {
+      method: 'POST',
+      body: JSON.stringify({
+        snapshot: { buildId: 'stale-build', sourceCodeHash: discovery.body.data.snapshot.sourceCodeHash },
+        command: { type: 'setGraphView', layout: 'radial' },
+      }),
+    });
+    assert.equal(staleCommand.status, 409);
+    assert.equal((await staleCommand.json()).error.code, 'snapshot_mismatch');
+
     const queued = await requestUrl('/bridge/v1/commands', {
       method: 'POST',
       body: JSON.stringify({
+        snapshot: discovery.body.data.snapshot,
         command: {
           type: 'openFunction',
           targetStableId: 'fn_test',
@@ -737,6 +767,7 @@ test('viewer bridge stores structured state and presentation command acknowledge
     assert.equal(queued.status, 201);
     const queuedBody = await queued.json();
     assert.equal(queuedBody.data.command.revision, 1);
+    assert.equal(queuedBody.data.command.snapshot.buildId, discovery.body.data.snapshot.buildId);
 
     const commands = await fetchJson('/bridge/v1/commands?clientId=viewer-test&afterRevision=0');
     assert.equal(commands.response.status, 200);
@@ -752,6 +783,7 @@ test('viewer bridge stores structured state and presentation command acknowledge
         status: 'applied',
         message: 'source opened',
         stateRevision: 2,
+        snapshot: discovery.body.data.snapshot,
       }),
     });
     assert.equal(ack.status, 200);

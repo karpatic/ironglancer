@@ -81,6 +81,52 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         font-size:.92rem;
         overflow-wrap:anywhere;
       }
+      .agent-panel {
+        display:grid;
+        grid-template-columns:minmax(160px,.7fr) minmax(0,1.5fr) minmax(180px,.8fr);
+        gap:10px;
+        align-items:center;
+        margin:0 0 14px;
+        border:1px solid #c9d6e6;
+        border-radius:8px;
+        background:#ffffff;
+        padding:10px 12px;
+        box-shadow:0 8px 18px rgba(31,45,68,.05);
+      }
+      .agent-panel[hidden] { display:none; }
+      .agent-status {
+        display:inline-flex;
+        align-items:center;
+        gap:7px;
+        min-width:0;
+        color:#344054;
+        font-size:.84rem;
+        font-weight:850;
+      }
+      .agent-status-dot {
+        width:9px;
+        height:9px;
+        border-radius:50%;
+        background:#98a2b3;
+        box-shadow:0 0 0 3px rgba(152,162,179,.16);
+        flex:0 0 auto;
+      }
+      .agent-panel.is-connected .agent-status-dot {
+        background:#087f5b;
+        box-shadow:0 0 0 3px rgba(8,127,91,.15);
+      }
+      .agent-field {
+        min-width:0;
+        color:#475467;
+        font-size:.8rem;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+      }
+      .agent-field strong {
+        color:#1f2937;
+        font-weight:850;
+      }
       .panel {
         min-width:0;
         border:1px solid var(--border);
@@ -911,10 +957,11 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
       }
       .error-text { color:var(--danger); }
       @media (max-width: 760px) {
-        .shell { width:min(100% - 18px, 1480px); padding-top:10px; }
-        .header, .function-title, .network-toolbar, .visualization-switch-row { align-items:flex-start; flex-direction:column; }
-        .network-viewport, .module-diagram-viewport { min-height:500px; }
-        .source-dialog-actions { justify-content:flex-start; }
+            .shell { width:min(100% - 18px, 1480px); padding-top:10px; }
+            .agent-panel { grid-template-columns:1fr; }
+            .header, .function-title, .network-toolbar, .visualization-switch-row { align-items:flex-start; flex-direction:column; }
+            .network-viewport, .module-diagram-viewport { min-height:500px; }
+            .source-dialog-actions { justify-content:flex-start; }
       }
     </style>
   </head>
@@ -927,6 +974,12 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
           <p id="build-meta" class="meta-line">Checking build metadata...</p>
         </div>
       </header>
+
+      <section id="agent-panel" class="agent-panel" aria-label="Agent bridge status" hidden>
+        <div id="agent-connection" class="agent-status"><span class="agent-status-dot" aria-hidden="true"></span>Disconnected</div>
+        <div id="agent-context" class="agent-field"><strong>Focus</strong> None</div>
+        <div id="agent-last-result" class="agent-field"><strong>Agent</strong> Presentation only</div>
+      </section>
 
       <main class="viewer-grid">
         <section class="panel" aria-labelledby="visualization-title">
