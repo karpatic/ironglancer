@@ -46,6 +46,11 @@ const networkNodeModes = [
   { id: 'files', label: 'Files', accessibilityLabel: 'Show file nodes' },
   { id: 'functions', label: 'Functions', accessibilityLabel: 'Show function nodes' },
 ];
+const networkSourceFileTypeStorageKey = 'ironglancer:function-network-source-file-types';
+const networkSourceFileTypeModes = [
+  { id: 'jsx', label: 'JSX', accessibilityLabel: 'Show .jsx source files in the function graph' },
+  { id: 'js', label: 'JS', accessibilityLabel: 'Show .js and .mjs source files in the function graph' },
+];
 const networkScopeStorageKey = 'ironglancer:function-network-scope';
 const legacyNetworkDirectionStorageKey = 'ironglancer:function-network-direction';
 const networkDepthStorageKey = 'ironglancer:function-network-depth';
@@ -107,6 +112,7 @@ const networkResetViewBtn = document.getElementById('network-reset-view-btn');
 const networkResetSelectionBtn = document.getElementById('network-reset-selection-btn');
 const networkLayoutSwitchEl = document.getElementById('network-layout-switch');
 const networkNodeSwitchEl = document.getElementById('network-node-switch');
+const networkSourceSwitchEl = document.getElementById('network-source-switch');
 const networkScopeSwitchEl = document.getElementById('network-scope-switch');
 const networkDepthSwitchEl = document.getElementById('network-depth-switch');
 const networkHelpEl = document.getElementById('function-network-help');
@@ -129,14 +135,17 @@ const sourceDialogCloseBtn = document.getElementById('source-dialog-close');
 
 let outputPayload = null;
 let sourcePayload = null;
+let moduleSourcePayload = null;
 let functionMapPayload = { limitations: [], functions: [], edges: [] };
 let latestModuleSvg = '';
 let functions = [];
 let edges = [];
 let fileNodes = [];
+let outputModuleByPath = new Map();
 let functionById = new Map();
 let functionByStableId = new Map();
 let fileByPath = new Map();
+let moduleSourceByPath = new Map();
 let edgesBySourceId = new Map();
 let edgesByTargetId = new Map();
 let fileEdges = [];
@@ -172,13 +181,14 @@ let activeRelationFilter = 'all';
 let activePrimaryView = 'jsx-map';
 let activeNetworkLayoutMode = 'network';
 let activeNetworkNodeVisibility = { files: false, functions: true };
+let activeNetworkSourceFileTypes = { jsx: true, js: false };
 let activeNetworkScope = 'full';
 let activeNetworkDepth = '1';
 let visibleNetworkGraph = null;
 let latestFunctionGraphStatus = '';
 let networkNeedsFit = true;
 let moduleDiagramNeedsFit = true;
-let sourceDialogState = { functionId: '', declaration: null, group: [], index: -1 };
+let sourceDialogState = { functionId: '', declaration: null, modulePath: '', group: [], index: -1 };
 let sourceDialogRestoreFocusEl = null;
 let viewerBridge = emptyViewerBridge();
 const sourceMetricsSuffixPattern = /\s+\[lines:\s*\d+\s*\|\s*refs:\s*\d+\s*\|\s*importers:\s*\d+\]\s*$/i;
@@ -256,6 +266,13 @@ function shortLabel(value, maxLength = 18) {
 
 function fileName(modulePath = '') {
   return String(modulePath || '').split('/').filter(Boolean).at(-1) || String(modulePath || 'unknown');
+}
+
+function sourceFileTypeForPath(modulePath = '') {
+  const lowerPath = String(modulePath || '').toLowerCase();
+  if (lowerPath.endsWith('.jsx')) return 'jsx';
+  if (lowerPath.endsWith('.js') || lowerPath.endsWith('.mjs')) return 'js';
+  return '';
 }
 
 function lineRange(record = {}) {
@@ -378,6 +395,47 @@ function sourceMode() {
 
 function unavailableSourceComment(kind) {
   return '// ' + kind + ' source was not saved for this run (sourceMode=' + sourceMode() + ').';
+}
+
+function safeOutputModulePath(modulePath = '') {
+  const normalized = String(modulePath || '').replace(/\\/g, '/').trim();
+  if (!normalized) return '';
+  if (normalized.startsWith('/') || /^[A-Za-z]:\//.test(normalized)) return '';
+  if (normalized.split('/').includes('..')) return '';
+  return normalized.replace(/^\.\//, '');
+}
+
+function outputModuleRecord(modulePath = '') {
+  return outputModuleByPath.get(safeOutputModulePath(modulePath)) || null;
+}
+
+function moduleLineCount(modulePath = '') {
+  return compactCount(outputModuleRecord(modulePath)?.lineCount)
+    || compactCount(moduleSourceByPath.get(modulePath)?.lineCount);
+}
+
+function buildOutputModuleIndex(payload = {}) {
+  outputModuleByPath = new Map();
+  for (const module of safeArray(payload.modules)) {
+    const modulePath = safeOutputModulePath(module?.path);
+    if (!modulePath) continue;
+    outputModuleByPath.set(modulePath, { ...module, path: modulePath });
+  }
+}
+
+function buildModuleSourceIndex(payload = {}) {
+  moduleSourceByPath = new Map();
+  for (const moduleSource of safeArray(payload.modules)) {
+    const modulePath = safeOutputModulePath(moduleSource?.path);
+    const code = typeof moduleSource?.code === 'string' ? moduleSource.code : '';
+    if (!modulePath || !outputModuleByPath.has(modulePath) || !code) continue;
+    moduleSourceByPath.set(modulePath, {
+      path: modulePath,
+      lineCount: compactCount(moduleSource.lineCount) || code.split(/\r\n|\r|\n/).length,
+      maxLineLength: compactCount(moduleSource.maxLineLength),
+      code,
+    });
+  }
 }
 
 function sourceKey(moduleId, name) {
@@ -515,7 +573,6 @@ function functionsForFile(modulePath) {
 function indexFileGraph() {
   functionIdsByFile = new Map();
   const functionsByFile = new Map();
-  const moduleByPath = new Map(safeArray(outputPayload?.modules).map((module) => [module.path, module]));
 
   for (const node of functions) {
     if (!functionsByFile.has(node.modulePath)) functionsByFile.set(node.modulePath, []);
@@ -527,7 +584,7 @@ function indexFileGraph() {
       const sorted = list.slice().sort(sortFunctions);
       functionIdsByFile.set(modulePath, sorted.map((node) => node.id));
       const totalFunctionLines = sorted.reduce((total, node) => total + lineCountFor(node), 0);
-      const moduleRecord = moduleByPath.get(modulePath) || {};
+      const moduleRecord = outputModuleRecord(modulePath) || {};
       return {
         nodeType: 'file',
         id: fileNodeId(modulePath),
@@ -716,9 +773,22 @@ function networkFunctionIdsByFileFor(nodes) {
   return idsByFile;
 }
 
+function sourceFilteredFunctionIds(ids) {
+  return new Set(Array.from(ids || [])
+    .filter((id) => {
+      const node = functionById.get(id);
+      return node && networkSourceMatchesPath(node.modulePath);
+    }));
+}
+
+function sourceFilteredFilePaths(paths) {
+  return new Set(Array.from(paths || [])
+    .filter((modulePath) => networkSourceMatchesPath(modulePath)));
+}
+
 function createNetworkGraph({ functionIds, functionEdgeIds, filePaths, fileEdgeIds, filtered }) {
-  const visibleFunctionIds = functionIds || new Set(functions.map((node) => node.id));
-  const visibleFilePaths = filePaths || new Set(fileNodes.map((node) => node.modulePath));
+  const visibleFunctionIds = sourceFilteredFunctionIds(functionIds || new Set(functions.map((node) => node.id)));
+  const visibleFilePaths = sourceFilteredFilePaths(filePaths || new Set(fileNodes.map((node) => node.modulePath)));
   const visibleFunctionEdgeIds = functionEdgeIds || new Set(edges.map((edge) => edge.id));
   const visibleFileEdgeIds = fileEdgeIds || new Set(fileEdges.map((edge) => edge.id));
   const graphFunctions = functions.filter((node) => visibleFunctionIds.has(node.id));
@@ -734,7 +804,7 @@ function createNetworkGraph({ functionIds, functionEdgeIds, filePaths, fileEdgeI
     && visibleFilePaths.has(edge.targetFilePath)
   ));
   return {
-    filtered: Boolean(filtered),
+    filtered: Boolean(filtered || !networkSourceFilterIsFull()),
     functions: graphFunctions,
     edges: graphEdges,
     fileNodes: graphFileNodes,
@@ -1113,6 +1183,80 @@ function persistNetworkNodeVisibility(visibility = activeNetworkNodeVisibility) 
   }
 }
 
+function normalizeNetworkSourceFileTypes(value = {}) {
+  const jsx = Boolean(value.jsx);
+  const js = Boolean(value.js);
+  if (!jsx && !js) return { jsx: true, js: false };
+  return { jsx, js };
+}
+
+function parseNetworkSourceFileTypes(savedValue) {
+  const value = String(savedValue || '').trim().toLowerCase();
+  if (value === 'jsx') return { jsx: true, js: false };
+  if (value === 'js') return { jsx: false, js: true };
+  const sourceTokens = value.split(/[,+\s]+/).filter(Boolean);
+  if (sourceTokens.length > 0 && sourceTokens.every((token) => token === 'jsx' || token === 'js')) {
+    return normalizeNetworkSourceFileTypes({
+      jsx: sourceTokens.includes('jsx'),
+      js: sourceTokens.includes('js'),
+    });
+  }
+  if (value.startsWith('{')) {
+    try {
+      return normalizeNetworkSourceFileTypes(JSON.parse(value));
+    } catch {
+      return { jsx: true, js: false };
+    }
+  }
+  return { jsx: true, js: false };
+}
+
+function serializeNetworkSourceFileTypes(sourceTypes = activeNetworkSourceFileTypes) {
+  const normalized = normalizeNetworkSourceFileTypes(sourceTypes);
+  if (normalized.jsx && normalized.js) return 'jsx+js';
+  return normalized.jsx ? 'jsx' : 'js';
+}
+
+function loadNetworkSourceFileTypes() {
+  const storage = storageForViewerPreferences();
+  const savedValue = storage ? storage.getItem(networkSourceFileTypeStorageKey) : '';
+  const sourceTypes = parseNetworkSourceFileTypes(savedValue);
+  if (storage && savedValue && savedValue !== serializeNetworkSourceFileTypes(sourceTypes)) {
+    try {
+      storage.setItem(networkSourceFileTypeStorageKey, serializeNetworkSourceFileTypes(sourceTypes));
+    } catch {
+      // Migration is best-effort; the normalized filter is still used for this session.
+    }
+  }
+  return sourceTypes;
+}
+
+function persistNetworkSourceFileTypes(sourceTypes = activeNetworkSourceFileTypes) {
+  const storage = storageForViewerPreferences();
+  if (!storage) return;
+  try {
+    storage.setItem(networkSourceFileTypeStorageKey, serializeNetworkSourceFileTypes(sourceTypes));
+  } catch {
+    // Source file filter persistence is a convenience; the viewer still works without it.
+  }
+}
+
+function networkSourceFileTypeLabel(sourceTypes = activeNetworkSourceFileTypes) {
+  const normalized = normalizeNetworkSourceFileTypes(sourceTypes);
+  if (normalized.jsx && normalized.js) return 'JSX + JS files';
+  return normalized.jsx ? 'JSX files' : 'JS files';
+}
+
+function networkSourceMatchesPath(modulePath, sourceTypes = activeNetworkSourceFileTypes) {
+  const sourceType = sourceFileTypeForPath(modulePath);
+  return Boolean(sourceType && normalizeNetworkSourceFileTypes(sourceTypes)[sourceType]);
+}
+
+function networkSourceFilterIsFull(sourceTypes = activeNetworkSourceFileTypes) {
+  const normalized = normalizeNetworkSourceFileTypes(sourceTypes);
+  return normalized.jsx && normalized.js;
+}
+
 function networkShowsFiles() {
   return Boolean(activeNetworkNodeVisibility.files);
 }
@@ -1132,7 +1276,7 @@ function networkLevelLabel(visibility = activeNetworkNodeVisibility) {
 }
 
 function graphStatusLabel(modeId = networkLayout?.mode || activeNetworkLayoutMode) {
-  const parts = [networkLayoutModeRecord(modeId).statusLabel, networkLevelLabel()];
+  const parts = [networkLayoutModeRecord(modeId).statusLabel, networkLevelLabel(), networkSourceFileTypeLabel()];
   const scope = networkScopeRecord(activeNetworkScope);
   if (activeNetworkScope === 'full') return parts.concat(scope.statusLabel).join(' · ');
   parts.push(scope.statusLabel);
@@ -1179,6 +1323,15 @@ function networkVisibleSummary(graph = networkGraph()) {
     + networkSemanticEdgeCount(graph) + ' ' + networkSemanticEdgeLabel(graph);
 }
 
+function emptyNetworkMessage(graph = networkGraph()) {
+  if ((functions.length > 0 || fileNodes.length > 0)
+    && graph.functions.length === 0
+    && graph.fileNodes.length === 0) {
+    return 'No saved function nodes match ' + networkSourceFileTypeLabel().toLowerCase() + '.';
+  }
+  return 'No saved function relationships were found.';
+}
+
 function networkHelpText() {
   const scope = networkScopeRecord(activeNetworkScope);
   const depth = networkDepthRecord(activeNetworkDepth);
@@ -1220,6 +1373,29 @@ function renderNetworkNodeSwitch() {
       setNetworkNodeVisibility({ ...activeNetworkNodeVisibility, [mode.id]: !active });
     });
     networkNodeSwitchEl.appendChild(button);
+  }
+}
+
+function renderNetworkSourceSwitch() {
+  networkSourceSwitchEl.textContent = '';
+  for (const mode of networkSourceFileTypeModes) {
+    const active = Boolean(activeNetworkSourceFileTypes[mode.id]);
+    const otherActive = mode.id === 'jsx'
+      ? activeNetworkSourceFileTypes.js
+      : activeNetworkSourceFileTypes.jsx;
+    const button = createElement('button', active ? 'is-active' : '', mode.label);
+    button.type = 'button';
+    button.setAttribute('aria-label', mode.accessibilityLabel);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    if (active && !otherActive) {
+      button.setAttribute('aria-disabled', 'true');
+      button.setAttribute('title', 'At least one source file type stays visible.');
+    }
+    button.addEventListener('click', () => {
+      if (active && !otherActive) return;
+      setNetworkSourceFileTypes({ ...activeNetworkSourceFileTypes, [mode.id]: !active });
+    });
+    networkSourceSwitchEl.appendChild(button);
   }
 }
 
@@ -1379,13 +1555,31 @@ function setNetworkNodeVisibility(nextVisibility, { reason = 'switch-node-levels
 
   activeNetworkNodeVisibility = normalized;
   persistNetworkNodeVisibility(normalized);
-  if (focusFilePath && fileByPath.has(focusFilePath)) {
+  if (focusFilePath && fileByPath.has(focusFilePath) && networkSourceMatchesPath(focusFilePath)) {
     selectedFilePath = focusFilePath;
     selectedFunctionId = '';
     activeRelationFilter = 'all';
   }
   reconcileSelectionForNodeVisibility();
   renderNetworkNodeSwitch();
+  renderNetworkDepthSwitch();
+  renderSelectedFunctionPanel();
+  layoutFunctionNetwork();
+  renderFunctionNetwork();
+  fitCurrentNetworkLayout();
+  sendViewerBridgeState(reason);
+}
+
+function setNetworkSourceFileTypes(nextSourceFileTypes, { reason = 'switch-source-files' } = {}) {
+  const normalized = normalizeNetworkSourceFileTypes(nextSourceFileTypes);
+  const changed = normalized.jsx !== activeNetworkSourceFileTypes.jsx
+    || normalized.js !== activeNetworkSourceFileTypes.js;
+  if (!changed) return;
+
+  activeNetworkSourceFileTypes = normalized;
+  persistNetworkSourceFileTypes(normalized);
+  reconcileSelectionForNodeVisibility();
+  renderNetworkSourceSwitch();
   renderNetworkDepthSwitch();
   renderSelectedFunctionPanel();
   layoutFunctionNetwork();
@@ -2518,10 +2712,11 @@ function renderFunctionNetwork() {
       'font-size': 16,
       'font-weight': 700,
     });
-    message.textContent = 'No saved function relationships were found.';
+    const emptyMessage = emptyNetworkMessage(graph);
+    message.textContent = emptyMessage;
     networkSvgEl.appendChild(message);
     latestFunctionGraphStatus = graphStatusLabel(activeNetworkLayoutMode)
-      + ': no saved function relationships were found.';
+      + ': ' + emptyMessage.charAt(0).toLowerCase() + emptyMessage.slice(1);
     updateVisualizationStatus();
     return;
   }
@@ -3139,6 +3334,116 @@ function sourceDeclarationForLabel(label) {
   return null;
 }
 
+function jsxOutputModuleRecords() {
+  return Array.from(outputModuleByPath.values())
+    .filter((module) => sourceFileTypeForPath(module.path) === 'jsx' && module.reachable !== false)
+    .sort((a, b) => compareFilePaths(a.path, b.path));
+}
+
+function mermaidClassIdBase(modulePath) {
+  const baseName = fileName(modulePath).replace(/\.[^.]+$/, '');
+  return baseName.replace(/[^A-Za-z0-9_$]/g, '_') || 'Module';
+}
+
+function mermaidModulePathByClassId() {
+  const baseCounts = new Map();
+  const pathByClassId = new Map();
+  for (const module of jsxOutputModuleRecords()) {
+    const base = mermaidClassIdBase(module.path);
+    const count = (baseCounts.get(base) || 0) + 1;
+    baseCounts.set(base, count);
+    pathByClassId.set(count === 1 ? base : base + '_' + count, module.path);
+  }
+  return pathByClassId;
+}
+
+function modulePathForDiagramElement(element, pathByClassId = mermaidModulePathByClassId()) {
+  let current = element;
+  while (current && current !== moduleDiagramSvgEl) {
+    for (const moduleId of sourceModuleIdCandidatesFromElement(current)) {
+      const modulePath = pathByClassId.get(moduleId);
+      if (modulePath) return modulePath;
+    }
+    current = current.parentNode;
+  }
+  return '';
+}
+
+function moduleHeaderText(modulePath) {
+  const lines = moduleLineCount(modulePath);
+  return (lines ? lines + ' ' : '') + fileName(modulePath);
+}
+
+function moduleHeaderLabelMatches(element, modulePath) {
+  if (!element || hasClass(element, 'source-member-trigger') || hasClass(element, 'source-module-trigger')) return false;
+  const rawText = String(element.textContent || '').replace(/\s+/g, ' ').trim();
+  if (!rawText) return false;
+  const basename = fileName(modulePath);
+  const withoutLineCount = rawText.replace(/^\d+\s+/, '').trim();
+  return rawText === basename
+    || rawText === moduleHeaderText(modulePath)
+    || withoutLineCount === basename;
+}
+
+function diagramHeaderCandidates(classGroup, modulePath) {
+  const candidates = [
+    classGroup,
+    ...Array.from(classGroup.querySelectorAll?.('text,p,span,div') || []),
+  ];
+  const seen = new Set();
+  return candidates.filter((candidate) => {
+    if (seen.has(candidate)) return false;
+    seen.add(candidate);
+    return moduleHeaderLabelMatches(candidate, modulePath);
+  });
+}
+
+function addModuleHeaderActivation(element, modulePath) {
+  element.classList.add('source-module-trigger');
+  element.setAttribute('data-ironglancer-module-path', modulePath);
+  element.setAttribute('tabindex', '0');
+  element.setAttribute('role', 'button');
+  element.setAttribute('focusable', 'true');
+  element.setAttribute('aria-label', 'Show full source for ' + modulePath);
+
+  const titleText = 'Show full source for ' + modulePath;
+  if (element.namespaceURI === svgNamespace) {
+    const title = element.querySelector?.('title') || createSvgElement('title');
+    title.textContent = titleText;
+    if (!title.parentNode) element.insertBefore(title, element.firstChild);
+  } else {
+    element.setAttribute('title', titleText);
+  }
+
+  addKeyboardActivation(element, (event) => {
+    if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
+    showSourceDialogForModulePath(modulePath, element);
+  });
+}
+
+function wireModuleHeaders() {
+  if (!moduleDiagramSvgEl || typeof moduleDiagramSvgEl.querySelectorAll !== 'function') return;
+  const pathByClassId = mermaidModulePathByClassId();
+  const classGroups = Array.from(moduleDiagramSvgEl.querySelectorAll('g'))
+    .map((group) => ({ group, modulePath: modulePathForDiagramElement(group, pathByClassId) }))
+    .filter((record) => record.modulePath);
+  const candidatePaths = new Map();
+  for (const { group, modulePath } of classGroups) {
+    for (const candidate of diagramHeaderCandidates(group, modulePath)) {
+      if (!candidatePaths.has(candidate)) candidatePaths.set(candidate, modulePath);
+    }
+  }
+  const candidates = Array.from(candidatePaths.keys());
+  for (const candidate of candidates) {
+    const containsAnotherCandidate = candidates.some((other) => (
+      other !== candidate
+      && typeof candidate.contains === 'function'
+      && candidate.contains(other)
+    ));
+    if (!containsAnotherCandidate) addModuleHeaderActivation(candidate, candidatePaths.get(candidate));
+  }
+}
+
 function svgNumber(value) {
   if (!Number.isFinite(value)) return '0';
   return String(Number(value.toFixed(3)));
@@ -3333,11 +3638,14 @@ function renderSourceDialogDeclaration(declaration) {
 function showSourceDialogForDeclaration(declaration, restoreFocusEl = null) {
   if (!declaration) return false;
   const node = functionNodeForDeclaration(declaration);
-  if (node) selectFunction(node.id, { reason: 'open-source', restoreFocusEl });
+  if (node && networkSourceMatchesPath(node.modulePath)) {
+    selectFunction(node.id, { reason: 'open-source', restoreFocusEl });
+  }
   const group = sourceDialogGroupForDeclaration(declaration);
   sourceDialogState = {
     functionId: node?.id || '',
     declaration,
+    modulePath: '',
     group,
     index: group.indexOf(declaration),
   };
@@ -3522,6 +3830,7 @@ function prepareModuleDiagramForInteraction(svgMarkup, importEdges) {
   setModuleDiagramSvgSizeForZoom();
   wireImportEdges(importEdges);
   wireSourceMembers();
+  wireModuleHeaders();
   moduleDiagramNeedsFit = true;
   fitModuleDiagramWhenVisible();
   updateVisualizationStatus();
@@ -4184,11 +4493,18 @@ function refreshNetworkForSelection({ forceScroll = false } = {}) {
   requestAnimationFrame(() => scrollSelectionIntoViewIfNeeded({ force: Boolean(forceScroll) }));
 }
 
-function selectFunction(functionId, { reason = 'select-function', restoreFocusEl = null, scroll = false } = {}) {
-  if (!functionById.has(functionId)) return false;
+function selectFunction(functionId, {
+  reason = 'select-function',
+  restoreFocusEl = null,
+  scroll = false,
+  allowHiddenSource = false,
+} = {}) {
+  const node = functionById.get(functionId);
+  if (!node) return false;
+  if (!allowHiddenSource && !networkSourceMatchesPath(node.modulePath)) return false;
   selectedFunctionId = functionId;
   selectedFilePath = '';
-  if (!relationshipItemsForNode(functionById.get(functionId)).some((item) => item.tags.includes(activeRelationFilter))) {
+  if (!relationshipItemsForNode(node).some((item) => item.tags.includes(activeRelationFilter))) {
     activeRelationFilter = 'all';
   }
   renderSelectedFunctionPanel();
@@ -4198,8 +4514,14 @@ function selectFunction(functionId, { reason = 'select-function', restoreFocusEl
   return true;
 }
 
-function selectFile(modulePath, { reason = 'select-file', restoreFocusEl = null, scroll = false } = {}) {
+function selectFile(modulePath, {
+  reason = 'select-file',
+  restoreFocusEl = null,
+  scroll = false,
+  allowHiddenSource = false,
+} = {}) {
   if (!fileByPath.has(modulePath)) return false;
+  if (!allowHiddenSource && !networkSourceMatchesPath(modulePath)) return false;
   selectedFilePath = modulePath;
   selectedFunctionId = '';
   activeRelationFilter = 'all';
@@ -4222,23 +4544,26 @@ function clearSelection() {
 function reconcileSelectionForNodeVisibility() {
   if (selectedFunctionId) {
     const selectedNode = functionById.get(selectedFunctionId);
-    if (selectedNode && networkShowsFunctions()) {
+    if (selectedNode && networkShowsFunctions() && networkSourceMatchesPath(selectedNode.modulePath)) {
       selectedFilePath = '';
       return;
     }
     selectedFunctionId = '';
     activeRelationFilter = 'all';
-    if (selectedNode && networkShowsFiles() && fileByPath.has(selectedNode.modulePath)) {
+    if (selectedNode
+      && networkShowsFiles()
+      && fileByPath.has(selectedNode.modulePath)
+      && networkSourceMatchesPath(selectedNode.modulePath)) {
       selectedFilePath = selectedNode.modulePath;
       return;
     }
   }
 
   if (selectedFilePath) {
-    if (networkShowsFiles() && fileByPath.has(selectedFilePath)) return;
+    if (networkShowsFiles() && fileByPath.has(selectedFilePath) && networkSourceMatchesPath(selectedFilePath)) return;
     const previousFilePath = selectedFilePath;
     selectedFilePath = '';
-    if (networkShowsFunctions()) {
+    if (networkShowsFunctions() && networkSourceMatchesPath(previousFilePath)) {
       const child = mostConnectedFunctionForFile(previousFilePath);
       if (child) selectedFunctionId = child.id;
     }
@@ -4458,6 +4783,259 @@ function renderNeighborhood(node) {
   sourceDialogNeighborhoodEl.appendChild(svg);
 }
 
+function moduleIncomingPaths(modulePath) {
+  return Array.from(outputModuleByPath.values())
+    .filter((module) => safeArray(module.localDependencies).includes(modulePath))
+    .map((module) => module.path)
+    .sort(compareFilePaths);
+}
+
+function moduleOutgoingPaths(modulePath) {
+  return safeArray(outputModuleRecord(modulePath)?.localDependencies)
+    .filter((dependency) => outputModuleByPath.has(dependency))
+    .sort(compareFilePaths);
+}
+
+function moduleDialogGroup() {
+  return Array.from(outputModuleByPath.keys()).sort(compareFilePaths);
+}
+
+function moduleNeighborLabel(modulePath, center = false) {
+  return shortLabel(fileName(modulePath), center ? 18 : 14);
+}
+
+function moduleRelationshipCount(modulePath) {
+  return moduleIncomingPaths(modulePath).length + moduleOutgoingPaths(modulePath).length;
+}
+
+function renderModuleNeighborhoodNode(parent, { x, y, modulePath, center = false }) {
+  const group = createSvgElement('g', {
+    class: 'neighborhood-node source-module-neighborhood-node' + (center ? ' is-center' : ''),
+    role: 'button',
+    tabindex: 0,
+    'aria-label': 'Open full source for ' + modulePath,
+  });
+  const title = createSvgElement('title');
+  title.textContent = modulePath;
+  group.appendChild(title);
+  group.appendChild(createSvgElement('rect', {
+    x: x - (center ? 58 : 42),
+    y: y - (center ? 20 : 16),
+    width: center ? 116 : 84,
+    height: center ? 40 : 32,
+    rx: 8,
+    fill: fileColorByPath.get(modulePath) || '#64748b',
+  }));
+  const label = createSvgElement('text', {
+    x,
+    y: center ? y + 4 : y + 4,
+    'text-anchor': 'middle',
+  });
+  label.textContent = moduleNeighborLabel(modulePath, center);
+  group.appendChild(label);
+  addKeyboardActivation(group, () => showSourceDialogForModulePath(modulePath, group));
+  parent.appendChild(group);
+}
+
+function renderModuleNeighborhoodOverflow(parent, x, y, count) {
+  if (count <= 0) return;
+  const label = createSvgElement('text', {
+    x,
+    y,
+    'text-anchor': 'middle',
+    fill: '#667085',
+    'font-size': 12,
+    'font-weight': 800,
+  });
+  label.textContent = '+' + count + ' more in details';
+  parent.appendChild(label);
+}
+
+function renderModuleNeighborhood(modulePath) {
+  sourceDialogNeighborhoodEl.hidden = false;
+  sourceDialogNeighborhoodEl.textContent = '';
+  const svg = createSvgElement('svg', { viewBox: '0 0 700 154', role: 'img', 'aria-label': 'Module imports for ' + modulePath });
+  const defs = createSvgElement('defs');
+  const marker = createSvgElement('marker', {
+    id: 'neighborhood-arrow',
+    viewBox: '0 0 10 10',
+    refX: 9,
+    refY: 5,
+    markerWidth: 7,
+    markerHeight: 7,
+    orient: 'auto',
+  });
+  marker.appendChild(createSvgElement('path', { d: 'M 0 0 L 10 5 L 0 10 z', fill: '#718096' }));
+  defs.appendChild(marker);
+  svg.appendChild(defs);
+
+  const incomingLabel = createSvgElement('text', {
+    class: 'neighborhood-label is-incoming',
+    x: 160,
+    y: 23,
+    'text-anchor': 'middle',
+  });
+  incomingLabel.textContent = 'Imported by';
+  const outgoingLabel = createSvgElement('text', {
+    class: 'neighborhood-label is-outgoing',
+    x: 540,
+    y: 23,
+    'text-anchor': 'middle',
+  });
+  outgoingLabel.textContent = 'Imports';
+  svg.append(incomingLabel, outgoingLabel);
+
+  const incoming = moduleIncomingPaths(modulePath);
+  const outgoing = moduleOutgoingPaths(modulePath);
+  const shownIncoming = incoming.slice(0, 6);
+  const shownOutgoing = outgoing.slice(0, 6);
+  const center = { x: 350, y: 78 };
+
+  shownIncoming.forEach((incomingPath, index) => {
+    const position = gridPosition(index, shownIncoming.length, { x1: 58, x2: 262, y1: 56, y2: 108 });
+    miniEdge(svg, position.x + 46, position.y, center.x - 62, center.y, 'is-incoming');
+    renderModuleNeighborhoodNode(svg, { x: position.x, y: position.y, modulePath: incomingPath });
+  });
+
+  shownOutgoing.forEach((outgoingPath, index) => {
+    const position = gridPosition(index, shownOutgoing.length, { x1: 438, x2: 642, y1: 56, y2: 108 });
+    miniEdge(svg, center.x + 62, center.y, position.x - 46, position.y, 'is-outgoing');
+    renderModuleNeighborhoodNode(svg, { x: position.x, y: position.y, modulePath: outgoingPath });
+  });
+
+  renderModuleNeighborhoodNode(svg, { x: center.x, y: center.y, modulePath, center: true });
+  renderModuleNeighborhoodOverflow(svg, 160, 145, Math.max(0, incoming.length - shownIncoming.length));
+  renderModuleNeighborhoodOverflow(svg, 540, 145, Math.max(0, outgoing.length - shownOutgoing.length));
+
+  if (incoming.length === 0 && outgoing.length === 0) {
+    const message = createSvgElement('text', {
+      x: 350,
+      y: 145,
+      'text-anchor': 'middle',
+      fill: '#667085',
+      'font-size': 13,
+      'font-weight': 700,
+    });
+    message.textContent = 'No local module imports were traced.';
+    svg.appendChild(message);
+  }
+
+  sourceDialogNeighborhoodEl.appendChild(svg);
+}
+
+function renderModuleInsight(modulePath, sourceRecord) {
+  const incoming = moduleIncomingPaths(modulePath);
+  const outgoing = moduleOutgoingPaths(modulePath);
+  const functionsInModule = functionsForFile(modulePath);
+  sourceDialogInsightEl.textContent = '';
+  const available = Boolean(sourceRecord?.code);
+  sourceDialogInsightEl.appendChild(createElement(
+    'p',
+    'takeaway',
+    available
+      ? 'Full saved module source is available for ' + modulePath + '.'
+      : 'Full module source is unavailable for ' + modulePath + '.',
+  ));
+
+  const row = createElement('div', 'connection-metrics');
+  for (const item of [
+    { label: 'Lines', value: moduleLineCount(modulePath), className: '' },
+    { label: 'Imported by', value: incoming.length, className: 'is-incoming' },
+    { label: 'Imports', value: outgoing.length, className: 'is-outgoing' },
+    { label: 'Functions', value: functionsInModule.length, className: '' },
+  ]) {
+    const metric = createElement('span', 'connection-metric ' + item.className);
+    metric.append(createElement('strong', '', String(item.value)), createElement('span', '', item.label));
+    row.appendChild(metric);
+  }
+  sourceDialogInsightEl.appendChild(row);
+
+  if (!available) {
+    sourceDialogInsightEl.appendChild(createElement(
+      'p',
+      'empty-note',
+      'Regenerate this viewer with --source-mode full or --include-source to enable full-file source popups.',
+    ));
+  }
+}
+
+function moduleRelationshipButton(modulePath) {
+  const button = createElement('button', 'relationship-item');
+  button.type = 'button';
+  button.setAttribute('aria-label', 'Open full source for ' + modulePath);
+  button.append(
+    createElement('div', 'relationship-name', modulePath),
+    createElement('div', 'relationship-meta', moduleLineCount(modulePath) + ' ' + plural(moduleLineCount(modulePath), 'line')),
+  );
+  button.addEventListener('click', () => showSourceDialogForModulePath(modulePath, button));
+  return button;
+}
+
+function renderModuleRelationshipGroup(parent, title, modulePaths) {
+  const section = createElement('section', 'relationship-group');
+  section.appendChild(createElement('h4', '', title));
+  if (modulePaths.length === 0) {
+    section.appendChild(createElement('p', 'empty-note', 'No saved module links in this direction.'));
+  } else {
+    for (const modulePath of modulePaths) section.appendChild(moduleRelationshipButton(modulePath));
+  }
+  parent.appendChild(section);
+}
+
+function renderModuleConnectionDisclosure(modulePath) {
+  const incoming = moduleIncomingPaths(modulePath);
+  const outgoing = moduleOutgoingPaths(modulePath);
+  const count = incoming.length + outgoing.length;
+  sourceDialogConnectionsEl.hidden = count === 0;
+  sourceDialogConnectionsEl.open = false;
+  sourceDialogConnectionsSummaryEl.textContent = 'Module connections (' + count + ')';
+  sourceDialogRelationshipsEl.textContent = '';
+  renderModuleRelationshipGroup(sourceDialogRelationshipsEl, 'Imported by', incoming);
+  renderModuleRelationshipGroup(sourceDialogRelationshipsEl, 'Imports', outgoing);
+}
+
+function renderSourceDialogModule(modulePath) {
+  const safeModulePath = safeOutputModulePath(modulePath);
+  if (!safeModulePath || !outputModuleByPath.has(safeModulePath)) return;
+  const sourceRecord = moduleSourceByPath.get(safeModulePath);
+  sourceDialogTitleEl.textContent = fileName(safeModulePath);
+  sourceDialogPathEl.textContent = safeModulePath + (moduleLineCount(safeModulePath)
+    ? ' (' + moduleLineCount(safeModulePath) + ' ' + plural(moduleLineCount(safeModulePath), 'line') + ')'
+    : '');
+  renderModuleNeighborhood(safeModulePath);
+  sourceDialogCodeEl.textContent = sourceRecord?.code || [
+    unavailableSourceComment('Module'),
+    '// Re-run IronGlancer with --source-mode full or --include-source to save full module code.',
+  ].join('\n');
+  renderModuleInsight(safeModulePath, sourceRecord);
+  renderModuleConnectionDisclosure(safeModulePath);
+  updateDialogNavigationControls();
+}
+
+function showSourceDialogForModulePath(modulePath, restoreFocusEl = null) {
+  const safeModulePath = safeOutputModulePath(modulePath);
+  if (!safeModulePath || !outputModuleByPath.has(safeModulePath)) return false;
+  const group = moduleDialogGroup();
+  sourceDialogState = {
+    functionId: '',
+    declaration: null,
+    modulePath: safeModulePath,
+    group,
+    index: group.indexOf(safeModulePath),
+  };
+  sourceDialogRestoreFocusEl = restoreFocusEl || null;
+  renderSourceDialogModule(safeModulePath);
+  if (typeof sourceDialogEl.showModal === 'function') {
+    if (!sourceDialogEl.open) sourceDialogEl.showModal();
+  } else {
+    sourceDialogEl.setAttribute('open', '');
+  }
+  if (sourceDialogBodyEl) sourceDialogBodyEl.scrollTop = 0;
+  sourceDialogCloseBtn.focus();
+  sendViewerBridgeState(moduleSourceByPath.has(safeModulePath) ? 'open-module-source' : 'open-module-source-unavailable');
+  return true;
+}
+
 function renderSourceDialogFunction(functionId) {
   const node = functionById.get(functionId);
   if (!node) return;
@@ -4474,11 +5052,14 @@ function renderSourceDialogFunction(functionId) {
 function showSourceDialogForFunctionId(functionId, restoreFocusEl = null) {
   const node = functionById.get(functionId);
   if (!node) return false;
-  selectFunction(functionId, { reason: 'open-source', restoreFocusEl });
+  if (networkSourceMatchesPath(node.modulePath)) {
+    selectFunction(functionId, { reason: 'open-source', restoreFocusEl });
+  }
   const group = dialogGroupForNode(node);
   sourceDialogState = {
     functionId,
     declaration: null,
+    modulePath: '',
     group,
     index: group.findIndex((candidate) => candidate.id === functionId),
   };
@@ -4498,13 +5079,30 @@ function showSourceDialogForFunctionId(functionId, restoreFocusEl = null) {
 function navigateSourceDialog(direction) {
   const nextIndex = sourceDialogState.index + direction;
   if (nextIndex < 0 || nextIndex >= sourceDialogState.group.length) return;
+  if (sourceDialogState.modulePath) {
+    const modulePath = sourceDialogState.group[nextIndex];
+    sourceDialogState = {
+      functionId: '',
+      declaration: null,
+      modulePath,
+      group: sourceDialogState.group,
+      index: nextIndex,
+    };
+    renderSourceDialogModule(modulePath);
+    if (sourceDialogBodyEl) sourceDialogBodyEl.scrollTop = 0;
+    sendViewerBridgeState('navigate-module-source');
+    return;
+  }
   if (sourceDialogState.declaration) {
     const declaration = sourceDialogState.group[nextIndex];
     const node = functionNodeForDeclaration(declaration);
-    if (node) selectFunction(node.id, { reason: 'navigate-source', scroll: true });
+    if (node && networkSourceMatchesPath(node.modulePath)) {
+      selectFunction(node.id, { reason: 'navigate-source', scroll: true });
+    }
     sourceDialogState = {
       functionId: node?.id || '',
       declaration,
+      modulePath: '',
       group: sourceDialogState.group,
       index: nextIndex,
     };
@@ -4518,10 +5116,13 @@ function navigateSourceDialog(direction) {
   sourceDialogState = {
     functionId: node.id,
     declaration: null,
+    modulePath: '',
     group: sourceDialogState.group,
     index: nextIndex,
   };
-  selectFunction(node.id, { reason: 'navigate-source', scroll: true });
+  if (networkSourceMatchesPath(node.modulePath)) {
+    selectFunction(node.id, { reason: 'navigate-source', scroll: true });
+  }
   renderSourceDialogFunction(node.id);
   if (sourceDialogBodyEl) sourceDialogBodyEl.scrollTop = 0;
   sendViewerBridgeState('navigate-source');
@@ -4530,7 +5131,7 @@ function navigateSourceDialog(direction) {
 function closeSourceDialog() {
   const restoreFocusEl = sourceDialogRestoreFocusEl;
   sourceDialogRestoreFocusEl = null;
-  sourceDialogState = { functionId: '', declaration: null, group: [], index: -1 };
+  sourceDialogState = { functionId: '', declaration: null, modulePath: '', group: [], index: -1 };
   updateDialogNavigationControls();
   if (sourceDialogEl.open && typeof sourceDialogEl.close === 'function') {
     sourceDialogEl.close();
@@ -4583,12 +5184,38 @@ function fileSnapshotForModulePath(modulePath) {
   };
 }
 
+function moduleSourceSnapshotForModulePath(modulePath) {
+  const safeModulePath = safeOutputModulePath(modulePath);
+  if (!safeModulePath || !outputModuleByPath.has(safeModulePath)) return null;
+  return {
+    kind: 'module',
+    modulePath: safeModulePath,
+    path: safeModulePath,
+    name: fileName(safeModulePath),
+    lineCount: moduleLineCount(safeModulePath),
+    sourceAvailable: moduleSourceByPath.has(safeModulePath),
+  };
+}
+
+function openSourceSnapshot() {
+  if (sourceDialogState.modulePath) return moduleSourceSnapshotForModulePath(sourceDialogState.modulePath);
+  if (sourceDialogState.declaration) {
+    return {
+      kind: 'declaration',
+      ...declarationSnapshotForSourceDeclaration(sourceDialogState.declaration),
+    };
+  }
+  const snapshot = declarationSnapshotForFunctionId(sourceDialogState.functionId);
+  return snapshot ? { kind: 'function', ...snapshot } : null;
+}
+
 function currentGraphPresentationState() {
   const graph = networkGraph();
   return {
     primaryView: activePrimaryView,
     layout: activeNetworkLayoutMode,
     nodeVisibility: { ...activeNetworkNodeVisibility },
+    sourceFileTypes: { ...activeNetworkSourceFileTypes },
     scope: activeNetworkScope,
     depth: activeNetworkDepth,
     selectedFunction: declarationSnapshotForFunctionId(selectedFunctionId),
@@ -4613,14 +5240,13 @@ function currentViewerState(reason) {
     graph: currentGraphPresentationState(),
     selectedFunction: declarationSnapshotForFunctionId(selectedFunctionId),
     selectedFile: fileSnapshotForModulePath(selectedFilePath),
-    openSource: sourceDialogState.declaration
-      ? declarationSnapshotForSourceDeclaration(sourceDialogState.declaration)
-      : declarationSnapshotForFunctionId(sourceDialogState.functionId),
+    openSource: openSourceSnapshot(),
     highlighted: declarationSnapshotForFunctionId(selectedFunctionId),
     viewport: {
       layout: activeNetworkLayoutMode,
       primaryView: activePrimaryView,
       nodeVisibility: { ...activeNetworkNodeVisibility },
+      sourceFileTypes: { ...activeNetworkSourceFileTypes },
       scope: activeNetworkScope,
       depth: activeNetworkDepth,
       zoom: networkZoom,
@@ -4668,6 +5294,30 @@ function hasCommandField(command, fieldName) {
 function commandBooleanValue(command, fieldName) {
   if (!hasCommandField(command, fieldName)) return null;
   return typeof command[fieldName] === 'boolean' ? command[fieldName] : null;
+}
+
+function commandSourceFileTypesValue(command = {}) {
+  if (hasCommandField(command, 'sourceFileTypes')) {
+    const value = command.sourceFileTypes;
+    if (typeof value === 'string') return parseNetworkSourceFileTypes(value);
+    if (Array.isArray(value)) {
+      return normalizeNetworkSourceFileTypes({
+        jsx: value.map((item) => String(item).trim().toLowerCase()).includes('jsx'),
+        js: value.map((item) => String(item).trim().toLowerCase()).includes('js'),
+      });
+    }
+    if (value && typeof value === 'object') return normalizeNetworkSourceFileTypes(value);
+  }
+
+  const showJsx = commandBooleanValue(command, 'showJsx');
+  const showJs = commandBooleanValue(command, 'showJs');
+  if (showJsx !== null || showJs !== null) {
+    return normalizeNetworkSourceFileTypes({
+      jsx: showJsx === null ? activeNetworkSourceFileTypes.jsx : showJsx,
+      js: showJs === null ? activeNetworkSourceFileTypes.js : showJs,
+    });
+  }
+  return null;
 }
 
 function commandScopeValue(command = {}) {
@@ -4744,10 +5394,22 @@ function applyGraphViewCommand(command = {}) {
     }
   }
 
+  const nextSourceFileTypes = commandSourceFileTypesValue(command);
+  if (nextSourceFileTypes) {
+    if (nextSourceFileTypes.jsx !== activeNetworkSourceFileTypes.jsx
+      || nextSourceFileTypes.js !== activeNetworkSourceFileTypes.js) {
+      activeNetworkSourceFileTypes = nextSourceFileTypes;
+      persistNetworkSourceFileTypes(nextSourceFileTypes);
+      graphChanged = true;
+      controlsChanged = true;
+    }
+  }
+
   if (controlsChanged) {
     reconcileSelectionForNodeVisibility();
     renderNetworkLayoutSwitch();
     renderNetworkNodeSwitch();
+    renderNetworkSourceSwitch();
     renderNetworkScopeSwitch();
     renderNetworkDepthSwitch();
     renderSelectedFunctionPanel();
@@ -4773,6 +5435,10 @@ function applyViewerBridgeCommand(command = {}) {
 
   const functionId = functionIdForViewerCommand(command);
   if (!functionId) return { applied: false, message: 'target function is not visible in this viewer snapshot' };
+  const commandNode = functionById.get(functionId);
+  if (commandNode && !networkSourceMatchesPath(commandNode.modulePath)) {
+    return { applied: false, message: 'target function is hidden by the source file filter' };
+  }
   const sourceRecord = sourceRecordForFunctionId(functionId);
 
   if (type === 'openFunction' || type === 'openSource') {
@@ -4932,7 +5598,9 @@ function isModuleDiagramEdgeTarget(target) {
 function isModuleDiagramSourceTarget(target) {
   let element = target;
   while (element && element !== moduleDiagramViewportEl) {
-    if (hasClass(element, 'source-member-trigger') || hasClass(element, 'source-member-hit-target')) return true;
+    if (hasClass(element, 'source-member-trigger')
+      || hasClass(element, 'source-member-hit-target')
+      || hasClass(element, 'source-module-trigger')) return true;
     element = element.parentNode;
   }
   return false;
@@ -5171,8 +5839,12 @@ downloadBtn.addEventListener('click', () => {
 async function main() {
   outputPayload = await loadJson('./output.json');
   if (!outputPayload) throw new Error('Failed to load output.json');
+  buildOutputModuleIndex(outputPayload);
   sourcePayload = await loadJson('./source-code.json', { declarations: [] });
   if (!sourcePayloadMatchesOutput(outputPayload, sourcePayload)) sourcePayload = { declarations: [] };
+  moduleSourcePayload = await loadJson('./source-modules.json', { modules: [] });
+  if (!sourcePayloadMatchesOutput(outputPayload, moduleSourcePayload)) moduleSourcePayload = { modules: [] };
+  buildModuleSourceIndex(moduleSourcePayload);
   functionMapPayload = outputPayload.functionMap || { limitations: [], functions: [], edges: [] };
   buildDeclarationIndexes(sourcePayload);
   indexFunctions();
@@ -5181,6 +5853,7 @@ async function main() {
   activePrimaryView = loadPrimaryViewMode();
   activeNetworkLayoutMode = loadNetworkLayoutMode();
   activeNetworkNodeVisibility = loadNetworkNodeVisibility();
+  activeNetworkSourceFileTypes = loadNetworkSourceFileTypes();
   activeNetworkScope = loadNetworkScope();
   activeNetworkDepth = loadNetworkDepth();
   rawRenderText();
@@ -5191,6 +5864,7 @@ async function main() {
   applyPrimaryViewMode();
   renderNetworkLayoutSwitch();
   renderNetworkNodeSwitch();
+  renderNetworkSourceSwitch();
   renderNetworkScopeSwitch();
   renderNetworkDepthSwitch();
   renderSelectedFunctionPanel();

@@ -203,9 +203,26 @@ function declarationSourcePayload(sourceCode = {}) {
   };
 }
 
+function safeRelativeModulePath(modulePath) {
+  const normalized = toPosixPath(String(modulePath || '').trim()).replace(/^\.\//, '');
+  if (!normalized || normalized.startsWith('/') || /^[A-Za-z]:\//.test(normalized)) return '';
+  if (normalized.split('/').includes('..')) return '';
+  return normalized;
+}
+
 function moduleSourcePayload(sourceCode = {}) {
   return {
-    modules: Array.isArray(sourceCode.modules) ? sourceCode.modules : [],
+    modules: (Array.isArray(sourceCode.modules) ? sourceCode.modules : []).map((moduleSource) => {
+      const modulePath = safeRelativeModulePath(moduleSource?.path);
+      if (!modulePath) {
+        throw new Error(`Refusing to write source module data: unsafe module path ${JSON.stringify(moduleSource?.path)}.`);
+      }
+      return {
+        ...moduleSource,
+        path: modulePath,
+        code: typeof moduleSource?.code === 'string' ? moduleSource.code : '',
+      };
+    }),
   };
 }
 
@@ -395,7 +412,9 @@ export async function generateStaticSite({
   }
   await assertReplaceableOutputDir(resolvedOutDir);
   const declarationSource = declarationSourcePayload(analysis.sourceCode);
-  const moduleSource = moduleSourcePayload(analysis.sourceCode);
+  const moduleSource = effectiveSourceMode === 'full'
+    ? moduleSourcePayload(analysis.sourceCode)
+    : { modules: [] };
   if (effectiveSourceMode === 'declarations') {
     assertNoCredentialLiterals(declarationSource);
   } else if (effectiveSourceMode === 'full') {
@@ -419,7 +438,7 @@ export async function generateStaticSite({
     packageName: packageMeta.name,
     version: packageMeta.version,
     generatedAt,
-    rootDir: effectiveSourceMode === 'full' ? analysis.rootDir : null,
+    rootDir: null,
     entry: analysis.entryRel,
     entryKind: analysis.entryKind || 'module',
     entryModules: Array.isArray(analysis.entryModules) ? analysis.entryModules : [analysis.entryRel].filter(Boolean),
@@ -465,10 +484,12 @@ export async function generateStaticSite({
     });
   }
   if (effectiveSourceMode === 'full') {
-    await writeJson(path.join(tempOutDir, API_DATA_DIR, 'source-modules.json'), {
+    const moduleSourceOutput = {
       ...moduleSource,
       meta,
-    });
+    };
+    await writeJson(path.join(tempOutDir, 'source-modules.json'), moduleSourceOutput);
+    await writeJson(path.join(tempOutDir, API_DATA_DIR, 'source-modules.json'), moduleSourceOutput);
   }
   await writeJson(path.join(tempOutDir, API_DATA_DIR, 'function-map.json'), {
     ...functionDependencyPayload(analysis.functionDependencyMap),

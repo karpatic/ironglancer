@@ -560,6 +560,9 @@ async function viewerCommand(options, args = {}) {
     depth: args.depth,
     showFiles: args.showFiles,
     showFunctions: args.showFunctions,
+    sourceFileTypes: args.sourceFileTypes,
+    showJsx: args.showJsx,
+    showJs: args.showJs,
   };
   return fetchBridgeJson(new URL('commands', bridgeUrl), {
     method: 'POST',
@@ -761,6 +764,19 @@ const tools = [
         depth: { enum: ['1', '2', '3', 'all'] },
         showFiles: { type: 'boolean' },
         showFunctions: { type: 'boolean' },
+        sourceFileTypes: {
+          oneOf: [
+            { type: 'string', enum: ['jsx', 'js', 'jsx+js', 'js+jsx'] },
+            {
+              type: 'array',
+              minItems: 1,
+              uniqueItems: true,
+              items: { enum: ['jsx', 'js'] },
+            },
+          ],
+        },
+        showJsx: { type: 'boolean' },
+        showJs: { type: 'boolean' },
       },
     },
   },

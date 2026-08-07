@@ -674,14 +674,26 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         text-decoration:underline;
         text-underline-offset:2px;
       }
+      .module-diagram-canvas .source-module-trigger {
+        cursor:pointer;
+        fill:var(--accent);
+        color:var(--accent);
+        font-weight:900;
+        pointer-events:auto;
+        text-decoration:underline;
+        text-underline-offset:2px;
+      }
       .module-diagram-canvas .source-member-trigger:hover,
       .module-diagram-canvas .source-member-trigger:focus-visible,
-      .module-diagram-canvas .source-member-trigger.is-agent-highlighted {
+      .module-diagram-canvas .source-member-trigger.is-agent-highlighted,
+      .module-diagram-canvas .source-module-trigger:hover,
+      .module-diagram-canvas .source-module-trigger:focus-visible {
         fill:var(--danger);
         color:var(--danger);
         text-decoration:underline;
       }
-      .module-diagram-canvas .source-member-trigger:focus-visible {
+      .module-diagram-canvas .source-member-trigger:focus-visible,
+      .module-diagram-canvas .source-module-trigger:focus-visible {
         outline:3px solid rgba(29,78,216,.22);
         outline-offset:3px;
       }
@@ -937,6 +949,10 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
                   <div class="control-set">
                     <span class="control-label">Nodes</span>
                     <div id="network-node-switch" class="segmented-control" role="group" aria-label="Function graph node levels"></div>
+                  </div>
+                  <div class="control-set">
+                    <span class="control-label">Source files</span>
+                    <div id="network-source-switch" class="segmented-control" role="group" aria-label="Function graph source file types"></div>
                   </div>
                   <div class="control-set">
                     <span class="control-label">Scope</span>

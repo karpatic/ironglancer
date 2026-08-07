@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.4 - 2026-08-07
+
+- Added the advanced function graph Source files control for JSX, JS, or both, defaulting to JSX-only while preserving valid graph selections, counts, persistence, and bridge state.
+- Made Mermaid module headers open full relative-path module source when full source is explicitly saved, with an Imported by/Imports neighborhood and safe unavailable state when source is not present.
+- Updated the generated demo analysis to opt into full source for the public browser modules without changing the CLI source privacy default.
+
 ## 0.2.3 - 2026-08-07
 
 - Restored generated demo component-member source navigation by emitting declaration snippets for the demo analysis.

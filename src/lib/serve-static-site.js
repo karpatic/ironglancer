@@ -42,6 +42,7 @@ const VIEWER_LEGACY_GRAPH_DIRECTION_ALIASES = new Map([
   ['used-by', 'parents'],
 ]);
 const VIEWER_GRAPH_DEPTH_VALUES = new Set(['1', '2', '3', 'all']);
+const VIEWER_GRAPH_SOURCE_FILE_TYPE_VALUES = new Set(['jsx', 'js']);
 const PAGINATION_QUERY_PARAMS = ['limit', 'offset'];
 const MODULE_LIST_QUERY_PARAMS = [
   'search', 'q', 'extension', 'reachable', 'jsx', 'sort', 'order', 'fields', ...PAGINATION_QUERY_PARAMS,
@@ -1222,6 +1223,36 @@ function validateViewerBooleanCommandValue(command, fieldName) {
   }
 }
 
+function normalizeViewerSourceFileTypesCommand(command) {
+  if (!Object.prototype.hasOwnProperty.call(command, 'sourceFileTypes')) return;
+  const rawValue = command.sourceFileTypes;
+  let values;
+  if (typeof rawValue === 'string') {
+    values = rawValue.split(/[,+\s]+/).filter(Boolean);
+  } else if (Array.isArray(rawValue)) {
+    values = rawValue;
+  } else if (rawValue && typeof rawValue === 'object') {
+    values = Object.entries(rawValue)
+      .filter(([, enabled]) => Boolean(enabled))
+      .map(([sourceType]) => sourceType);
+  } else {
+    throw apiError(400, 'invalid_bridge_command', 'sourceFileTypes must be a string, array, or object.');
+  }
+  const normalized = Array.from(new Set(values.map((value) => normalizeString(value).trim().toLowerCase()).filter(Boolean)));
+  const invalid = normalized.filter((value) => !VIEWER_GRAPH_SOURCE_FILE_TYPE_VALUES.has(value));
+  if (invalid.length > 0) {
+    throw apiError(
+      400,
+      'invalid_bridge_command',
+      `sourceFileTypes must contain only: ${Array.from(VIEWER_GRAPH_SOURCE_FILE_TYPE_VALUES).sort(compareLocale).join(', ')}.`,
+    );
+  }
+  if (normalized.length === 0) {
+    throw apiError(400, 'invalid_bridge_command', 'sourceFileTypes cannot disable both JSX and JS.');
+  }
+  command.sourceFileTypes = normalized.sort(compareLocale);
+}
+
 function normalizeViewerEnumCommandAlias(command, aliasField, canonicalField, allowedValues, aliases = null) {
   if (!Object.prototype.hasOwnProperty.call(command, aliasField)) return;
   const aliasValue = normalizeString(command[aliasField]).trim();
@@ -1262,8 +1293,14 @@ function validateSetGraphViewCommand(command) {
   validateViewerEnumCommandValue(command, 'depth', VIEWER_GRAPH_DEPTH_VALUES);
   validateViewerBooleanCommandValue(command, 'showFiles');
   validateViewerBooleanCommandValue(command, 'showFunctions');
+  validateViewerBooleanCommandValue(command, 'showJsx');
+  validateViewerBooleanCommandValue(command, 'showJs');
+  normalizeViewerSourceFileTypesCommand(command);
   if (command.showFiles === false && command.showFunctions === false) {
     throw apiError(400, 'invalid_bridge_command', 'showFiles and showFunctions cannot both be false.');
+  }
+  if (command.showJsx === false && command.showJs === false) {
+    throw apiError(400, 'invalid_bridge_command', 'showJsx and showJs cannot both be false.');
   }
 }
 
