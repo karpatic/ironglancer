@@ -74,7 +74,7 @@ test('static analysis server exposes viewer files and a versioned cached API', a
 
     const run = await fetchJson(new URL('/api/v1/run', serviceUrl));
     assert.equal(run.response.status, 200);
-    assert.equal(run.body.data.rootDir, fixtureRoot);
+    assert.equal(run.body.data.rootDir, null);
     assert.equal(run.body.data.entry, 'src/app.jsx');
     assert.equal(run.body.data.package.name, 'ironglancer');
     assert.equal(run.body.data.summary.moduleCount, 5);

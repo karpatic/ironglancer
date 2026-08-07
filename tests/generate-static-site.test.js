@@ -572,7 +572,8 @@ test('generateStaticSite writes a static viewer bundle', async () => {
   assert.match(output.meta.sourceCodeHash, /^[a-f0-9]{64}$/);
   assert.equal(output.meta.apiVersion, 'v1');
   assert.equal(output.meta.schemaVersion, '0.2.0');
-  assert.equal(output.meta.rootDir, fixtureRoot);
+  assert.equal(output.meta.rootDir, null);
+  assert.equal(JSON.stringify(output).includes(JSON.stringify(fixtureRoot).slice(1, -1)), false);
   assert.equal(output.meta.entry, 'src/app.jsx');
   const { stdout: expectedGitCommit } = await execFile('git', ['-C', fixtureRoot, 'rev-parse', 'HEAD']);
   assert.equal(output.meta.gitCommit, expectedGitCommit.trim());
