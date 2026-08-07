@@ -1,6 +1,10 @@
 # Changelog
 
-## 0.2.0 - pending release
+## 0.2.1 - 2026-08-07
+
+- Replaced the unpublished 0.2.0 registry release with deterministic Webpack watch lifecycle verification: the real Webpack 5 watch test now forces an API-supported invalidation after the source write, waits for the changed compilation and matching IronGlancer analysis, and verifies the live viewer/API/bridge stay on one refreshed immutable build and listener.
+
+## 0.2.0 - GitHub Release only
 
 - Added pull-request CI for Node.js 20 and 22 with `npm ci`, tests, demo build, Action bundle freshness, release integrity checks, package dry run, and local Action dogfooding.
 - Reoriented IronGlancer as a browser-side JavaScript/JSX front-end architecture analyzer: HTML/module entries are authoritative, default output is browser-reachable modules only, and `--include-unreachable` is bounded to configured or inferred front-end roots.
@@ -14,4 +18,4 @@
 - Hardened generated output replacement with destructive-target refusal, IronGlancer ownership markers, temporary sibling generation, and safe replacement.
 - Added release-readiness documentation and checks for the 0.2.0 package state.
 
-External pilot validation is pending. Do not treat this changelog as evidence that npmjs, GitHub Packages, or a GitHub Release has been published.
+External pilot validation is pending. Do not treat the 0.2.0 GitHub Release as evidence that npmjs or GitHub Packages were published.

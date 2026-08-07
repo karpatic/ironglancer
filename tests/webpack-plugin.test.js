@@ -134,6 +134,47 @@ function assertCleanWebpackBuild({ error, stats }) {
   }
 }
 
+function webpackStatsHash(stats) {
+  const hash = stats?.hash || stats?.compilation?.hash;
+  assert.equal(typeof hash, 'string', 'expected Webpack stats to expose a compilation hash');
+  assert.notEqual(hash, '', 'expected Webpack stats hash to be non-empty');
+  return hash;
+}
+
+async function waitForCleanWebpackBuild(watchQueue, {
+  afterHash = null,
+  label = 'Webpack watch build',
+  timeoutMs = 15000,
+} = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let lastHash = null;
+
+  while (Date.now() < deadline) {
+    const remainingMs = Math.max(1, deadline - Date.now());
+    let event;
+    try {
+      event = await watchQueue.next(remainingMs);
+    } catch (error) {
+      throw new Error(`${label} did not complete before the timeout.`, { cause: error });
+    }
+    assertCleanWebpackBuild(event);
+    const hash = webpackStatsHash(event.stats);
+    lastHash = hash;
+    if (!afterHash || hash !== afterHash) return { ...event, hash };
+  }
+
+  throw new Error(`${label} did not produce a new compilation hash after ${afterHash}; last hash was ${lastHash}.`);
+}
+
+async function invalidateWebpackWatching(watching) {
+  if (!watching || typeof watching.invalidate !== 'function') {
+    throw new TypeError('Expected Webpack Watching instance to support invalidate().');
+  }
+  await new Promise((resolve, reject) => {
+    watching.invalidate((error) => (error ? reject(error) : resolve()));
+  });
+}
+
 async function closeWebpackWatching(watching) {
   if (!watching) return;
   await new Promise((resolve, reject) => {
@@ -171,6 +212,13 @@ async function writeTinyBrowserProject(projectDir, message) {
     '',
   ].join('\n'), 'utf8');
   await fs.writeFile(path.join(projectDir, 'src/message.js'), message, 'utf8');
+}
+
+async function readSavedModuleSource(outDir, modulePath) {
+  const payload = JSON.parse(await fs.readFile(path.join(outDir, '.ironglancer-api/source-modules.json'), 'utf8'));
+  const moduleSource = payload.modules.find((item) => item.path === modulePath);
+  assert.ok(moduleSource, `expected saved source for ${modulePath}`);
+  return moduleSource;
 }
 
 test('package exposes the Webpack plugin for import and require', () => {
@@ -306,18 +354,24 @@ test('actual Webpack 5 watch rebuild refreshes the generated viewer service and 
       watchQueue.push(error, stats);
     });
 
-    assertCleanWebpackBuild(await watchQueue.next());
+    const firstBuild = await waitForCleanWebpackBuild(watchQueue, {
+      label: 'initial Webpack watch build',
+    });
     await plugin.whenIdle();
     const firstState = plugin.getState();
     assert.equal(firstState.status, 'ready');
     assert.equal(firstState.outDir, outDir);
     assert.match(firstState.serviceUrl, /^http:\/\/127\.0\.0\.1:\d+\/$/);
     serviceUrl = firstState.serviceUrl;
-    servicePort = firstState.service.port;
+    const firstService = plugin.getServiceInfo();
+    assert.equal(firstService.url, serviceUrl);
+    servicePort = firstService.port;
 
     const firstOutput = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
     assert.equal(firstOutput.meta.entry, 'src/main.js');
     assert.equal(firstOutput.modules.some((module) => module.path === 'src/message.js'), true);
+    const firstSource = await readSavedModuleSource(outDir, 'src/message.js');
+    assert.equal(firstSource.code, firstMessageModule);
 
     const firstServedOutput = await fetchJson(new URL('/output.json', serviceUrl));
     assert.equal(firstServedOutput.response.status, 200);
@@ -336,32 +390,49 @@ test('actual Webpack 5 watch rebuild refreshes the generated viewer service and 
     assert.equal(firstBridge.response.status, 200);
     assert.equal(firstBridge.body.data.snapshot.entry, 'src/main.js');
     assert.equal(firstBridge.body.data.snapshot.buildId, firstOutput.meta.buildId);
+    assert.equal(firstBridge.body.data.snapshot.sourceCodeHash, firstOutput.meta.sourceCodeHash);
 
-    await new Promise((resolve) => setTimeout(resolve, 150));
     await fs.writeFile(messagePath, secondMessageModule, 'utf8');
-    const changedTime = new Date(Date.now() + 1000);
-    await fs.utimes(messagePath, changedTime, changedTime);
+    assert.equal(await fs.readFile(messagePath, 'utf8'), secondMessageModule);
 
-    assertCleanWebpackBuild(await watchQueue.next());
+    const secondBuildPromise = waitForCleanWebpackBuild(watchQueue, {
+      afterHash: firstBuild.hash,
+      label: 'changed Webpack watch rebuild',
+    });
+    const [secondBuild] = await Promise.all([
+      secondBuildPromise,
+      invalidateWebpackWatching(watching),
+    ]);
+    assert.notEqual(secondBuild.hash, firstBuild.hash);
     await plugin.whenIdle();
     const secondState = plugin.getState();
     assert.equal(secondState.status, 'ready');
     assert.equal(secondState.serviceUrl, serviceUrl);
     assert.equal(secondState.service.port, servicePort);
+    const secondService = plugin.getServiceInfo();
+    assert.equal(secondService.server, firstService.server);
+    assert.equal(secondService.port, servicePort);
 
     const secondOutput = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
+    const secondSource = await readSavedModuleSource(outDir, 'src/message.js');
+    assert.equal(secondSource.code, secondMessageModule);
+    const secondViewer = await fetch(serviceUrl);
     const secondServedOutput = await fetchJson(new URL('/output.json', serviceUrl));
     const secondRun = await fetchJson(new URL('/api/v1/run', serviceUrl));
     const secondBridge = await fetchJson(new URL('/bridge/v1/', serviceUrl));
+    assert.equal(secondViewer.status, 200);
+    assert.match(await secondViewer.text(), /<title>IronGlancer<\/title>/);
     assert.equal(secondServedOutput.response.status, 200);
     assert.equal(secondRun.response.status, 200);
     assert.equal(secondBridge.response.status, 200);
     assert.notEqual(secondOutput.meta.buildId, firstOutput.meta.buildId);
+    assert.notEqual(secondOutput.meta.sourceCodeHash, firstOutput.meta.sourceCodeHash);
     assert.equal(secondServedOutput.body.meta.buildId, secondOutput.meta.buildId);
+    assert.equal(secondServedOutput.body.meta.sourceCodeHash, secondOutput.meta.sourceCodeHash);
     assert.equal(secondRun.body.data.buildId, secondOutput.meta.buildId);
     assert.equal(secondBridge.body.data.snapshot.buildId, secondOutput.meta.buildId);
     assert.equal(secondRun.body.data.sourceCodeHash, secondOutput.meta.sourceCodeHash);
-    assert.notEqual(secondRun.body.data.sourceCodeHash, firstRun.body.data.sourceCodeHash);
+    assert.equal(secondBridge.body.data.snapshot.sourceCodeHash, secondOutput.meta.sourceCodeHash);
 
     await closeWebpackWatching(watching);
     watching = null;
