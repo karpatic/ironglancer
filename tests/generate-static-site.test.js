@@ -739,6 +739,14 @@ test('generateStaticSite refuses destructive output targets and unmarked replace
     'utf8',
   );
 
+  const defaultChildOutDir = path.join(rootDir, '.ironglancer');
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir: defaultChildOutDir });
+  assert.equal(await pathExists(path.join(defaultChildOutDir, '.ironglancer-output.json')), true);
+
+  const nestedChildOutDir = path.join(rootDir, 'reports', 'ironglancer');
+  await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir: nestedChildOutDir });
+  assert.equal(await pathExists(path.join(nestedChildOutDir, 'output.json')), true);
+
   const cases = [
     { outDir: path.parse(process.cwd()).root, message: /filesystem root/ },
     { outDir: os.homedir(), message: /home directory/ },
@@ -777,6 +785,45 @@ test('generateStaticSite refuses destructive output targets and unmarked replace
   const siblingArtifacts = (await fs.readdir(parentDir))
     .filter((name) => name.startsWith('.safe-site.tmp-') || name.startsWith('.safe-site.previous-'));
   assert.deepEqual(siblingArtifacts, []);
+});
+
+test('generateStaticSite excludes nested output from includeUnreachable discovery without dropping user excludes', async () => {
+  const rootDir = await writeTempProject({
+    'main.js': [
+      "import { reachable } from './reachable.js';",
+      'export function app() { return reachable(); }',
+    ].join('\n'),
+    'reachable.js': "export function reachable() { return 'reachable'; }\n",
+    'src/orphan.js': "export function orphan() { return 'orphan'; }\n",
+    'dist/bundle.js': "export function bundled() { return 'bundled'; }\n",
+  });
+  const outDir = path.join(rootDir, '.ironglancer');
+
+  await generateStaticSite({
+    rootDir,
+    entry: 'main.js',
+    outDir,
+    includeUnreachable: true,
+    sourceMode: 'full',
+    exclude: ['dist/'],
+  });
+  await fs.writeFile(path.join(outDir, 'manual-orphan.js'), 'export const generated = true;\n', 'utf8');
+
+  const result = await generateStaticSite({
+    rootDir,
+    entry: 'main.js',
+    outDir,
+    includeUnreachable: true,
+    sourceMode: 'full',
+    exclude: ['dist/'],
+  });
+  const modules = result.jsScripts.map((module) => module.path);
+  assert.deepEqual(modules, [
+    'main.js',
+    'reachable.js',
+    'src/orphan.js',
+  ]);
+  assert.deepEqual(result.metadata.excludes, ['.ironglancer', 'dist']);
 });
 
 test('generateStaticSite refuses credential-looking source snippets without rejecting validation copy', async () => {

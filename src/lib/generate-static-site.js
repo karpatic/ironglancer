@@ -14,7 +14,7 @@ import {
   normalizeSourceMode,
   sourcePrivacyMetadata,
 } from './options.js';
-import { compareLocale } from './utils.js';
+import { compareLocale, toPosixPath } from './utils.js';
 import { viewerHtml } from '../viewer/html.js';
 
 const require = createRequire(import.meta.url);
@@ -271,7 +271,29 @@ function samePath(a, b) {
 
 function isPathInside(parent, child) {
   const relative = path.relative(parent, child);
-  return relative && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+  return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+function normalizeOutputExclude(value) {
+  return toPosixPath(String(value || '').trim())
+    .replace(/^\.\//, '')
+    .replace(/^\/+/, '')
+    .replace(/\/+$/g, '');
+}
+
+function outputRelativeExclude({ rootDir, outDir }) {
+  const resolvedRoot = path.resolve(rootDir || '.');
+  const resolvedOut = path.resolve(outDir);
+  if (!isPathInside(resolvedRoot, resolvedOut)) return '';
+  return normalizeOutputExclude(path.relative(resolvedRoot, resolvedOut));
+}
+
+function withAutomaticOutputExclude(exclude, { rootDir, outDir }) {
+  const outputExclude = outputRelativeExclude({ rootDir, outDir });
+  if (!outputExclude) return exclude;
+  const values = Array.isArray(exclude) ? [...exclude] : [exclude].filter((value) => value != null && value !== false);
+  const hasOutputExclude = values.some((value) => normalizeOutputExclude(value) === outputExclude);
+  return hasOutputExclude ? values : [...values, outputExclude];
 }
 
 function unsafeOutputReason({ outDir, rootDir }) {
@@ -352,6 +374,10 @@ export async function generateStaticSite({
   const effectiveSourceMode = includeSource ? 'full' : normalizeSourceMode(sourceMode);
   const effectiveModuleLimit = normalizeModuleLimit(moduleLimit);
   const resolvedOutDir = path.resolve(outDir || 'ironglancer-site');
+  const analysisExclude = withAutomaticOutputExclude(exclude, {
+    rootDir,
+    outDir: resolvedOutDir,
+  });
   const analysis = await analyzeProject({
     rootDir,
     entry,
@@ -360,7 +386,7 @@ export async function generateStaticSite({
     framework,
     sourceRoot,
     includeUnreachable,
-    exclude,
+    exclude: analysisExclude,
     moduleLimit: effectiveModuleLimit,
   });
   const unsafeReason = unsafeOutputReason({ outDir: resolvedOutDir, rootDir: analysis.rootDir });

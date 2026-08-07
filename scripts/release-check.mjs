@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 const rootDir = path.resolve(new URL('..', import.meta.url).pathname);
-const expectedVersion = '0.2.1';
+const expectedVersion = '0.2.2';
 
 async function readJson(relativePath) {
   return JSON.parse(await fs.readFile(path.join(rootDir, relativePath), 'utf8'));

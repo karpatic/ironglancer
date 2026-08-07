@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2 - 2026-08-07
+
+- Fixed the Webpack plugin's documented default `.ironglancer` output path so a project-local child directory is not mistaken for a destructive source ancestor.
+- Excluded generated project-local IronGlancer output from `includeUnreachable` discovery on repeated plugin runs while preserving user exclusions.
+- Made the package publish workflow idempotent per registry by skipping npmjs or GitHub Packages publishes when the exact version already exists.
+
 ## 0.2.1 - 2026-08-07
 
 - Replaced the unpublished 0.2.0 registry release with deterministic Webpack watch lifecycle verification: the real Webpack 5 watch test now forces an API-supported invalidation after the source write, waits for the changed compilation and matching IronGlancer analysis, and verifies the live viewer/API/bridge stay on one refreshed immutable build and listener.

@@ -33,7 +33,40 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Read package version
+        id: package
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Check npmjs package version
+        id: npmjs-version
+        env:
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          set -euo pipefail
+          ERR_FILE="$(mktemp)"
+          trap 'rm -f "$ERR_FILE"' EXIT
+          if FOUND_VERSION="$(npm view "ironglancer@${PACKAGE_VERSION}" version --registry=https://registry.npmjs.org/ 2>"$ERR_FILE")"; then
+            if [[ "$FOUND_VERSION" == "$PACKAGE_VERSION" ]]; then
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              echo "ironglancer@${PACKAGE_VERSION} already exists on npmjs; skipping publish."
+              exit 0
+            fi
+            echo "Unexpected npmjs version response: ${FOUND_VERSION}" >&2
+            exit 1
+          fi
+          STATUS=$?
+          if grep -Eqi '(E404|404 Not Found|not found)' "$ERR_FILE"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "ironglancer@${PACKAGE_VERSION} is not on npmjs; publishing."
+            exit 0
+          fi
+          cat "$ERR_FILE" >&2
+          exit "$STATUS"
+
       - name: Publish to npm (trusted publishing)
+        if: steps.npmjs-version.outputs.exists != 'true'
         run: npm publish --provenance --access public
 
   publish-github:
@@ -54,7 +87,46 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Read package version
+        id: package
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Check GitHub Packages version
+        id: github-packages-version
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          set -euo pipefail
+          NPMRC="$(mktemp)"
+          ERR_FILE="$(mktemp)"
+          trap 'rm -f "$NPMRC" "$ERR_FILE"' EXIT
+          printf '%s\n' \
+            '@karpatic:registry=https://npm.pkg.github.com' \
+            '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}' \
+            > "$NPMRC"
+          if FOUND_VERSION="$(NPM_CONFIG_USERCONFIG="$NPMRC" npm view "@karpatic/ironglancer@${PACKAGE_VERSION}" version --registry=https://npm.pkg.github.com 2>"$ERR_FILE")"; then
+            if [[ "$FOUND_VERSION" == "$PACKAGE_VERSION" ]]; then
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              echo "@karpatic/ironglancer@${PACKAGE_VERSION} already exists on GitHub Packages; skipping publish."
+              exit 0
+            fi
+            echo "Unexpected GitHub Packages version response: ${FOUND_VERSION}" >&2
+            exit 1
+          fi
+          STATUS=$?
+          if grep -Eqi '(E404|404 Not Found|not found)' "$ERR_FILE"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "@karpatic/ironglancer@${PACKAGE_VERSION} is not on GitHub Packages; publishing."
+            exit 0
+          fi
+          cat "$ERR_FILE" >&2
+          exit "$STATUS"
+
       - name: Publish mirror to GitHub Packages
+        if: steps.github-packages-version.outputs.exists != 'true'
         run: npm run publish:github
         env:
           GITHUB_NPM_TOKEN: ${{ secrets.GITHUB_TOKEN }}

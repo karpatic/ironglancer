@@ -289,6 +289,138 @@ test('successful Webpack builds generate a viewer and refresh the managed API an
   }
 });
 
+test('actual Webpack plugin default output serves viewer data and excludes generated output on rebuild', { timeout: 30000 }, async () => {
+  const tempRoot = await makeTempDir('ironglancer-webpack-default-');
+  const projectDir = path.join(tempRoot, 'project');
+  const outDir = path.join(projectDir, '.ironglancer');
+  const bundleDir = path.join(projectDir, 'dist');
+  const messagePath = path.join(projectDir, 'src/message.js');
+  const watchQueue = createWebpackWatchQueue();
+  const firstMessageModule = [
+    "export const message = 'default-alpha';",
+    'export function decorate(value) {',
+    '  return `default:${value}`;',
+    '}',
+    '',
+  ].join('\n');
+  const secondMessageModule = [
+    "export const message = 'default-bravo';",
+    'export function decorate(value) {',
+    '  return `default-second:${value.toUpperCase()}`;',
+    '}',
+    '',
+  ].join('\n');
+  let compiler;
+  let plugin;
+  let watching;
+
+  try {
+    await writeTinyBrowserProject(projectDir, firstMessageModule);
+    plugin = new ImportedWebpackPlugin({
+      rootDir: projectDir,
+      entry: 'src/main.js',
+      sourceMode: 'full',
+      includeUnreachable: true,
+      exclude: ['dist'],
+      moduleLimit: 60,
+      port: 0,
+    });
+    compiler = webpack({
+      mode: 'development',
+      target: 'web',
+      context: projectDir,
+      entry: './src/main.js',
+      output: {
+        path: bundleDir,
+        filename: 'bundle.js',
+        clean: true,
+      },
+      cache: false,
+      optimization: {
+        minimize: false,
+      },
+      plugins: [plugin],
+      infrastructureLogging: {
+        level: 'none',
+      },
+    });
+
+    watching = compiler.watch({
+      aggregateTimeout: 50,
+      ignored: /node_modules/,
+      poll: 100,
+    }, (error, stats) => {
+      watchQueue.push(error, stats);
+    });
+
+    const firstBuild = await waitForCleanWebpackBuild(watchQueue, {
+      label: 'initial default-output Webpack watch build',
+    });
+    await plugin.whenIdle();
+    const firstState = plugin.getState();
+    assert.equal(firstState.status, 'ready');
+    assert.equal(firstState.outDir, outDir);
+    assert.match(firstState.serviceUrl, /^http:\/\/127\.0\.0\.1:\d+\/$/);
+    assert.equal(firstState.apiUrl, `${firstState.serviceUrl}api/v1`);
+    assert.equal(firstState.bridgeUrl, `${firstState.serviceUrl}bridge/v1/`);
+
+    const firstOutput = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
+    assert.equal(firstOutput.meta.entry, 'src/main.js');
+    assert.equal(firstOutput.modules.some((module) => module.path === 'src/message.js'), true);
+    assert.equal(firstOutput.modules.some((module) => module.path.startsWith('dist/')), false);
+    assert.equal(firstOutput.modules.some((module) => module.path.startsWith('.ironglancer/')), false);
+
+    const viewer = await fetch(firstState.serviceUrl);
+    assert.equal(viewer.status, 200);
+    assert.match(await viewer.text(), /<title>IronGlancer<\/title>/);
+    const servedOutput = await fetchJson(new URL('/output.json', firstState.serviceUrl));
+    assert.equal(servedOutput.response.status, 200);
+    assert.equal(servedOutput.body.meta.buildId, firstOutput.meta.buildId);
+    const firstRun = await fetchJson(new URL('/api/v1/run', firstState.serviceUrl));
+    assert.equal(firstRun.response.status, 200);
+    assert.equal(firstRun.body.data.entry, 'src/main.js');
+    const firstBridge = await fetchJson(new URL('/bridge/v1/', firstState.serviceUrl));
+    assert.equal(firstBridge.response.status, 200);
+    assert.equal(firstBridge.body.data.snapshot.entry, 'src/main.js');
+
+    await fs.writeFile(path.join(outDir, 'manual-orphan.js'), 'export const generated = true;\n', 'utf8');
+    await fs.writeFile(messagePath, secondMessageModule, 'utf8');
+    const secondBuildPromise = waitForCleanWebpackBuild(watchQueue, {
+      afterHash: firstBuild.hash,
+      label: 'default-output Webpack watch rebuild',
+    });
+    const [secondBuild] = await Promise.all([
+      secondBuildPromise,
+      invalidateWebpackWatching(watching),
+    ]);
+    assert.notEqual(secondBuild.hash, firstBuild.hash);
+    await plugin.whenIdle();
+
+    const secondState = plugin.getState();
+    assert.equal(secondState.status, 'ready');
+    assert.equal(secondState.outDir, outDir);
+    assert.equal(secondState.serviceUrl, firstState.serviceUrl);
+    assert.equal(secondState.apiUrl, firstState.apiUrl);
+    assert.equal(secondState.bridgeUrl, firstState.bridgeUrl);
+    const secondOutput = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
+    assert.equal(secondOutput.modules.some((module) => module.path === 'src/message.js'), true);
+    assert.equal(secondOutput.modules.some((module) => module.path.startsWith('dist/')), false);
+    assert.equal(secondOutput.modules.some((module) => module.path.startsWith('.ironglancer/')), false);
+    assert.notEqual(secondOutput.meta.buildId, firstOutput.meta.buildId);
+    const secondRun = await fetchJson(new URL('/api/v1/run', secondState.serviceUrl));
+    const secondBridge = await fetchJson(new URL('/bridge/v1/', secondState.serviceUrl));
+    assert.equal(secondRun.response.status, 200);
+    assert.equal(secondRun.body.data.buildId, secondOutput.meta.buildId);
+    assert.equal(secondBridge.response.status, 200);
+    assert.equal(secondBridge.body.data.snapshot.buildId, secondOutput.meta.buildId);
+  } finally {
+    await closeWebpackWatching(watching);
+    await closeWebpackCompiler(compiler);
+    if (plugin) await plugin.close();
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test('actual Webpack 5 watch rebuild refreshes the generated viewer service and releases its listener', { timeout: 30000 }, async () => {
   const tempRoot = await makeTempDir('ironglancer-webpack-watch-');
   const projectDir = path.join(tempRoot, 'project');
