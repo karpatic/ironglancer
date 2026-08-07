@@ -27,7 +27,7 @@ CLI
 - `--include-unreachable` includes extra `.js`/`.jsx`/`.mjs` files from the configured/inferred front-end source root; default output is browser-reachable modules only
 - `--include-source` is the explicit full-source shortcut; `--source-mode none|declarations|full` offers finer source artifact control
 - `--module-limit <count>` bounds generation and both sides of git-ref diffs; the default is 500
-- `--serve` generates once, then serves the immutable viewer plus `/api/v1` on `127.0.0.1:4173` by default
+- `--serve` generates once, then serves the immutable viewer plus `/api/v1` and `/bridge/v1` on `127.0.0.1:4173` by default
 - `--route-alias` remains as a deprecated compatibility alias for older root-relative URL mappings; prefer `--alias`
 
 Examples
@@ -35,6 +35,45 @@ Examples
 - `ironglancer ./my-app --entry src/main.jsx --alias @/=src/ --out ./docs/ironglancer`
 - `ironglancer ./my-app --entry src/app.jsx --include-unreachable --source-root src`
 - `ironglancer ./my-app --entry index.html --serve --host 127.0.0.1 --port 0`
+
+Webpack plugin
+- import it with ESM: `import { IronGlancerWebpackPlugin } from 'ironglancer/webpack';`
+- require it with CommonJS: `const IronGlancerWebpackPlugin = require('ironglancer/webpack');`
+- after each successful Webpack build or rebuild, the plugin reruns normal `generateStaticSite` with the configured IronGlancer inputs
+- failed Webpack compilations are skipped, rebuild-triggered analyses are serialized/coalesced, and the previous successful report/service remains active if analysis fails
+- the plugin keeps one managed localhost HTTP service for the existing viewer, read-only `/api/v1`, and viewer bridge `/bridge/v1`
+- `enabled: false` disables the HTTP service only; generation still runs
+- the plugin does not consume Webpack's module graph and does not host MCP
+
+```js
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { IronGlancerWebpackPlugin } from 'ironglancer/webpack';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ironGlancer = new IronGlancerWebpackPlugin({
+  rootDir: __dirname,
+  entry: 'src/main.jsx',
+  outDir: '.ironglancer',
+  framework: 'react',
+  aliases: ['@/=src/'],
+  sourceMode: 'declarations',
+  includeUnreachable: true,
+  host: '127.0.0.1',
+  port: 4173,
+  enabled: true,
+});
+
+export default {
+  // ...
+  plugins: [ironGlancer],
+};
+
+// Surrounding tooling can inspect these after a successful build:
+console.log(ironGlancer.getState().serviceUrl);
+console.log(ironGlancer.getState().apiUrl);
+console.log(ironGlancer.getState().bridgeUrl);
+```
 
 Source privacy
 - default `--source-mode none` writes no source snippets and no full module source
@@ -77,7 +116,7 @@ GitHub Action
 
 Standalone viewer
 - generate the static viewer: `ironglancer ./my-app --entry index.html --out ./ironglancer-site`
-- serve it with any local file server, or use IronGlancer's server: `ironglancer ./my-app --entry index.html --out ./ironglancer-site --serve`
+- serve it with any local file server, or use IronGlancer's server for the viewer, `/api/v1`, and `/bridge/v1`: `ironglancer ./my-app --entry index.html --out ./ironglancer-site --serve`
 - the main view leads with modules/components/lazy boundaries/assets/findings; functions are available as an advanced static-evidence view
 
 Standalone agent
@@ -119,6 +158,11 @@ Read-only API
 - symbol/function endpoints expose advanced static import/export/reference relationships, not runtime calls or data lineage
 - import triage distinguishes `local`, `asset`, `remote`, `browser-incompatible`, `external`, and `unresolved`
 - unknown query parameters return HTTP 400; list pagination uses `limit` and `offset`
+
+Viewer bridge
+- `/bridge/v1` is a localhost, presentation-only channel for viewer state and commands
+- agents and surrounding tooling can read viewer state, queue viewer commands, and acknowledge applied commands while keeping architecture queries under read-only `/api/v1`
+- the bridge is part of the same IronGlancer HTTP service as the viewer and API
 
 Routes
 - `GET /api/v1`

@@ -10,6 +10,7 @@
 - Added source privacy modes: `none` default, `declarations`, and `full`, with explicit viewer/API/MCP degradation when source text is unavailable.
 - Exposed validated `--module-limit` for normal generation and both git-ref sides of architecture diffs, with effective limit/count metadata.
 - Added a bundled GitHub Action wrapper around the same architecture diff path, JSON/HTML/SARIF report outputs, gate outputs, and report-before-failure behavior.
+- Added a Webpack plugin export that reruns normal IronGlancer generation after successful builds/rebuilds and manages the existing localhost viewer, read-only `/api/v1`, and `/bridge/v1` service without consuming Webpack's graph or hosting MCP.
 - Hardened generated output replacement with destructive-target refusal, IronGlancer ownership markers, temporary sibling generation, and safe replacement.
 - Added release-readiness documentation and checks for the 0.2.0 package state.
 

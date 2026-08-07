@@ -3,3 +3,4 @@ export { createArchitectureDiff, loadSnapshotFromPath, loadSnapshotInput } from 
 export { SnapshotDiffError, compareSnapshots, renderDiffHtml, renderDiffSarif } from './lib/diff-snapshots.js';
 export { generateStaticSite } from './lib/generate-static-site.js';
 export { createStaticAnalysisRequestHandler, loadStaticAnalysisRun, startStaticAnalysisServer } from './lib/serve-static-site.js';
+export { IronGlancerWebpackPlugin } from './webpack-plugin.js';

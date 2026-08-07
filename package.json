@@ -20,6 +20,8 @@
     "architecture",
     "visualization",
     "dependency-graph",
+    "webpack",
+    "webpack-plugin",
     "mermaid",
     "jsx",
     "javascript",
@@ -36,6 +38,10 @@
     "./diff": "./src/lib/diff-snapshots.js",
     "./generate-static-site": "./src/lib/generate-static-site.js",
     "./serve-static-site": "./src/lib/serve-static-site.js",
+    "./webpack": {
+      "import": "./src/webpack-plugin.js",
+      "require": "./src/webpack-plugin.cjs"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -68,10 +74,14 @@
     "@babel/parser": "^7.29.8",
     "mermaid": "^11.12.0"
   },
+  "peerDependencies": {
+    "webpack": "^5.0.0"
+  },
   "devDependencies": {
     "@vercel/ncc": "^0.38.4",
     "bundlessdev": "1.0.10",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "webpack": "^5.109.2"
   }
 }
