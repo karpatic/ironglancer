@@ -4,11 +4,11 @@ import { once } from 'node:events';
 import fs from 'node:fs/promises';
 import http from 'node:http';
 import net from 'node:net';
-import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 
+import { makeTempDir } from './helpers/temp-dir.js';
 import { generateStaticSite } from '../src/lib/generate-static-site.js';
 
 const browserTestsEnabled = process.env.IRONGLANCER_BROWSER_TESTS === '1';
@@ -243,9 +243,9 @@ test('real browser dense source labels open the clicked declaration at 20 percen
     return;
   }
 
-  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-dense-browser-root-'));
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-dense-browser-site-'));
-  const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-chrome-profile-'));
+  const rootDir = await makeTempDir('ironglancer-dense-browser-root-');
+  const outDir = await makeTempDir('ironglancer-dense-browser-site-');
+  const profileDir = await makeTempDir('ironglancer-chrome-profile-');
   t.after(() => fs.rm(rootDir, { recursive: true, force: true }));
   t.after(() => fs.rm(outDir, { recursive: true, force: true }));
   t.after(() => fs.rm(profileDir, { recursive: true, force: true }));

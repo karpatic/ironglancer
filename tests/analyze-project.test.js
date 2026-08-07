@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs/promises';
 
+import { makeTempDir } from './helpers/temp-dir.js';
 import { analyzeProject } from '../src/lib/analyze-project.js';
 
 function legacyFunctionId(modulePath, name, kind, startLine, endLine) {
@@ -336,7 +336,7 @@ test('analyzeProject resolves import-map package prefix aliases with longest-pre
 const fixtureRoot = path.resolve('tests/fixtures/sample-app');
 
 async function writeTempProject(files) {
-  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-analyze-fixture-'));
+  const rootDir = await makeTempDir('ironglancer-analyze-fixture-');
   await Promise.all(Object.entries(files).map(async ([relativePath, contents]) => {
     const filePath = path.join(rootDir, relativePath);
     await fs.mkdir(path.dirname(filePath), { recursive: true });

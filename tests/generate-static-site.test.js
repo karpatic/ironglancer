@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
 
+import { makeTempDir } from './helpers/temp-dir.js';
 import { generateStaticSite } from '../src/lib/generate-static-site.js';
 
 const execFile = promisify(execFileCallback);
@@ -364,7 +365,7 @@ async function runGeneratedViewerApp({
 }
 
 async function writeTempProject(files) {
-  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-fixture-'));
+  const rootDir = await makeTempDir('ironglancer-fixture-');
   await Promise.all(Object.entries(files).map(async ([relativePath, contents]) => {
     const filePath = path.join(rootDir, relativePath);
     await fs.mkdir(path.dirname(filePath), { recursive: true });
@@ -405,7 +406,7 @@ async function generateTestSite({
   prefix = 'ironglancer-static-',
   sourceMode = 'full',
 } = {}) {
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  const outDir = await makeTempDir(prefix);
   const result = await generateStaticSite({ rootDir, entry, outDir, sourceMode });
   const readJson = async (fileName) => JSON.parse(await fs.readFile(path.join(outDir, fileName), 'utf8'));
   const [html, appJs, payload, sourcePayload, moduleSourcePayload, functionMapPayload] = await Promise.all([
@@ -633,7 +634,7 @@ test('generateStaticSite defaults to no source artifacts', async () => {
       '}',
     ].join('\n'),
   });
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-source-default-'));
+  const outDir = await makeTempDir('ironglancer-source-default-');
 
   await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir });
   const output = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
@@ -655,7 +656,7 @@ test('generateStaticSite sourceMode none emits no source artifacts and leaks no 
       '}',
     ].join('\n'),
   });
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-source-none-'));
+  const outDir = await makeTempDir('ironglancer-source-none-');
 
   await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir, sourceMode: 'none' });
   const output = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
@@ -678,7 +679,7 @@ test('generateStaticSite sourceMode full preserves full source artifacts', async
       '}',
     ].join('\n'),
   });
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-source-full-'));
+  const outDir = await makeTempDir('ironglancer-source-full-');
 
   await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir, sourceMode: 'full' });
   const moduleSourcePayload = JSON.parse(await fs.readFile(
@@ -694,7 +695,7 @@ test('generateStaticSite rejects invalid source modes before replacing output', 
   const rootDir = await writeTempProject({
     'src/app.jsx': 'export function App() { return <main />; }\n',
   });
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-source-invalid-'));
+  const outDir = await makeTempDir('ironglancer-source-invalid-');
   const markerPath = path.join(outDir, 'marker.txt');
   await fs.writeFile(markerPath, 'keep me\n', 'utf8');
 
@@ -713,7 +714,7 @@ test('generateStaticSite records effective module limit metadata and validates b
     ].join('\n'),
     'src/feature.js': 'export function feature() { return 1; }\n',
   });
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-module-limit-'));
+  const outDir = await makeTempDir('ironglancer-module-limit-');
 
   await generateStaticSite({ rootDir, entry: 'src/app.js', outDir, moduleLimit: 2 });
   const output = JSON.parse(await fs.readFile(path.join(outDir, 'output.json'), 'utf8'));
@@ -729,7 +730,7 @@ test('generateStaticSite records effective module limit metadata and validates b
 });
 
 test('generateStaticSite refuses destructive output targets and unmarked replacements', async () => {
-  const parentDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-destructive-parent-'));
+  const parentDir = await makeTempDir('ironglancer-destructive-parent-');
   const rootDir = path.join(parentDir, 'project');
   await fs.mkdir(path.join(rootDir, 'src'), { recursive: true });
   await fs.writeFile(
@@ -790,7 +791,7 @@ test('generateStaticSite refuses credential-looking source snippets without reje
       '}',
     ].join('\n'),
   });
-  const safeOutParent = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-validation-out-'));
+  const safeOutParent = await makeTempDir('ironglancer-validation-out-');
   await assert.doesNotReject(generateStaticSite({
     rootDir: safeRootDir,
     entry: 'src/app.jsx',
@@ -837,7 +838,7 @@ test('generateStaticSite refuses credential-looking source snippets without reje
       generateStaticSite({
         rootDir,
         entry: 'src/app.jsx',
-        outDir: path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-credential-out-')), 'site'),
+        outDir: path.join(await makeTempDir('ironglancer-credential-out-'), 'site'),
         sourceMode: 'declarations',
       }),
       /credential-looking literal/,

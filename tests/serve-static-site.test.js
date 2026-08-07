@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs/promises';
 
+import { makeTempDir } from './helpers/temp-dir.js';
 import { generateStaticSite } from '../src/lib/generate-static-site.js';
 import { createStaticAnalysisRequestHandler } from '../src/lib/serve-static-site.js';
 
@@ -53,7 +53,7 @@ async function requestUrl(url, { method = 'GET', body = '' } = {}) {
 }
 
 test('static analysis server exposes viewer files and a versioned cached API', async () => {
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-server-'));
+  const outDir = await makeTempDir('ironglancer-server-');
   await generateStaticSite({ rootDir: fixtureRoot, entry: 'src/app.jsx', outDir, sourceMode: 'full' });
   activeHandler = await createStaticAnalysisRequestHandler({ outDir });
 
@@ -271,7 +271,7 @@ test('static analysis server exposes viewer files and a versioned cached API', a
 });
 
 test('static analysis server reports source privacy limits explicitly', async () => {
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-server-source-mode-'));
+  const outDir = await makeTempDir('ironglancer-server-source-mode-');
   await generateStaticSite({ rootDir: fixtureRoot, entry: 'src/app.jsx', outDir });
   activeHandler = await createStaticAnalysisRequestHandler({ outDir });
 
@@ -300,8 +300,8 @@ test('static analysis server reports source privacy limits explicitly', async ()
 });
 
 test('source excerpts preserve the API v1 80-line default and maximum', async () => {
-  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-source-limit-src-'));
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-source-limit-out-'));
+  const rootDir = await makeTempDir('ironglancer-source-limit-src-');
+  const outDir = await makeTempDir('ironglancer-source-limit-out-');
   await fs.mkdir(path.join(rootDir, 'src'), { recursive: true });
   await fs.writeFile(
     path.join(rootDir, 'src/app.js'),
@@ -328,7 +328,7 @@ test('source excerpts preserve the API v1 80-line default and maximum', async ()
 });
 
 test('module functions API supports compact summary pagination and query bounds', async () => {
-  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-module-functions-src-'));
+  const rootDir = await makeTempDir('ironglancer-module-functions-src-');
   const sourcePath = path.join(rootDir, 'src/app.jsx');
   await fs.mkdir(path.dirname(sourcePath), { recursive: true });
   await fs.writeFile(sourcePath, [
@@ -345,7 +345,7 @@ test('module functions API supports compact summary pagination and query bounds'
     '}',
   ].join('\n'), 'utf8');
 
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-module-functions-api-'));
+  const outDir = await makeTempDir('ironglancer-module-functions-api-');
   await generateStaticSite({ rootDir, entry: 'src/app.jsx', outDir, sourceMode: 'full' });
   activeHandler = await createStaticAnalysisRequestHandler({ outDir });
 
@@ -411,7 +411,7 @@ test('module functions API supports compact summary pagination and query bounds'
 });
 
 test('function and module lists expose triage filters and deterministic sorting', async () => {
-  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-triage-src-'));
+  const rootDir = await makeTempDir('ironglancer-triage-src-');
   await fs.mkdir(path.join(rootDir, 'src'), { recursive: true });
   await fs.writeFile(path.join(rootDir, 'src/app.js'), [
     "import { a } from './dep.js';",
@@ -432,7 +432,7 @@ test('function and module lists expose triage filters and deterministic sorting'
   ].join('\n'), 'utf8');
   await fs.writeFile(path.join(rootDir, 'src/dep.js'), 'export const a = 1; export const b = 2;\n', 'utf8');
   await fs.writeFile(path.join(rootDir, 'src/orphan.js'), 'export function Orphan() { return 3; }\n', 'utf8');
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-triage-api-'));
+  const outDir = await makeTempDir('ironglancer-triage-api-');
   await generateStaticSite({ rootDir, entry: 'src/app.js', outDir, sourceMode: 'full', includeUnreachable: true });
   activeHandler = await createStaticAnalysisRequestHandler({ outDir });
 
@@ -547,7 +547,7 @@ test('function and module lists expose triage filters and deterministic sorting'
 });
 
 test('module and function graph APIs return bounded shortest paths and blast radius', async () => {
-  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-graph-src-'));
+  const rootDir = await makeTempDir('ironglancer-graph-src-');
   await fs.mkdir(path.join(rootDir, 'src'), { recursive: true });
   await fs.writeFile(path.join(rootDir, 'src/app.js'), [
     "import { Mid } from './mid.js';",
@@ -558,7 +558,7 @@ test('module and function graph APIs return bounded shortest paths and blast rad
     'export function Mid() { return Leaf(); }',
   ].join('\n'), 'utf8');
   await fs.writeFile(path.join(rootDir, 'src/leaf.js'), 'export function Leaf() { return 1; }\n', 'utf8');
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-graph-api-'));
+  const outDir = await makeTempDir('ironglancer-graph-api-');
   await generateStaticSite({ rootDir, entry: 'src/app.js', outDir, sourceMode: 'full' });
   activeHandler = await createStaticAnalysisRequestHandler({ outDir });
 
@@ -620,7 +620,7 @@ test('module and function graph APIs return bounded shortest paths and blast rad
 });
 
 test('stable IDs survive unrelated line insertions while legacy declaration IDs remain compatible', async () => {
-  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-stable-id-src-'));
+  const rootDir = await makeTempDir('ironglancer-stable-id-src-');
   const sourcePath = path.join(rootDir, 'src/app.jsx');
   await fs.mkdir(path.dirname(sourcePath), { recursive: true });
   const writeVariant = async (prefix) => fs.writeFile(sourcePath, [
@@ -641,9 +641,9 @@ test('stable IDs survive unrelated line insertions while legacy declaration IDs 
 
   try {
     await writeVariant('');
-    const before = await readIds(await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-stable-id-before-')));
+    const before = await readIds(await makeTempDir('ironglancer-stable-id-before-'));
     await writeVariant('// unrelated header\n\n');
-    const after = await readIds(await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-stable-id-after-')));
+    const after = await readIds(await makeTempDir('ironglancer-stable-id-after-'));
 
     assert.equal(after.module.stableId, before.module.stableId);
     assert.equal(before.functions.length, 2);
@@ -665,13 +665,13 @@ test('stable IDs survive unrelated line insertions while legacy declaration IDs 
 });
 
 test('import stable IDs ignore named-binding order', async () => {
-  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-import-id-src-'));
+  const rootDir = await makeTempDir('ironglancer-import-id-src-');
   const sourcePath = path.join(rootDir, 'src/app.js');
   await fs.mkdir(path.dirname(sourcePath), { recursive: true });
   await fs.writeFile(path.join(rootDir, 'src/dep.js'), 'export const a = 1; export const b = 2;\n', 'utf8');
   const readStableId = async (bindings) => {
     await fs.writeFile(sourcePath, `import { ${bindings} } from './dep.js';\nexport function App() { return a + b; }\n`, 'utf8');
-    const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-import-id-out-'));
+    const outDir = await makeTempDir('ironglancer-import-id-out-');
     await generateStaticSite({ rootDir, entry: 'src/app.js', outDir, sourceMode: 'full' });
     activeHandler = await createStaticAnalysisRequestHandler({ outDir });
     const imports = await fetchJson('/api/v1/imports?sourcePath=src%2Fapp.js');
@@ -689,7 +689,7 @@ test('import stable IDs ignore named-binding order', async () => {
 });
 
 test('viewer bridge stores structured state and presentation command acknowledgements', async () => {
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-bridge-'));
+  const outDir = await makeTempDir('ironglancer-bridge-');
   await generateStaticSite({ rootDir: fixtureRoot, entry: 'src/app.jsx', outDir, sourceMode: 'full' });
   activeHandler = await createStaticAnalysisRequestHandler({ outDir });
 
@@ -769,7 +769,7 @@ test('viewer bridge stores structured state and presentation command acknowledge
 });
 
 test('static analysis server rejects static symlink escapes', async (t) => {
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-server-symlink-'));
+  const outDir = await makeTempDir('ironglancer-server-symlink-');
   await generateStaticSite({ rootDir: fixtureRoot, entry: 'src/app.jsx', outDir, sourceMode: 'full' });
   try {
     await fs.symlink(path.resolve('package.json'), path.join(outDir, 'package-link.json'));

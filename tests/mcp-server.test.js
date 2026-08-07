@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import os from 'node:os';
 import fs from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 
+import { makeTempDir } from './helpers/temp-dir.js';
 import { generateStaticSite } from '../src/lib/generate-static-site.js';
 
 const fixtureRoot = path.resolve('tests/fixtures/sample-app');
@@ -76,7 +76,7 @@ function createMcpClient(analysisDir) {
 }
 
 test('ironglancer MCP server exposes saved function placement tools over newline-delimited stdio', async () => {
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-mcp-'));
+  const outDir = await makeTempDir('ironglancer-mcp-');
   await generateStaticSite({ rootDir: fixtureRoot, entry: 'src/app.jsx', outDir, sourceMode: 'full' });
   const client = createMcpClient(outDir);
 
@@ -183,7 +183,7 @@ test('ironglancer MCP server exposes saved function placement tools over newline
 });
 
 test('ironglancer MCP server degrades explicitly when module source is unavailable', async () => {
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-mcp-source-mode-'));
+  const outDir = await makeTempDir('ironglancer-mcp-source-mode-');
   await generateStaticSite({ rootDir: fixtureRoot, entry: 'src/app.jsx', outDir });
   const client = createMcpClient(outDir);
 

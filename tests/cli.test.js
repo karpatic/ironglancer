@@ -6,6 +6,7 @@ import fs from 'node:fs/promises';
 import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
 
+import { makeTempDir } from './helpers/temp-dir.js';
 import { runCli } from '../src/cli.mjs';
 
 const execFile = promisify(execFileCallback);
@@ -234,7 +235,7 @@ test('cli passes source mode and module limit through generation and diff comman
 });
 
 test('cli diff compares saved snapshot file and directory inputs as JSON stdout', async () => {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-snapshots-'));
+  const tempDir = await makeTempDir('ironglancer-cli-diff-snapshots-');
   const basePath = path.join(tempDir, 'base-output.json');
   const headDir = path.join(tempDir, 'head-site');
   await writeJson(basePath, diffSnapshot({
@@ -271,7 +272,7 @@ test('cli diff compares saved snapshot file and directory inputs as JSON stdout'
 });
 
 test('cli diff compares git refs without mutating branch, HEAD, or worktree', async () => {
-  const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-git-'));
+  const projectDir = await makeTempDir('ironglancer-cli-diff-git-');
   await git(projectDir, ['init', '-b', 'main']);
   await git(projectDir, ['config', 'user.email', 'tests@example.test']);
   await git(projectDir, ['config', 'user.name', 'IronGlancer Tests']);
@@ -330,7 +331,7 @@ test('cli diff compares git refs without mutating branch, HEAD, or worktree', as
 });
 
 test('cli diff resolves a same-named directory without output.json as a git ref', async () => {
-  const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-ref-directory-precedence-'));
+  const projectDir = await makeTempDir('ironglancer-cli-diff-ref-directory-precedence-');
   await git(projectDir, ['init', '-b', 'main']);
   await git(projectDir, ['config', 'user.email', 'tests@example.test']);
   await git(projectDir, ['config', 'user.name', 'IronGlancer Tests']);
@@ -383,7 +384,7 @@ test('cli diff resolves a same-named directory without output.json as a git ref'
 });
 
 test('cli diff analyzes a nested project folder at each git ref', async () => {
-  const repoDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-nested-'));
+  const repoDir = await makeTempDir('ironglancer-cli-diff-nested-');
   const projectDir = path.join(repoDir, 'packages', 'app');
   await git(repoDir, ['init', '-b', 'main']);
   await git(repoDir, ['config', 'user.email', 'tests@example.test']);
@@ -424,7 +425,7 @@ test('cli diff analyzes a nested project folder at each git ref', async () => {
 });
 
 test('cli diff writes HTML and SARIF files for saved snapshots', async () => {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-files-'));
+  const tempDir = await makeTempDir('ironglancer-cli-diff-files-');
   const basePath = path.join(tempDir, 'base.json');
   const headPath = path.join(tempDir, 'head.json');
   const htmlPath = path.join(tempDir, 'architecture-diff.html');
@@ -478,7 +479,7 @@ test('cli diff writes HTML and SARIF files for saved snapshots', async () => {
 });
 
 test('cli diff defaults to exit 0 and fail-on gates only actionable new unsuppressed findings after reports are written', async () => {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-review-gate-'));
+  const tempDir = await makeTempDir('ironglancer-cli-diff-review-gate-');
   const basePath = path.join(tempDir, 'base.json');
   const headPath = path.join(tempDir, 'head.json');
   const baselinePath = path.join(tempDir, 'accepted-diff.json');
@@ -575,7 +576,7 @@ test('cli diff defaults to exit 0 and fail-on gates only actionable new unsuppre
 });
 
 test('cli diff review reports omit absolute baseline and suppression paths and source excerpts', async () => {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-review-privacy-'));
+  const tempDir = await makeTempDir('ironglancer-cli-diff-review-privacy-');
   const basePath = path.join(tempDir, 'base.json');
   const headPath = path.join(tempDir, 'head.json');
   const baselinePath = path.join(tempDir, 'accepted-diff.json');
@@ -632,7 +633,7 @@ test('cli diff review reports omit absolute baseline and suppression paths and s
 });
 
 test('cli diff replaces report files atomically without sibling temporary residue', async () => {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-atomic-files-'));
+  const tempDir = await makeTempDir('ironglancer-cli-diff-atomic-files-');
   const basePath = path.join(tempDir, 'base.json');
   const headPath = path.join(tempDir, 'head.json');
   const htmlPath = path.join(tempDir, 'architecture-diff.html');
@@ -670,7 +671,7 @@ test('cli diff replaces report files atomically without sibling temporary residu
 });
 
 test('cli diff preserves private permissions when atomically replacing reports', async () => {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-private-reports-'));
+  const tempDir = await makeTempDir('ironglancer-cli-diff-private-reports-');
   const basePath = path.join(tempDir, 'base.json');
   const headPath = path.join(tempDir, 'head.json');
   const htmlPath = path.join(tempDir, 'architecture-diff.html');
@@ -692,7 +693,7 @@ test('cli diff preserves private permissions when atomically replacing reports',
 });
 
 test('cli diff leaves every prior report intact when any output cannot be staged', async () => {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-report-transaction-'));
+  const tempDir = await makeTempDir('ironglancer-cli-diff-report-transaction-');
   const basePath = path.join(tempDir, 'base.json');
   const headPath = path.join(tempDir, 'head.json');
   const htmlPath = path.join(tempDir, 'architecture-diff.html');
@@ -713,7 +714,7 @@ test('cli diff leaves every prior report intact when any output cannot be staged
 });
 
 test('cli diff uses architecture-diff.html when HTML output is omitted', async () => {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-default-html-'));
+  const tempDir = await makeTempDir('ironglancer-cli-diff-default-html-');
   const basePath = path.join(tempDir, 'base.json');
   const headPath = path.join(tempDir, 'head.json');
   await writeJson(basePath, diffSnapshot({ label: 'base', modules: [] }));
@@ -737,7 +738,7 @@ test('cli diff uses architecture-diff.html when HTML output is omitted', async (
 });
 
 test('cli diff reports bad refs on stderr and cleans temporary ref directories', async () => {
-  const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-bad-ref-'));
+  const projectDir = await makeTempDir('ironglancer-cli-diff-bad-ref-');
   await git(projectDir, ['init', '-b', 'main']);
   await git(projectDir, ['config', 'user.email', 'tests@example.test']);
   await git(projectDir, ['config', 'user.name', 'IronGlancer Tests']);
@@ -772,7 +773,7 @@ test('cli diff reports bad refs on stderr and cleans temporary ref directories',
 });
 
 test('cli diff rejects unsupported formats and output path collisions', async () => {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-bad-output-'));
+  const tempDir = await makeTempDir('ironglancer-cli-diff-bad-output-');
   const basePath = path.join(tempDir, 'base.json');
   const headPath = path.join(tempDir, 'head.json');
   await writeJson(basePath, diffSnapshot({ label: 'base', modules: [] }));
@@ -951,7 +952,7 @@ test('cli diff rejects unsupported formats and output path collisions', async ()
 });
 
 test('cli diff rejects non-JSON review config files without leaking absolute paths', async () => {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-bad-review-config-'));
+  const tempDir = await makeTempDir('ironglancer-cli-diff-bad-review-config-');
   const basePath = path.join(tempDir, 'base.json');
   const headPath = path.join(tempDir, 'head.json');
   const suppressionsPath = path.join(tempDir, 'ironglancer-suppressions.json');
@@ -981,7 +982,7 @@ test('cli diff rejects non-JSON review config files without leaking absolute pat
 });
 
 test('cli diff reports missing entry at a git ref without leaving temp residue', async () => {
-  const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-diff-missing-entry-'));
+  const projectDir = await makeTempDir('ironglancer-cli-diff-missing-entry-');
   await git(projectDir, ['init', '-b', 'main']);
   await git(projectDir, ['config', 'user.email', 'tests@example.test']);
   await git(projectDir, ['config', 'user.name', 'IronGlancer Tests']);
@@ -1132,7 +1133,7 @@ test('cli serve mode closes the server when status output fails', async () => {
 });
 
 test('cli runs in one command on a folder', async () => {
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-'));
+  const outDir = await makeTempDir('ironglancer-cli-');
   await execFile('node', ['src/cli.mjs', fixtureRoot, '--entry', 'src/app.jsx', '--out', outDir], {
     cwd: path.resolve('.'),
   });
@@ -1143,7 +1144,7 @@ test('cli runs in one command on a folder', async () => {
 });
 
 test('cli accepts route aliases for URL-rooted source imports', async () => {
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-cli-route-alias-'));
+  const outDir = await makeTempDir('ironglancer-cli-route-alias-');
   await execFile('node', [
     'src/cli.mjs',
     routeAliasRoot,

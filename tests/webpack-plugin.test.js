@@ -2,9 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import http from 'node:http';
-import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+
+import { makeTempDir } from './helpers/temp-dir.js';
 
 const require = createRequire(import.meta.url);
 const webpack = require('webpack');
@@ -181,7 +182,7 @@ test('package exposes the Webpack plugin for import and require', () => {
 });
 
 test('successful Webpack builds generate a viewer and refresh the managed API and bridge service', async () => {
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-webpack-site-'));
+  const outDir = await makeTempDir('ironglancer-webpack-site-');
   const plugin = new ImportedWebpackPlugin({
     rootDir: fixtureRoot,
     entry: 'src/app.jsx',
@@ -241,7 +242,7 @@ test('successful Webpack builds generate a viewer and refresh the managed API an
 });
 
 test('actual Webpack 5 watch rebuild refreshes the generated viewer service and releases its listener', { timeout: 30000 }, async () => {
-  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-webpack-watch-'));
+  const tempRoot = await makeTempDir('ironglancer-webpack-watch-');
   const projectDir = path.join(tempRoot, 'project');
   const outDir = path.join(tempRoot, 'analysis');
   const bundleDir = path.join(tempRoot, 'dist');
@@ -425,7 +426,7 @@ test('rapid rebuilds are serialized and coalesced while analysis is running', as
 });
 
 test('generation failure preserves the previous output and live service', async () => {
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-webpack-preserve-'));
+  const outDir = await makeTempDir('ironglancer-webpack-preserve-');
   const plugin = new ImportedWebpackPlugin({
     rootDir: fixtureRoot,
     entry: 'src/app.jsx',
@@ -505,7 +506,7 @@ test('service refresh failure preserves the previous report and handler', async 
 });
 
 test('constructor options are passed to normal IronGlancer generation', async () => {
-  const rootDir = path.join(os.tmpdir(), 'ironglancer-webpack-options');
+  const rootDir = await makeTempDir('ironglancer-webpack-options-');
   let captured = null;
   const plugin = new ImportedWebpackPlugin({
     rootDir,
@@ -527,7 +528,7 @@ test('constructor options are passed to normal IronGlancer generation', async ()
       return { outDir: options.outDir };
     },
   });
-  const compiler = createCompiler({ context: path.join(os.tmpdir(), 'unused-context') });
+  const compiler = createCompiler({ context: path.join(rootDir, 'unused-context') });
   plugin.apply(compiler);
 
   await compiler.hooks.done.promise(successfulStats());
@@ -547,7 +548,7 @@ test('constructor options are passed to normal IronGlancer generation', async ()
 });
 
 test('watch shutdown closes listeners and releases the managed service port', async () => {
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-webpack-close-'));
+  const outDir = await makeTempDir('ironglancer-webpack-close-');
   const plugin = new ImportedWebpackPlugin({
     rootDir: fixtureRoot,
     entry: 'src/app.jsx',

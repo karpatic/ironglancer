@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
+
+import { makeTempDir } from './helpers/temp-dir.js';
 
 const execFile = promisify(execFileCallback);
 
@@ -64,7 +65,7 @@ function parseGithubOutput(text) {
 }
 
 test('GitHub Action writes reports and outputs before gate failure', async () => {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-action-'));
+  const tempDir = await makeTempDir('ironglancer-action-');
   const basePath = path.join(tempDir, 'base.json');
   const headPath = path.join(tempDir, 'head.json');
   const reportPath = path.join(tempDir, 'architecture-diff.json');

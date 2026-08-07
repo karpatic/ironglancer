@@ -1,15 +1,15 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
+import { makeTempDir } from './helpers/temp-dir.js';
 import { buildDemoSite } from '../scripts/build-demo.mjs';
 
 const demoRoot = path.resolve('examples/bundless-react');
 
 test('buildDemoSite publishes a Bundless React app with its IronGlancer analysis', async (t) => {
-  const outDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ironglancer-bundless-demo-'));
+  const outDir = await makeTempDir('ironglancer-bundless-demo-');
   t.after(() => fs.rm(outDir, { recursive: true, force: true }));
 
   const result = await buildDemoSite({ outDir });
