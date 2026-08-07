@@ -3323,6 +3323,7 @@ function renderSourceDialogDeclaration(declaration) {
     sourceDialogInsightEl.textContent = '';
     sourceDialogInsightEl.appendChild(createElement('p', 'takeaway', 'Saved source for this diagram member is available, but it is not present in the function graph snapshot.'));
     sourceDialogNeighborhoodEl.textContent = '';
+    sourceDialogNeighborhoodEl.hidden = true;
     sourceDialogConnectionsEl.hidden = true;
   }
 
@@ -4295,7 +4296,7 @@ function renderNeighborhoodNode(parent, { x, y, node, color, center = false }) {
 }
 
 function renderExternalNeighborhoodNode(parent, { x, y, item }) {
-  const group = createSvgElement('g', { class: 'neighborhood-node' });
+  const group = createSvgElement('g', { class: 'neighborhood-node is-external' });
   const title = createSvgElement('title');
   title.textContent = item.title + ' from ' + item.meta;
   group.appendChild(title);
@@ -4344,8 +4345,9 @@ function gridPosition(index, count, { x1, x2, y1, y2 }) {
 }
 
 function renderNeighborhood(node) {
+  sourceDialogNeighborhoodEl.hidden = false;
   sourceDialogNeighborhoodEl.textContent = '';
-  const svg = createSvgElement('svg', { viewBox: '0 0 700 190', role: 'img', 'aria-label': 'Nearby functions for ' + displayName(node) });
+  const svg = createSvgElement('svg', { viewBox: '0 0 700 154', role: 'img', 'aria-label': 'Local imports and uses for ' + displayName(node) });
   const defs = createSvgElement('defs');
   const marker = createSvgElement('marker', {
     id: 'neighborhood-arrow',
@@ -4359,6 +4361,21 @@ function renderNeighborhood(node) {
   marker.appendChild(createSvgElement('path', { d: 'M 0 0 L 10 5 L 0 10 z', fill: '#718096' }));
   defs.appendChild(marker);
   svg.appendChild(defs);
+  const incomingLabel = createSvgElement('text', {
+    class: 'neighborhood-label is-incoming',
+    x: 160,
+    y: 23,
+    'text-anchor': 'middle',
+  });
+  incomingLabel.textContent = 'Imported/used by';
+  const outgoingLabel = createSvgElement('text', {
+    class: 'neighborhood-label is-outgoing',
+    x: 540,
+    y: 23,
+    'text-anchor': 'middle',
+  });
+  outgoingLabel.textContent = 'Imports/uses';
+  svg.append(incomingLabel, outgoingLabel);
 
   const allItems = relationshipItemsForNode(node);
   const items = filteredRelationshipItems(allItems);
@@ -4371,12 +4388,12 @@ function renderNeighborhood(node) {
   const outgoing = allOutgoing.slice(0, 6);
   const hiddenCount = Math.max(0, allIncoming.length - incoming.length)
     + Math.max(0, allOutgoing.length - outgoing.length);
-  const center = { x: 350, y: 92 };
+  const center = { x: 350, y: 78 };
 
   incoming.forEach((item, index) => {
     const caller = functionById.get(item.functionId);
     if (!caller) return;
-    const position = gridPosition(index, incoming.length, { x1: 58, x2: 262, y1: 52, y2: 132 });
+    const position = gridPosition(index, incoming.length, { x1: 58, x2: 262, y1: 56, y2: 108 });
     miniEdge(svg, position.x + 18, position.y, center.x - 24, center.y, 'is-incoming');
     renderNeighborhoodNode(svg, {
       x: position.x,
@@ -4387,7 +4404,7 @@ function renderNeighborhood(node) {
   });
 
   outgoing.forEach((item, index) => {
-    const position = gridPosition(index, outgoing.length, { x1: 438, x2: 642, y1: 52, y2: 132 });
+    const position = gridPosition(index, outgoing.length, { x1: 438, x2: 642, y1: 56, y2: 108 });
     miniEdge(svg, center.x + 24, center.y, position.x - 18, position.y, 'is-outgoing');
     if (item.functionId) {
       const target = functionById.get(item.functionId);
@@ -4414,7 +4431,7 @@ function renderNeighborhood(node) {
   if (items.length === 0) {
     const message = createSvgElement('text', {
       x: 350,
-      y: 168,
+      y: 143,
       'text-anchor': 'middle',
       fill: '#667085',
       'font-size': 13,
@@ -4425,7 +4442,7 @@ function renderNeighborhood(node) {
   } else if (hiddenCount > 0 || allItems.length > items.length) {
     const message = createSvgElement('text', {
       x: 350,
-      y: 178,
+      y: 146,
       'text-anchor': 'middle',
       fill: '#667085',
       'font-size': 12,

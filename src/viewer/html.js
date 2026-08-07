@@ -671,11 +671,19 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         color:var(--accent);
         font-weight:800;
         pointer-events:auto;
+        text-decoration:underline;
+        text-underline-offset:2px;
       }
+      .module-diagram-canvas .source-member-trigger:hover,
+      .module-diagram-canvas .source-member-trigger:focus-visible,
       .module-diagram-canvas .source-member-trigger.is-agent-highlighted {
         fill:var(--danger);
         color:var(--danger);
         text-decoration:underline;
+      }
+      .module-diagram-canvas .source-member-trigger:focus-visible {
+        outline:3px solid rgba(29,78,216,.22);
+        outline-offset:3px;
       }
       .module-diagram-canvas .source-member-metrics {
         display:inline-flex;
@@ -828,7 +836,7 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         padding:9px;
       }
       .neighborhood {
-        height:190px;
+        height:154px;
         border:1px solid var(--border);
         border-radius:8px;
         background:#ffffff;
@@ -840,15 +848,29 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
         height:100%;
       }
       .neighborhood-node { cursor:pointer; }
+      .neighborhood-node.is-external { cursor:default; }
       .neighborhood-node circle,
       .neighborhood-node rect {
         stroke:#ffffff;
         stroke-width:2;
       }
+      .neighborhood-node:focus-visible circle,
+      .neighborhood-node:focus-visible rect {
+        stroke:var(--accent);
+        stroke-width:3;
+        outline:0;
+      }
       .neighborhood-node.is-center circle {
         stroke:#111827;
         stroke-width:3.2;
       }
+      .neighborhood-label {
+        fill:#475467;
+        font-size:13px;
+        font-weight:900;
+      }
+      .neighborhood-label.is-incoming { fill:var(--good); }
+      .neighborhood-label.is-outgoing { fill:var(--warn); }
       .neighborhood-node text {
         fill:#1f2937;
         font-size:10px;
@@ -867,7 +889,7 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
       .neighborhood-edge.is-incoming { stroke:var(--good); stroke-width:2.5; }
       .neighborhood-edge.is-outgoing { stroke:var(--warn); stroke-width:2.3; }
       .source-code-block {
-        max-height:46vh;
+        max-height:min(46vh, 420px);
         border:1px solid #24324a;
         border-radius:8px;
         background:var(--code);
@@ -1068,11 +1090,11 @@ export function viewerHtml({ appScriptSrc = './app.js' } = {}) {
             <button id="source-dialog-close" type="button">Close</button>
           </div>
         </div>
+        <div id="source-dialog-neighborhood" class="neighborhood" aria-label="Local imports and uses"></div>
+        <pre class="source-code-block"><code id="source-dialog-code"></code></pre>
         <section class="dialog-insight" aria-label="Source insight">
           <div id="source-dialog-insight" class="connection-summary"></div>
-          <div id="source-dialog-neighborhood" class="neighborhood" aria-label="Nearby functions"></div>
         </section>
-        <pre class="source-code-block"><code id="source-dialog-code"></code></pre>
         <details id="source-dialog-connections" class="connections-disclosure">
           <summary id="source-dialog-connections-summary">All connections</summary>
           <div id="source-dialog-relationships" class="relationship-list"></div>

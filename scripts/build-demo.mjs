@@ -48,6 +48,7 @@ export async function buildDemoSite({
     rootDir: resolvedDemoRoot,
     entry: 'main.jsx',
     outDir: analysisOutDir,
+    sourceMode: 'declarations',
   });
 
   return {

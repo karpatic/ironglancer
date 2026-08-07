@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3 - 2026-08-07
+
+- Restored generated demo component-member source navigation by emitting declaration snippets for the demo analysis.
+- Reworked the source dialog so the compact local imports/uses neighborhood sits directly above the saved code with clear incoming and outgoing labels.
+
 ## 0.2.2 - 2026-08-07
 
 - Fixed the Webpack plugin's documented default `.ironglancer` output path so a project-local child directory is not mistaken for a destructive source ancestor.
