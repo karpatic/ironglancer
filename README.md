@@ -101,7 +101,7 @@ GitHub Action
 - outputs: `report-path`, `sarif-path`, `gate-triggered`, `finding-count`, and `exit-code`
 
 ```yaml
-- uses: karpatic/ironglancer@v0.2.4
+- uses: karpatic/ironglancer@v0.2.5
   with:
     folder: .
     base: ${{ github.event.pull_request.base.sha }}

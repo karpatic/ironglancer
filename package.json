@@ -1,6 +1,6 @@
 {
   "name": "ironglancer",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Analyze browser-side JavaScript/JSX front-end architecture from HTML or module entries.",
   "type": "module",
   "author": "Carlos Karpati",

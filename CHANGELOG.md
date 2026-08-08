@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.5 - 2026-08-08
+
+- Split the project analyzer into focused analysis modules while preserving the public analyzer entry points.
+- Made Webpack an optional peer dependency and corrected release documentation for the dual-registry package flow.
+- Added the non-MCP loopback `ironglancer-agent` CLI for the read-only API and presentation bridge, including snapshot-correlated viewer control and hardened cleanup-evidence collection.
+
 ## 0.2.4 - 2026-08-07
 
 - Added the advanced function graph Source files control for JSX, JS, or both, defaulting to JSX-only while preserving valid graph selections, counts, persistence, and bridge state.
