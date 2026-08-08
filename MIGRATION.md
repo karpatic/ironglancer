@@ -1,54 +1,103 @@
-# Migration Guide
+# Migrate from 0.1 to 0.2
 
-## 0.2.0
+IronGlancer 0.2 changed finding identities and made the analysis boundary explicit. Complete the baseline migration first. Then review scope and source settings.
 
-IronGlancer 0.2.0 makes the product boundary explicit: IronGlancer analyzes browser-side JavaScript/JSX architecture from an HTML or JS module entry. It is not a TypeScript, backend, CommonJS, Express, serverless, or whole-project inventory analyzer.
+## Replace a 0.1 baseline
 
-### 0.1 baseline migration
+Version 0.1 created finding IDs from the rule ID, evidence, and source location. Version 0.2 uses a semantic identity for each rule. Each finding also contains `identityVersion`.
 
-0.1 finding IDs were derived from rule id, evidence, and location. 0.2 finding IDs are semantic per-rule identities and every finding carries `identityVersion`.
+Baselines and suppressions still require an exact finding ID. Therefore, a 0.1 baseline or suppression does not match a 0.2 ID.
 
-Baselines and suppressions still match exact finding IDs. That means existing 0.1 accepted baselines and suppression files will not automatically suppress the new 0.2 IDs. Do a one-time migration:
+Complete this one-time 0.1 baseline migration:
 
-1. Run `ironglancer diff` with 0.2.0 against the same base/head pair used for your accepted 0.1 baseline.
-2. Review the new report normally.
-3. Save the reviewed 0.2 report as the new baseline, or update suppression entries to the new finding IDs with fresh human reasons.
-4. Remove any obsolete 0.1 finding IDs after the new gate has passed.
+1. Use IronGlancer 0.2 with the same base and head that you used for the accepted 0.1 baseline.
+2. Run `ironglancer diff`.
+3. Review the new report.
+4. Save the reviewed 0.2 report as the new baseline. Or, add the new IDs to the suppression file with new human reasons.
+5. Run the gate with the new baseline or suppressions.
+6. Remove obsolete 0.1 IDs after the gate passes.
 
-The new IDs intentionally ignore source line movement, evidence count drift, threshold text, severity, confidence, and messages. They still distinguish different rules, modules, functions, exports, and edge endpoints.
+The 0.2 IDs do not change because of source-line movement, evidence-count changes, threshold text, severity, confidence, or messages. The IDs still distinguish different rules, modules, functions, exports, and edge endpoints.
 
-### Browser entry reachability
+## Use a browser entry
 
-Default reports now include browser-reachable `.js`, `.jsx`, and `.mjs` modules only. Backend files in full-stack repositories stay out unless the configured browser entry can literally reach them through supported browser import syntax.
+IronGlancer 0.2 analyzes browser-side JavaScript/JSX architecture. Use one of these entry types:
 
-Use `--entry index.html` for HTML module script and import-map discovery, or pass a JS/JSX/MJS entry directly. Use `--alias specifier=path` for import aliases. `--route-alias` remains as a deprecated compatibility option for older root-relative URL mappings.
+- an HTML file with module scripts
+- a `.js`, `.jsx`, or `.mjs` browser module
 
-`--include-unreachable` is still available, but it is bounded to `--source-root` when provided or to inferred front-end roots such as `src/` from the entry modules. It no longer inventories arbitrary backend folders by default.
+Use an HTML entry to find module scripts and import maps:
 
-### Unsupported source kinds
+```sh
+ironglancer ./my-app --entry index.html
+```
 
-`.ts`, `.tsx`, `.mts`, `.cts`, and `.cjs` files are not analyzed as source modules. Imports that resolve to those files are reported as unsupported/unresolved browser evidence. `require()` and `module.exports` are reported as unsupported browser syntax where detected, but they do not create dependency edges.
+Or use a module entry and an import alias:
 
-Node builtin imports such as `node:fs` or `path` are browser-incompatibility findings when reachable from browser code.
+```sh
+ironglancer ./my-app --entry src/main.jsx --alias @/=src/
+```
 
-### Source privacy default
+Default reports contain only modules that the browser entry can reach. Server files in a full-stack repository stay out of the report unless supported browser import syntax reaches them.
 
-The default source mode is now `none`.
+`--route-alias route=path` is a deprecated compatibility option for old root-relative URL mappings. Use `--alias specifier=path` for new configurations.
 
-- `none` writes no `source-code.json` and no `.ironglancer-api/source-modules.json`.
-- `declarations` writes declaration snippets in `source-code.json` and omits module source.
-- `full` writes both declaration snippets and module source.
+## Add unreachable front-end modules only when necessary
 
-Viewer, API, and local agent source workflows report explicit unavailable-source metadata when the selected mode does not include the requested source artifact. Structural module/function metadata remains available.
+Use `--include-unreachable` to add other `.js`, `.jsx`, and `.mjs` files from the front-end source root:
 
-### Module limit
+```sh
+ironglancer ./my-app --entry index.html --include-unreachable --source-root src
+```
 
-The default module limit remains 500. Use `--module-limit <count>` for ordinary generation and git-ref diffs. Reports include the effective limit and analyzed count under `meta.analysis.moduleLimit`.
+`--source-root` gives this search a project-relative boundary. If you omit it, IronGlancer infers a front-end root from the entry. The option does not create an inventory of arbitrary backend folders.
 
-### GitHub Action and SARIF
+## Remove unsupported source assumptions
 
-The bundled GitHub Action wraps the same diff implementation as the CLI. It writes requested reports before returning a gate failure. SARIF upload is intentionally separate so repositories can choose their own upload policy.
+IronGlancer 0.2 does not analyze these source types as browser modules:
 
-### Release status
+- `.ts`
+- `.tsx`
+- `.mts`
+- `.cts`
+- `.cjs`
 
-This repository state is prepared for 0.2.0 but does not publish npmjs `ironglancer`, GitHub Packages `@karpatic/ironglancer`, or a GitHub Release. Those external release steps require Carlos's explicit confirmation.
+An import that resolves to one of these files becomes unsupported or unresolved browser evidence. A detected `require()` or `module.exports` is unsupported browser syntax. It does not create a dependency edge.
+
+A reachable Node builtin import, such as `node:fs` or `path`, becomes a browser-incompatibility finding.
+
+IronGlancer does not analyze TypeScript, TSX, CommonJS graphs, backend routes, serverless functions, or a complete project inventory. It also does not make runtime behavior claims.
+
+## Select a source privacy mode
+
+The default source mode is `none`.
+
+- `none` does not write `source-code.json` or `.ironglancer-api/source-modules.json`.
+- `declarations` writes declaration snippets to `source-code.json`. It does not write module source.
+- `full` writes declaration snippets and full module source.
+
+Example:
+
+```sh
+ironglancer ./my-app --entry index.html --source-mode declarations
+```
+
+If the selected mode does not contain requested source text, the viewer, API, and local agent return explicit unavailable-source metadata. Structural module and function metadata stays available.
+
+## Keep the module limit
+
+The default module limit is still `500`. Use `--module-limit <count>` for normal generation and for both sides of a Git-ref diff.
+
+The report records the effective limit and the analyzed count in `meta.analysis.moduleLimit`.
+
+## Update GitHub Action review steps
+
+The bundled GitHub Action uses the same diff implementation as the CLI. It writes requested reports before it returns a gate failure.
+
+SARIF upload is a separate step. This separation lets each repository select its own upload policy.
+
+## Understand the 0.2.0 release record
+
+Version 0.2.0 was a GitHub Release only. It was not published to npmjs or GitHub Packages.
+
+The current package version is `0.2.5`. npmjs `ironglancer`, GitHub Packages `@karpatic/ironglancer`, and the GitHub Release all have version `0.2.5`.
